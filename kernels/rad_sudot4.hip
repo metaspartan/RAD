@@ -663,8 +663,8 @@ extern "C" __global__ void moe_router_groups_and_q8_k(const float* __restrict__ 
         return;
     }
 
-    __shared__ int s_itop[16 * 8];
-    __shared__ float s_wtop[16 * 8];
+    __shared__ int s_itop[64 * 8];
+    __shared__ float s_wtop[64 * 8];
     __shared__ int cnt[128];
     __shared__ int off[129];
     __shared__ int act[128];

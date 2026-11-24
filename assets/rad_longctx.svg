@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 490" width="960" height="490">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 660" width="960" height="660">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#0b1020"/>
@@ -14,57 +14,81 @@
     </linearGradient>
   </defs>
 
-  <rect width="960" height="490" rx="16" fill="url(#bg)"/>
-  <rect x="1" y="1" width="958" height="488" rx="15" fill="none" stroke="#1e293b" stroke-width="2"/>
+  <rect width="960" height="660" rx="16" fill="url(#bg)"/>
+  <rect x="1" y="1" width="958" height="658" rx="15" fill="none" stroke="#1e293b" stroke-width="2"/>
 
-  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="23" font-weight="700" fill="#f8fafc">RAD v0.3.0 Long-Context Decode &amp; Prefill (2K → 32K) on Single R9700</text>
-  <text x="36" y="70" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">Live HTTP (`--ctx 32768 --max-seqs 8`, INT8 Full-Attn KV Cache -4.23 GB VRAM, Split-32 WMMA + Hybrid DFlash 2 / K=48)</text>
+  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="23" font-weight="700" fill="#f8fafc">RAD v0.6.0 Long-Context Decode &amp; Prefill (2K → 256K) on Single R9700</text>
+  <text x="36" y="70" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">INT8 Full-Attn KV Cache + Q48-Shared Split-64 WMMA FlashAttention + GQA-3:1 Shared-KV Prefill (`--ctx 262144`)</text>
 
-  <rect x="36" y="90" width="888" height="184" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
-  <text x="56" y="118" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="14.5" font-weight="700" fill="#e2e8f0">Live Long-Context Decode Throughput (tok/s) — Only -8.8% Drop from 4K to 32K</text>
+  <rect x="36" y="90" width="888" height="270" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
+  <text x="56" y="118" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="14.5" font-weight="700" fill="#e2e8f0">Long-Context Decode Throughput (tok/s) — Up to 546.7 tok/s @ 32K, 521.4 tok/s @ 64K, 245.1 tok/s @ 256K</text>
 
-  <text x="56" y="146" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">2K Context (2,089 toks)</text>
-  <rect x="260" y="132" width="383" height="20" rx="5" fill="url(#decGrad)"/>
-  <text x="653" y="147" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">403.9 tok/s (68.1 ms/rnd)</text>
+  <text x="56" y="146" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">2K Context (1,977 toks)</text>
+  <rect x="260" y="132" width="292" height="20" rx="5" fill="url(#decGrad)"/>
+  <text x="562" y="147" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">355.3 tok/s (emit=21.7)</text>
 
-  <text x="56" y="174" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">4K Context (4,135 toks)</text>
-  <rect x="260" y="160" width="450" height="20" rx="5" fill="url(#decGrad)"/>
-  <text x="720" y="175" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">474.2 tok/s (66.3 ms/rnd)</text>
+  <text x="56" y="174" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">4K Context (4,067 toks)</text>
+  <rect x="260" y="160" width="279" height="20" rx="5" fill="url(#decGrad)"/>
+  <text x="549" y="175" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">339.4 tok/s (emit=21.7)</text>
 
-  <text x="56" y="202" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">8K Context (8,227 toks)</text>
-  <rect x="260" y="188" width="445" height="20" rx="5" fill="url(#decGrad)"/>
-  <text x="715" y="203" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">468.5 tok/s (67.1 ms/rnd)</text>
+  <text x="56" y="202" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">8K Context (8,057 toks)</text>
+  <rect x="260" y="188" width="298" height="20" rx="5" fill="url(#decGrad)"/>
+  <text x="568" y="203" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">362.3 tok/s (emit=21.7)</text>
 
-  <text x="56" y="230" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">16K Context (16,411 toks)</text>
-  <rect x="260" y="216" width="433" height="20" rx="5" fill="url(#decGrad)"/>
-  <text x="703" y="231" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">455.8 tok/s (68.9 ms/rnd)</text>
+  <text x="56" y="230" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">16K Context (16,227 toks)</text>
+  <rect x="260" y="216" width="294" height="20" rx="5" fill="url(#decGrad)"/>
+  <text x="564" y="231" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">356.8 tok/s (emit=21.7)</text>
 
-  <text x="56" y="258" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">32K Context (31,415 toks)</text>
-  <rect x="260" y="244" width="411" height="20" rx="5" fill="url(#decGrad)"/>
-  <text x="681" y="259" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">432.6 tok/s (72.6 ms/rnd)</text>
+  <text x="56" y="258" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">32K Context (32,757 toks)</text>
+  <rect x="260" y="244" width="450" height="20" rx="5" fill="url(#decGrad)"/>
+  <text x="720" y="259" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">546.7 tok/s (emit=35.0)</text>
 
-  <rect x="36" y="290" width="888" height="164" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
-  <text x="56" y="318" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="14.5" font-weight="700" fill="#e2e8f0">Live Long-Context Prefill Throughput (tok/s) &amp; TTFT</text>
+  <text x="56" y="286" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">64K Context (65,437 toks)</text>
+  <rect x="260" y="272" width="429" height="20" rx="5" fill="url(#decGrad)"/>
+  <text x="699" y="287" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">521.4 tok/s (emit=35.0)</text>
 
-  <text x="56" y="344" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">2K Context (2,089 toks)</text>
-  <rect x="260" y="330" width="442" height="18" rx="5" fill="url(#ppGrad)"/>
-  <text x="712" y="344" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">3,141.9 tok/s (0.66 s TTFT)</text>
+  <text x="56" y="314" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">128K Context (130,987 toks)</text>
+  <rect x="260" y="300" width="234" height="20" rx="5" fill="url(#decGrad)"/>
+  <text x="504" y="315" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">284.9 tok/s (emit=21.7)</text>
 
-  <text x="56" y="368" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">4K Context (4,135 toks)</text>
-  <rect x="260" y="354" width="450" height="18" rx="5" fill="url(#ppGrad)"/>
-  <text x="720" y="368" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">3,197.5 tok/s (1.29 s TTFT)</text>
+  <text x="56" y="342" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">256K Context (261,707 toks)</text>
+  <rect x="260" y="328" width="202" height="20" rx="5" fill="url(#decGrad)"/>
+  <text x="472" y="343" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#4ade80">245.1 tok/s (emit=21.7)</text>
 
-  <text x="56" y="392" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">8K Context (8,227 toks)</text>
-  <rect x="260" y="378" width="447" height="18" rx="5" fill="url(#ppGrad)"/>
-  <text x="717" y="392" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">3,179.1 tok/s (2.59 s TTFT)</text>
+  <rect x="36" y="376" width="888" height="248" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
+  <text x="56" y="404" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="14.5" font-weight="700" fill="#e2e8f0">Long-Context Prefill Throughput (tok/s) &amp; TTFT (GQA-3:1 Shared-KV FlashAttention)</text>
 
-  <text x="56" y="416" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">16K Context (16,411 toks)</text>
-  <rect x="260" y="402" width="434" height="18" rx="5" fill="url(#ppGrad)"/>
-  <text x="704" y="416" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">3,080.5 tok/s (5.33 s TTFT)</text>
+  <text x="56" y="430" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">2K Context (1,977 toks)</text>
+  <rect x="260" y="416" width="450" height="18" rx="5" fill="url(#ppGrad)"/>
+  <text x="720" y="430" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">3,265.6 tok/s (0.61 s)</text>
 
-  <text x="56" y="440" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">32K Context (31,415 toks)</text>
-  <rect x="260" y="426" width="406" height="18" rx="5" fill="url(#ppGrad)"/>
-  <text x="676" y="440" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">2,884.3 tok/s (10.89 s TTFT)</text>
+  <text x="56" y="456" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">4K Context (4,067 toks)</text>
+  <rect x="260" y="442" width="449" height="18" rx="5" fill="url(#ppGrad)"/>
+  <text x="719" y="456" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">3,257.7 tok/s (1.25 s)</text>
 
-  <text x="36" y="474" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="11.5" fill="#64748b">Live OpenAI `/v1/chat/completions` on AMD Radeon AI PRO R9700 (gfx1201, ROCm 7.14) | Inkling-2-Mini Q4_K_XL + DFlash 2 | github.com/metaspartan/RAD</text>
+  <text x="56" y="482" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">8K Context (8,057 toks)</text>
+  <rect x="260" y="468" width="442" height="18" rx="5" fill="url(#ppGrad)"/>
+  <text x="712" y="482" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">3,209.0 tok/s (2.51 s)</text>
+
+  <text x="56" y="508" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">16K Context (16,227 toks)</text>
+  <rect x="260" y="494" width="430" height="18" rx="5" fill="url(#ppGrad)"/>
+  <text x="700" y="508" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">3,118.9 tok/s (5.20 s)</text>
+
+  <text x="56" y="534" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">32K Context (32,757 toks)</text>
+  <rect x="260" y="520" width="407" height="18" rx="5" fill="url(#ppGrad)"/>
+  <text x="677" y="534" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">2,953.6 tok/s (11.09 s)</text>
+
+  <text x="56" y="560" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">64K Context (65,437 toks)</text>
+  <rect x="260" y="546" width="366" height="18" rx="5" fill="url(#ppGrad)"/>
+  <text x="636" y="560" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">2,657.9 tok/s (24.62 s)</text>
+
+  <text x="56" y="586" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">128K Context (130,987 toks)</text>
+  <rect x="260" y="572" width="305" height="18" rx="5" fill="url(#ppGrad)"/>
+  <text x="575" y="586" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">2,210.7 tok/s (59.25 s)</text>
+
+  <text x="56" y="612" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">256K Context (261,707 toks)</text>
+  <rect x="260" y="598" width="228" height="18" rx="5" fill="url(#ppGrad)"/>
+  <text x="498" y="612" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12.5" font-weight="700" fill="#fbbf24">1,651.7 tok/s (158.44 s)</text>
+
+  <text x="36" y="644" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="11.5" fill="#64748b">Measured on a single AMD Radeon AI PRO R9700 (32 GB, gfx1201, ROCm) via `rad bench --ctx 262144 --max-seqs 1` | github.com/metaspartan/RAD</text>
 </svg>

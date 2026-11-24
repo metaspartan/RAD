@@ -2720,6 +2720,7 @@ fn load_drafter(opts: &CliOpts, engine: &mut InklingEngine, max_seqs: usize) -> 
     if let Some(ref p) = opts.dflash2 {
         if Path::new(p).exists() {
             engine.capture_verify_graph(8)?;
+            engine.capture_verify_graph(48)?;
             let mut d = DFlash2Drafter::load_multi(Path::new(p), opts.ctx, max_seqs)?;
             d.capture_draft_graph(engine, 8)?;
             return Ok(Some(Drafter::DFlash2(d)));
@@ -3005,7 +3006,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
 
     if let Some(ref mut d) = drafter {
         let k_len = d.spec_k();
-        let targets: &[usize] = &[2048, 4096, 8192, 16384, 32768, 65536, 131072];
+        let targets: &[usize] = &[2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
         let mut long_targets: Vec<usize> = targets
             .iter()
             .copied()
@@ -3015,17 +3016,23 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
         if long_targets.len() >= 2 {
             println!();
             println!("Long-Context Scaling (prefill + hybrid {spec_mode}/ngram K=48 decode):");
-            let block_txt = "function computeAttention(q, k, v, scale) { let acc = 0.0; for (let i = 0; i < q.length; i++) { acc += q[i] * k[i] * scale; } return acc; }\n";
+            let block_txt = "pub struct KvBlock {\n    pub block_id: usize,\n    pub ref_count: u32,\n    pub tokens: [i32; 16],\n    pub dirty: bool,\n}\nimpl KvBlock {\n    pub fn new(block_id: usize) -> Self {\n        Self { block_id, ref_count: 1, tokens: [0; 16], dirty: false }\n    }\n    pub fn retain(&mut self) {\n        self.ref_count = self.ref_count.saturating_add(1);\n    }\n    pub fn release(&mut self) -> bool {\n        self.ref_count = self.ref_count.saturating_sub(1);\n        self.ref_count == 0\n    }\n}\n";
+            let target_txt = "pub struct KvCachePool {\n    pub blocks: Vec<KvBlock>,\n    pub free_list: Vec<usize>,\n    pub block_size: usize,\n    pub max_blocks: usize,\n}\nimpl KvCachePool {\n    pub fn with_capacity(max_blocks: usize, block_size: usize) -> Self {\n        let mut blocks = Vec::with_capacity(max_blocks);\n        let mut free_list = Vec::with_capacity(max_blocks);\n        for i in 0..max_blocks {\n            blocks.push(KvBlock::new(i));\n            free_list.push(max_blocks - 1 - i);\n        }\n        Self { blocks, free_list, block_size, max_blocks }\n    }\n    pub fn alloc_block(&mut self) -> Option<usize> {\n        let id = self.free_list.pop()?;\n        self.blocks[id].ref_count = 1;\n        self.blocks[id].dirty = true;\n        Some(id)\n    }\n    pub fn free_block(&mut self, id: usize) {\n        if id < self.blocks.len() && self.blocks[id].release() {\n            self.blocks[id].dirty = false;\n            self.free_list.push(id);\n        }\n    }\n    pub fn used_blocks(&self) -> usize {\n        self.max_blocks.saturating_sub(self.free_list.len())\n    }\n}\n";
             let block_ids: Vec<i32> = tokenizer.encode(block_txt, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
-            let prefix_p = format_prompt(&[ChatMessage { role: "user".into(), content: json!("Repeat the exact computeAttention helper functions below verbatim:\n"), tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }], false);
+            let target_ids: Vec<i32> = tokenizer.encode(target_txt, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+            let prefix_p = format_prompt(
+                &[ChatMessage { role: "user".into(), content: json!("Here is a large Rust codebase file. At the end is `KvCachePool`. Output ONLY the exact `KvCachePool` struct and `impl KvCachePool` code verbatim from the file (no markdown fences, no commentary):\n"), tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }],
+                false,
+            );
             let mut prefix_ids: Vec<i32> = tokenizer.encode(prefix_p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
             let tail_ids = if prefix_ids.len() >= 2 { prefix_ids.split_off(prefix_ids.len() - 2) } else { Vec::new() };
             for tgt in long_targets.drain(..) {
                 let mut ids = Vec::with_capacity(tgt + 64);
                 ids.extend_from_slice(&prefix_ids);
-                while ids.len() + block_ids.len() + tail_ids.len() <= tgt {
+                while ids.len() + block_ids.len() + target_ids.len() + tail_ids.len() <= tgt {
                     ids.extend_from_slice(&block_ids);
                 }
+                ids.extend_from_slice(&target_ids);
                 ids.extend_from_slice(&tail_ids);
                 engine.reset_seq(0)?;
                 d.reset_seq(0);
@@ -3034,8 +3041,9 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
                 let pp_s = tp.elapsed().as_secs_f64();
                 let pp_tps = ids.len() as f64 / pp_s.max(1e-6);
                 let mut gen = 0usize;
+                let mut rounds = 0usize;
                 let td = Instant::now();
-                while gen < 128 {
+                while gen < 200 {
                     let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[0], ct, 48) {
                         ng
                     } else {
@@ -3056,10 +3064,15 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
                     }
                     ct = preds[n_acc - 1];
                     gen += n_acc;
+                    rounds += 1;
                     if ct == 200006 || ct == 199999 { break; }
                 }
-                let dec_tps = gen as f64 / td.elapsed().as_secs_f64().max(1e-6);
-                println!("| Long-Ctx {:>6} tok | prefill {:>6.1} tok/s ({:.2}s) | decode {:>6.1} tok/s ({gen} tok) |", ids.len(), pp_tps, pp_s, dec_tps);
+                let dec_s = td.elapsed().as_secs_f64().max(1e-6);
+                let dec_tps = gen as f64 / dec_s;
+                println!(
+                    "| Long-Ctx {:>6} tok | prefill {:>6.1} tok/s ({:.2}s) | decode {:>6.1} tok/s (emit={:.1}, {gen} tok) |",
+                    ids.len(), pp_tps, pp_s, dec_tps, gen as f64 / rounds.max(1) as f64
+                );
             }
         }
     }

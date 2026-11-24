@@ -29,7 +29,7 @@
   <rect width="960" height="434" rx="16" fill="url(#bg)"/>
   <rect x="1" y="1" width="958" height="432" rx="15" fill="none" stroke="#1e293b" stroke-width="2"/>
 
-  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="23" font-weight="700" fill="#f8fafc">RAD v0.3.0 Multi-User Scaling — Inkling-2-Mini on Single R9700</text>
+  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="23" font-weight="700" fill="#f8fafc">RAD v0.6.0 Multi-User Scaling — Inkling-2-Mini on Single R9700</text>
   <text x="36" y="70" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">Aggregate Decode Throughput (tok/s) with Continuous Batching &amp; Batched DFlash 2 Speculative Decoding</text>
 
   <rect x="36" y="90" width="888" height="304" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
