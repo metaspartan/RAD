@@ -34,9 +34,9 @@
 
   <rect x="36" y="90" width="888" height="304" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
 
-  <text x="56" y="128" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#94a3b8">B=4 Batched DFlash 2 K=4 (118.9 tok/s/user)</text>
-  <rect x="345" y="113" width="110" height="22" rx="5" fill="url(#tealGrad)"/>
-  <text x="465" y="129" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#2dd4bf">475.8 tok/s</text>
+  <text x="56" y="128" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#94a3b8">B=4 Batched DFlash 2 K=4 (121.2 tok/s/user)</text>
+  <rect x="345" y="113" width="112" height="22" rx="5" fill="url(#tealGrad)"/>
+  <text x="467" y="129" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#2dd4bf">485.0 tok/s</text>
 
   <text x="56" y="162" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=8 Continuous Batching (69.8 tok/s/user)</text>
   <rect x="345" y="147" width="129" height="22" rx="5" fill="url(#slateGrad)"/>
@@ -46,9 +46,9 @@
   <rect x="345" y="181" width="106" height="22" rx="5" fill="url(#greenGrad)"/>
   <text x="461" y="197" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">458.6 tok/s</text>
 
-  <text x="56" y="230" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Batched DFlash 2 K=4 (84.2 tok/s/user)</text>
-  <rect x="345" y="215" width="156" height="22" rx="5" fill="url(#tealGrad)"/>
-  <text x="511" y="231" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#2dd4bf">673.9 tok/s</text>
+  <text x="56" y="230" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Batched DFlash 2 K=4 (84.5 tok/s/user)</text>
+  <rect x="345" y="215" width="157" height="22" rx="5" fill="url(#tealGrad)"/>
+  <text x="512" y="231" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#2dd4bf">676.2 tok/s</text>
 
   <text x="56" y="264" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=16 Continuous Batching (42.9 tok/s/user)</text>
   <rect x="345" y="249" width="159" height="22" rx="5" fill="url(#cyanGrad)"/>

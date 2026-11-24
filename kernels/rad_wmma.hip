@@ -2061,7 +2061,7 @@ extern "C" __global__ void attn_b8_flash_q8_k(const float* __restrict__ Q,
     }
 }
 
-__device__ float g_b8_split_buf[32 * 32 * 48 * 130];
+__device__ float g_b8_split_buf[32 * 32 * 64 * 130];
 
 extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ Q,
                                                       const float* __restrict__ R,
@@ -2105,7 +2105,7 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
 
     if (tile_s >= tile_e) {
         if (tg == 0 && half == 0 && vq) {
-            float* dst = split_buf + (((size_t)h * n_splits + sp) * 48 + q_idx) * 130;
+            float* dst = split_buf + (((size_t)h * n_splits + sp) * 64 + q_idx) * 130;
             dst[0] = -1e30f;
             dst[1] = 0.0f;
         }
@@ -2284,7 +2284,7 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
             float sc0 = (m0 > -1e20f) ? expf(m0 - gm) : 0.0f;
             float sc1 = (m1 > -1e20f) ? expf(m1 - gm) : 0.0f;
             float gl = sm_l[0][gg][bt] * sc0 + sm_l[1][gg][bt] * sc1;
-            float* dst = split_buf + (((size_t)h_out * n_splits + sp) * 48 + (q_off + bt)) * 130;
+            float* dst = split_buf + (((size_t)h_out * n_splits + sp) * 64 + (q_off + bt)) * 130;
             if (lane == 0) { dst[0] = gm; dst[1] = gl; }
 #pragma unroll
             for (int blk = 0; blk < 4; ++blk) {
@@ -2509,13 +2509,13 @@ extern "C" __global__ void attn_b8_flash_reduce_q8_k(const float* __restrict__ s
 
     float gm = -1e30f;
     for (int sp = 0; sp < n_splits; ++sp) {
-        const float* p = split_buf + (((size_t)h * n_splits + sp) * 48 + bt) * 130;
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * 64 + bt) * 130;
         gm = fmaxf(gm, p[0]);
     }
     float gl = 0.0f;
     float go = 0.0f;
     for (int sp = 0; sp < n_splits; ++sp) {
-        const float* p = split_buf + (((size_t)h * n_splits + sp) * 48 + bt) * 130;
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * 64 + bt) * 130;
         if (p[0] > -1e20f) {
             float sc = expf(p[0] - gm);
             gl += p[1] * sc;

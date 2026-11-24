@@ -641,7 +641,7 @@ extern "C" __global__ void kv_conv_qkvr_store_multi_snap_q8kv_k(float* __restric
     }
 }
 
-__device__ float g_q8kv_b8_split_buf[32 * 32 * 48 * 130];
+__device__ float g_q8kv_b8_split_buf[32 * 32 * 64 * 130];
 
 extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restrict__ Q,
                                                            const float* __restrict__ R,
@@ -684,7 +684,7 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restri
 
     if (tile_s >= tile_e) {
         if (tg == 0 && half == 0 && vq) {
-            float* dst = split_buf + (((size_t)h * n_splits + sp) * 48 + q_idx) * 130;
+            float* dst = split_buf + (((size_t)h * n_splits + sp) * 64 + q_idx) * 130;
             dst[0] = -1e30f;
             dst[1] = 0.0f;
         }
@@ -880,7 +880,7 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restri
             float sc0 = (m0 > -1e20f) ? expf(m0 - gm) : 0.0f;
             float sc1 = (m1 > -1e20f) ? expf(m1 - gm) : 0.0f;
             float gl = sm_l[0][gg][bt] * sc0 + sm_l[1][gg][bt] * sc1;
-            float* dst = split_buf + (((size_t)h_out * n_splits + sp) * 48 + (q_off + bt)) * 130;
+            float* dst = split_buf + (((size_t)h_out * n_splits + sp) * 64 + (q_off + bt)) * 130;
             if (lane == 0) { dst[0] = gm; dst[1] = gl; }
 #pragma unroll
             for (int blk = 0; blk < 4; ++blk) {
@@ -904,13 +904,13 @@ extern "C" __global__ void attn_b8_flash_reduce_q8kv_k(const float* __restrict__
 
     float gm = -1e30f;
     for (int sp = 0; sp < n_splits; ++sp) {
-        const float* p = split_buf + (((size_t)h * n_splits + sp) * 48 + bt) * 130;
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * 64 + bt) * 130;
         gm = fmaxf(gm, p[0]);
     }
     float gl = 0.0f;
     float go = 0.0f;
     for (int sp = 0; sp < n_splits; ++sp) {
-        const float* p = split_buf + (((size_t)h * n_splits + sp) * 48 + bt) * 130;
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * 64 + bt) * 130;
         if (p[0] > -1e20f) {
             float sc = expf(p[0] - gm);
             gl += p[1] * sc;
@@ -966,11 +966,11 @@ extern "C" __global__ void attn_decode_gqa_splitkv_q8kv_k(const float* __restric
 #pragma unroll
     for (int g = 0; g < 3; ++g) {
         int h = h0 + g;
-        const float* qh = Q + (size_t)h * dh;
-        q0[g] = qh[lane] * q_scale;
-        q1[g] = qh[lane + 32] * q_scale;
-        q2[g] = qh[lane + 64] * q_scale;
-        q3[g] = qh[lane + 96] * q_scale;
+        float4 qv = reinterpret_cast<const float4*>(Q + (size_t)h * dh)[lane];
+        q0[g] = qv.x * q_scale;
+        q1[g] = qv.y * q_scale;
+        q2[g] = qv.z * q_scale;
+        q3[g] = qv.w * q_scale;
         rv[g] = (lane < d_rel) ? R[(size_t)h * d_rel + lane] : 0.0f;
         sk[g] = sinks[h];
         m[g] = (sp == 0 && wid == 0) ? 0.0f : -1e30f;
@@ -984,25 +984,25 @@ extern "C" __global__ void attn_decode_gqa_splitkv_q8kv_k(const float* __restric
     const __half* vs_h = v_scale + (size_t)kv_h * max_ctx;
 
     for (int t = ts + wid; t < te; t += 8) {
-        const int8_t* kt = kc_h + (size_t)t * dh;
-        const int8_t* vt = vc_h + (size_t)t * dh;
+        uint32_t k4 = reinterpret_cast<const uint32_t*>(kc_h + (size_t)t * dh)[lane];
+        uint32_t v4 = reinterpret_cast<const uint32_t*>(vc_h + (size_t)t * dh)[lane];
         float ks = __half2float(ks_h[t]);
         float vs = __half2float(vs_h[t]);
-        float k0 = (float)kt[lane] * ks;
-        float k1 = (float)kt[lane + 32] * ks;
-        float k2 = (float)kt[lane + 64] * ks;
-        float k3 = (float)kt[lane + 96] * ks;
-        float v0 = (float)vt[lane] * vs;
-        float v1 = (float)vt[lane + 32] * vs;
-        float v2 = (float)vt[lane + 64] * vs;
-        float v3 = (float)vt[lane + 96] * vs;
+        float k0 = (float)(int8_t)(k4 & 0xFF);
+        float k1 = (float)(int8_t)((k4 >> 8) & 0xFF);
+        float k2 = (float)(int8_t)((k4 >> 16) & 0xFF);
+        float k3 = (float)(int8_t)(k4 >> 24);
+        float v0 = (float)(int8_t)(v4 & 0xFF);
+        float v1 = (float)(int8_t)((v4 >> 8) & 0xFF);
+        float v2 = (float)(int8_t)((v4 >> 16) & 0xFF);
+        float v3 = (float)(int8_t)(v4 >> 24);
         int dist = pos - t;
         bool has_rb = (dist < rel_extent);
         float rb_l = (has_rb && lane < d_rel) ? rel_bias[(size_t)dist * d_rel + lane] : 0.0f;
 #pragma unroll
         for (int g = 0; g < 3; ++g) {
-            float dot = q0[g] * k0 + q1[g] * k1 + q2[g] * k2 + q3[g] * k3;
-            float score = __shfl(q8kv_warp_sum32(dot), 0, 32);
+            float dot = fmaf(q0[g], k0, fmaf(q1[g], k1, fmaf(q2[g], k2, q3[g] * k3)));
+            float score = __shfl(q8kv_warp_sum32(dot), 0, 32) * ks;
             if (has_rb) score += __shfl(q8kv_warp_sum32(rb_l * rv[g]), 0, 32);
             score -= sk[g];
             float m_new = fmaxf(m[g], score);
@@ -1010,21 +1010,23 @@ extern "C" __global__ void attn_decode_gqa_splitkv_q8kv_k(const float* __restric
             float p = expf(score - m_new);
             l[g] = l[g] * alpha + p;
             m[g] = m_new;
-            o0[g] = fmaf(p, v0, o0[g] * alpha);
-            o1[g] = fmaf(p, v1, o1[g] * alpha);
-            o2[g] = fmaf(p, v2, o2[g] * alpha);
-            o3[g] = fmaf(p, v3, o3[g] * alpha);
+            float pvs = p * vs;
+            o0[g] = fmaf(pvs, v0, o0[g] * alpha);
+            o1[g] = fmaf(pvs, v1, o1[g] * alpha);
+            o2[g] = fmaf(pvs, v2, o2[g] * alpha);
+            o3[g] = fmaf(pvs, v3, o3[g] * alpha);
         }
     }
 
     __shared__ float sm_m[8];
     __shared__ float sm_l[8];
     __shared__ float sm_o[8][128];
+    int d4 = lane * 4;
 #pragma unroll
     for (int g = 0; g < 3; ++g) {
         if (lane == 0) { sm_m[wid] = m[g]; sm_l[wid] = l[g]; }
-        sm_o[wid][lane] = o0[g]; sm_o[wid][lane + 32] = o1[g];
-        sm_o[wid][lane + 64] = o2[g]; sm_o[wid][lane + 96] = o3[g];
+        sm_o[wid][d4 + 0] = o0[g]; sm_o[wid][d4 + 1] = o1[g];
+        sm_o[wid][d4 + 2] = o2[g]; sm_o[wid][d4 + 3] = o3[g];
         __syncthreads();
         if (wid == 0) {
             float gm = sm_m[0];
@@ -1036,18 +1038,18 @@ extern "C" __global__ void attn_decode_gqa_splitkv_q8kv_k(const float* __restric
             for (int w = 0; w < 8; ++w) {
                 float sc = (sm_m[w] > -1e20f) ? expf(sm_m[w] - gm) : 0.0f;
                 gl += sm_l[w] * sc;
-                go0 += sm_o[w][lane] * sc;
-                go1 += sm_o[w][lane + 32] * sc;
-                go2 += sm_o[w][lane + 64] * sc;
-                go3 += sm_o[w][lane + 96] * sc;
+                go0 += sm_o[w][d4 + 0] * sc;
+                go1 += sm_o[w][d4 + 1] * sc;
+                go2 += sm_o[w][d4 + 2] * sc;
+                go3 += sm_o[w][d4 + 3] * sc;
             }
             int h = h0 + g;
             float* dst = split_buf + ((size_t)h * n_splits + sp) * 130;
             if (lane == 0) { dst[0] = gm; dst[1] = gl; }
-            dst[2 + lane] = go0;
-            dst[2 + lane + 32] = go1;
-            dst[2 + lane + 64] = go2;
-            dst[2 + lane + 96] = go3;
+            dst[2 + d4 + 0] = go0;
+            dst[2 + d4 + 1] = go1;
+            dst[2 + d4 + 2] = go2;
+            dst[2 + d4 + 3] = go3;
         }
         __syncthreads();
     }

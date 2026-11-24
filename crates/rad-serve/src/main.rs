@@ -44,6 +44,7 @@ struct GenJob {
     prompt_ids: Vec<i32>,
     images: Vec<String>,
     max_tokens: usize,
+    #[allow(dead_code)]
     enable_thinking: bool,
     json_grammar: bool,
     tx: mpsc::UnboundedSender<GenEvent>,
@@ -165,6 +166,7 @@ struct ActiveSlot {
     next_tok: i32,
     max_tokens: usize,
     emitted: usize,
+    #[allow(dead_code)]
     enable_thinking: bool,
     grammar: Option<grammar::JsonGrammarState>,
     started_at: Instant,
@@ -220,11 +222,13 @@ struct ChatMessage {
     #[serde(default)]
     content: serde_json::Value,
     #[serde(default)]
-    #[allow(dead_code)]
     tool_calls: Option<Vec<serde_json::Value>>,
     #[serde(default)]
-    #[allow(dead_code)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -241,10 +245,13 @@ struct ChatRequest {
     #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
+    max_completion_tokens: Option<usize>,
+    #[serde(default)]
     stream: Option<bool>,
     #[serde(default)]
     tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
+    #[allow(dead_code)]
     tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     response_format: Option<serde_json::Value>,
@@ -282,6 +289,13 @@ struct ResponsesRequest {
     max_output_tokens: Option<usize>,
     #[serde(default)]
     stream: Option<bool>,
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -359,10 +373,57 @@ fn msg_text_and_images(val: &serde_json::Value, images: &mut Vec<String>) -> Str
     }
 }
 
-fn format_prompt_with_images(messages: &[ChatMessage], enable_thinking: bool) -> (String, Vec<String>) {
+fn normalize_tool_specs(tools: &[serde_json::Value]) -> (Vec<serde_json::Value>, Vec<String>) {
+    let mut specs = Vec::new();
+    let mut names = Vec::new();
+    for t in tools {
+        let fn_obj = t.get("function").unwrap_or(t);
+        if let Some(name) = fn_obj.get("name").and_then(|v| v.as_str()) {
+            names.push(name.to_string());
+            let desc = fn_obj.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let params = fn_obj.get("parameters").cloned().unwrap_or_else(|| json!({}));
+            let ty = t.get("type").and_then(|v| v.as_str()).unwrap_or("function");
+            specs.push(json!({
+                "description": desc,
+                "name": name,
+                "parameters": params,
+                "type": ty
+            }));
+        }
+    }
+    (specs, names)
+}
+
+fn format_prompt_with_tools(
+    messages: &[ChatMessage],
+    tools: Option<&[serde_json::Value]>,
+    #[allow(dead_code)]
+    enable_thinking: bool,
+) -> (String, Vec<String>, Vec<String>) {
     let mut s = String::from("<|begin_of_text|>");
     let mut images = Vec::new();
+    let mut allowed_tools = Vec::new();
+    if let Some(ts) = tools {
+        if !ts.is_empty() {
+            let (specs, names) = normalize_tool_specs(ts);
+            allowed_tools = names;
+            if !specs.is_empty() {
+                let spec_json = serde_json::to_string(&specs).unwrap_or_else(|_| "[]".into());
+                s.push_str("<|message_system|>tool_declare<|content_xml|>");
+                s.push_str(&spec_json);
+                s.push_str("<|end_message|>");
+            }
+        }
+    }
+    let mut effort_emitted = false;
+    let effort_str = if enable_thinking { "0.7" } else { "0" };
     for m in messages {
+        if !effort_emitted && !matches!(m.role.as_str(), "system" | "developer") {
+            s.push_str("<|message_system|><|content_text|>Thinking effort level: ");
+            s.push_str(effort_str);
+            s.push_str("<|end_message|>");
+            effort_emitted = true;
+        }
         let txt = msg_text_and_images(&m.content, &mut images);
         match m.role.as_str() {
             "system" | "developer" => {
@@ -376,55 +437,185 @@ fn format_prompt_with_images(messages: &[ChatMessage], enable_thinking: bool) ->
                 s.push_str("<|end_message|>");
             }
             "assistant" => {
-                s.push_str("<|message_model|><|content_text|>");
-                s.push_str(&txt);
-                s.push_str("<|end_message|>");
+                if let Some(ref rc) = m.reasoning_content {
+                    if !rc.is_empty() {
+                        s.push_str("<|message_model|><|content_thinking|>");
+                        s.push_str(rc);
+                        s.push_str("<|end_message|>");
+                    }
+                }
+                let has_tcs = m.tool_calls.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+                if !txt.is_empty() || !has_tcs {
+                    s.push_str("<|message_model|><|content_text|>");
+                    s.push_str(&txt);
+                    s.push_str("<|end_message|>");
+                }
+                if let Some(ref tcs) = m.tool_calls {
+                    for tc in tcs {
+                        let fn_obj = tc.get("function").unwrap_or(tc);
+                        if let Some(name) = fn_obj.get("name").and_then(|v| v.as_str()) {
+                            let args_val = match fn_obj.get("arguments").or_else(|| fn_obj.get("args")) {
+                                Some(serde_json::Value::String(st)) => {
+                                    serde_json::from_str::<serde_json::Value>(st).unwrap_or_else(|_| json!({}))
+                                }
+                                Some(v) if v.is_object() => v.clone(),
+                                _ => json!({}),
+                            };
+                            let call_json = serde_json::to_string(&json!({"name": name, "args": args_val}))
+                                .unwrap_or_else(|_| format!("{{\"name\":\"{name}\",\"args\":{{}}}}"));
+                            s.push_str("<|message_model|>");
+                            s.push_str(name);
+                            s.push_str("<|content_invoke_tool_json|>");
+                            s.push_str(&call_json);
+                            s.push_str("<|end_message|>");
+                        }
+                    }
+                }
+                s.push_str("<|content_model_end_sampling|>");
             }
             "tool" => {
-                s.push_str("<|message_tool|><|content_text|>");
+                let mut tname = m.name.clone().unwrap_or_default();
+                if tname.is_empty() {
+                    if let Some(ref cid) = m.tool_call_id {
+                        'outer: for prev in messages {
+                            if prev.role == "assistant" {
+                                if let Some(ref tcs) = prev.tool_calls {
+                                    for tc in tcs {
+                                        if tc.get("id").and_then(|v| v.as_str()) == Some(cid.as_str()) {
+                                            if let Some(n) = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
+                                                tname = n.to_string();
+                                                break 'outer;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                s.push_str("<|message_tool|>");
+                s.push_str(&tname);
+                s.push_str("<|content_text|>");
                 s.push_str(&txt);
                 s.push_str("<|end_message|>");
             }
             _ => {}
         }
     }
+    if !effort_emitted {
+        s.push_str("<|message_system|><|content_text|>Thinking effort level: ");
+        s.push_str(effort_str);
+        s.push_str("<|end_message|>");
+    }
     if enable_thinking {
         s.push_str("<|message_model|><|content_thinking|>");
     } else {
         s.push_str("<|message_model|><|content_thinking|><|content_text|>");
     }
-    (s, images)
+    (s, images, allowed_tools)
 }
 
 fn format_prompt(messages: &[ChatMessage], enable_thinking: bool) -> String {
-    format_prompt_with_images(messages, enable_thinking).0
+    format_prompt_with_tools(messages, None, enable_thinking).0
 }
 
-fn format_responses_input(input: &serde_json::Value, instructions: Option<&str>) -> String {
-    let mut msgs = Vec::new();
+fn format_responses_input_with_tools(
+    input: &serde_json::Value,
+    instructions: Option<&str>,
+    tools: Option<&[serde_json::Value]>,
+    #[allow(dead_code)]
+    enable_thinking: bool,
+) -> (String, Vec<String>, Vec<String>) {
+    let mut msgs: Vec<ChatMessage> = Vec::new();
     if let Some(inst) = instructions {
         if !inst.is_empty() {
-            msgs.push(ChatMessage { role: "system".into(), content: json!(inst), tool_calls: None, name: None });
+            msgs.push(ChatMessage {
+                role: "system".into(),
+                content: json!(inst),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            });
         }
     }
     match input {
         serde_json::Value::String(s) => {
-            msgs.push(ChatMessage { role: "user".into(), content: json!(s), tool_calls: None, name: None });
+            msgs.push(ChatMessage {
+                role: "user".into(),
+                content: json!(s),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            });
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string();
-                let content = item.get("content").cloned().unwrap_or_else(|| json!(""));
-                msgs.push(ChatMessage { role, content, tool_calls: None, name: None });
+                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if item_type == "function_call" {
+                    let call_id = item.get("call_id").or_else(|| item.get("id")).and_then(|v| v.as_str()).unwrap_or("call_0").to_string();
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let arguments = item.get("arguments").cloned().unwrap_or_else(|| json!("{}"));
+                    let tc_json = json!({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments}
+                    });
+                    if let Some(last) = msgs.last_mut() {
+                        if last.role == "assistant" {
+                            last.tool_calls.get_or_insert_with(Vec::new).push(tc_json);
+                            continue;
+                        }
+                    }
+                    msgs.push(ChatMessage {
+                        role: "assistant".into(),
+                        content: json!(""),
+                        tool_calls: Some(vec![tc_json]),
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                    });
+                } else if item_type == "function_call_output" {
+                    let call_id = item.get("call_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let output = item.get("output").cloned().unwrap_or_else(|| json!(""));
+                    msgs.push(ChatMessage {
+                        role: "tool".into(),
+                        content: output,
+                        tool_calls: None,
+                        tool_call_id: call_id,
+                        name: None,
+                        reasoning_content: None,
+                    });
+                } else {
+                    let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string();
+                    let content = item.get("content").cloned().unwrap_or_else(|| json!(""));
+                    msgs.push(ChatMessage {
+                        role,
+                        content,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                    });
+                }
             }
         }
         _ => {
-            msgs.push(ChatMessage { role: "user".into(), content: json!(""), tool_calls: None, name: None });
+            msgs.push(ChatMessage {
+                role: "user".into(),
+                content: json!(""),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            });
         }
     }
-    format_prompt(&msgs, false)
+    format_prompt_with_tools(&msgs, tools, enable_thinking)
 }
 
+#[allow(dead_code)]
 fn split_thinking(raw: &str, enable_thinking: bool) -> (Option<String>, String) {
     let cleaned = raw
         .replace("<|content_model_end_sampling|>", "")
@@ -565,7 +756,8 @@ fn prefill_with_drafter(
 }
 
 fn ngram_bucket_len(avail: usize) -> usize {
-    if avail >= 48 { 48 }
+    if avail >= 64 { 64 }
+    else if avail >= 48 { 48 }
     else if avail >= 32 { 32 }
     else if avail >= 24 { 24 }
     else if avail >= 16 { 16 }
@@ -683,7 +875,7 @@ fn run_scheduler(
                             }
                         }
                         let _ = job.tx.send(GenEvent::Prefill { prompt_n: job.prompt_ids.len(), cached_n, pp_ms });
-                        if job.max_tokens == 0 || first_tok == 200006 || (first_tok == 200008 && !job.enable_thinking) {
+                        if job.max_tokens == 0 || first_tok == 200006 || first_tok == 199999 {
                             let _ = job.tx.send(GenEvent::Done { finish_reason: if job.max_tokens == 0 { "length" } else { "stop" }, pred_n: 0, dec_ms: 0.0 });
                             free[seq] = true;
                         } else {
@@ -791,7 +983,7 @@ fn run_scheduler(
                             cached_n: pf.cached_n,
                             pp_ms,
                         });
-                        if pf.job.max_tokens == 0 || last_tok == 200006 || (last_tok == 200008 && !pf.job.enable_thinking) {
+                        if pf.job.max_tokens == 0 || last_tok == 200006 || last_tok == 199999 {
                             let _ = pf.job.tx.send(GenEvent::Done {
                                 finish_reason: if pf.job.max_tokens == 0 { "length" } else { "stop" },
                                 pred_n: 0,
@@ -890,7 +1082,7 @@ fn run_scheduler(
                             let mut finished = false;
                             let mut last_tok = slot.next_tok;
                             for nxt in toks_out {
-                                let is_stop = nxt == 200006 || (nxt == 200008 && !slot.enable_thinking);
+                                let is_stop = nxt == 200006 || nxt == 199999;
                                 if is_stop || slot.tx.is_closed() {
                                     let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
                                     let _ = slot.tx.send(GenEvent::Done {
@@ -981,7 +1173,7 @@ fn run_scheduler(
                                 let mut finished = false;
                                 let mut last_tok = slot.next_tok;
                                 for nxt in toks_out {
-                                    let is_stop = nxt == 200006 || (nxt == 200008 && !slot.enable_thinking);
+                                    let is_stop = nxt == 200006 || nxt == 199999;
                                     if is_stop || slot.tx.is_closed() {
                                         let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
                                         let _ = slot.tx.send(GenEvent::Done {
@@ -1044,7 +1236,7 @@ fn run_scheduler(
                         }
                     }
                     let _ = engine.paged_kv.ensure_tokens(slot.seq, engine.seq_pos[slot.seq] as usize, &engine.seq_tokens[slot.seq]);
-                    let is_stop = nxt == 200006 || (nxt == 200008 && !slot.enable_thinking);
+                    let is_stop = nxt == 200006 || nxt == 199999;
                     if is_stop || slot.tx.is_closed() {
                         let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
                         let _ = slot.tx.send(GenEvent::Done {
@@ -1091,6 +1283,7 @@ async fn collect_job(
     prompt_ids: Vec<i32>,
     images: Vec<String>,
     max_tokens: usize,
+    #[allow(dead_code)]
     enable_thinking: bool,
     json_grammar: bool,
 ) -> Result<(Vec<u32>, usize, usize, f64, f64, &'static str), String> {
@@ -1190,10 +1383,9 @@ async fn chat_completions(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
     }
     let model_id = req.model.unwrap_or_else(|| "inkling-2-mini".into());
-    let max_tokens = req.max_tokens.unwrap_or(512).min(8192);
+    let max_tokens = req.max_tokens.or(req.max_completion_tokens).unwrap_or(4096).min(16384);
     let enable_thinking = req.chat_template_kwargs.and_then(|k| k.enable_thinking).unwrap_or(false);
     let stream = req.stream.unwrap_or(false);
-    let mut allowed_tools: Vec<String> = Vec::new();
     let mut force_tool_json = false;
     let mut forced_tool_name: Option<String> = None;
     if let Some(ref tc) = req.tool_choice {
@@ -1206,27 +1398,17 @@ async fn chat_completions(
     }
     let response_json = req.response_format.as_ref().and_then(|rf| rf.get("type")).and_then(|t| t.as_str()).map(|t| t == "json_object" || t == "json_schema").unwrap_or(false);
     let json_grammar = force_tool_json || response_json;
+    let initial_thinking = enable_thinking && !json_grammar;
 
-    let (mut prompt, images) = format_prompt_with_images(&req.messages, enable_thinking && !json_grammar);
-    if let Some(ref tools) = req.tools {
-        if !tools.is_empty() {
-            for t in tools {
-                if let Some(n) = t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
-                    allowed_tools.push(n.to_string());
-                }
-            }
-            let tools_json = serde_json::to_string(tools).unwrap_or_default();
-            let extra = if let Some(ref fn_name) = forced_tool_name {
-                format!(" You MUST call tool `{fn_name}` by responding ONLY with valid JSON: {{\"name\": \"{fn_name}\", \"arguments\": {{...}}}}.")
-            } else if force_tool_json {
-                " You MUST respond ONLY with valid JSON tool call: {\"name\": \"<tool_name>\", \"arguments\": {...}}.".to_string()
-            } else {
-                " To call a tool, respond with JSON: {\"name\": \"<tool_name>\", \"arguments\": {...}}.".to_string()
-            };
-            let tool_sys = format!("<|message_system|><|content_text|>Available tools: {tools_json}{extra}<|end_message|>");
-            if let Some(rest) = prompt.strip_prefix("<|begin_of_text|>") {
-                prompt = format!("<|begin_of_text|>{tool_sys}{rest}");
-            }
+    let (mut prompt, images, allowed_tools) = format_prompt_with_tools(&req.messages, req.tools.as_deref(), initial_thinking);
+    if force_tool_json {
+        let extra = if let Some(ref fn_name) = forced_tool_name {
+            format!("<|message_system|><|content_text|>You MUST call tool `{fn_name}` by responding ONLY with valid JSON: {{\"name\": \"{fn_name}\", \"arguments\": {{...}}}}.<|end_message|>")
+        } else {
+            "<|message_system|><|content_text|>You MUST respond ONLY with a valid JSON tool call: {\"name\": \"<tool_name>\", \"arguments\": {...}}.<|end_message|>".to_string()
+        };
+        if let Some(rest) = prompt.strip_prefix("<|begin_of_text|>") {
+            prompt = format!("<|begin_of_text|>{extra}{rest}");
         }
     } else if response_json {
         let json_sys = "<|message_system|><|content_text|>Respond ONLY with valid JSON.<|end_message|>";
@@ -1245,10 +1427,11 @@ async fn chat_completions(
     let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
     let created = now_unix();
     let req_id = next_id("chatcmpl");
+    let call_prefix = next_id("call");
 
     if stream {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, images, max_tokens, enable_thinking: enable_thinking && !json_grammar, json_grammar, tx }).is_err() {
+        if st.job_tx.send(GenJob { prompt_ids, images, max_tokens, enable_thinking: initial_thinking, json_grammar, tx }).is_err() {
             st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response();
         }
@@ -1256,23 +1439,51 @@ async fn chat_completions(
         let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
         let tok = st.tokenizer.clone();
         tokio::spawn(async move {
-            let mut acc_ids: Vec<u32> = Vec::new();
-            let mut prev_len = 0usize;
+            let mut parser = grammar::InklingStreamParser::new(initial_thinking, call_prefix, allowed_tools);
             let mut sent_role = false;
+            let mut tc_index = 0usize;
             while let Some(ev) = rx.recv().await {
                 match ev {
                     GenEvent::Prefill { .. } => {}
                     GenEvent::Token(t) => {
-                        acc_ids.push(t);
-                        let decoded = tok.decode(&acc_ids, true).unwrap_or_default();
-                        if decoded.len() > prev_len {
-                            let delta = decoded[prev_len..].to_string();
-                            prev_len = decoded.len();
-                            let d_obj = if !sent_role {
-                                sent_role = true;
-                                json!({"role": "assistant", "content": delta})
-                            } else {
-                                json!({"content": delta})
+                        let deltas = parser.push_token(t, &tok);
+                        for d in deltas {
+                            let d_obj = match d {
+                                grammar::StreamDelta::Text(s) => {
+                                    if !sent_role {
+                                        sent_role = true;
+                                        json!({"role": "assistant", "content": s})
+                                    } else {
+                                        json!({"content": s})
+                                    }
+                                }
+                                grammar::StreamDelta::Reasoning(s) => {
+                                    if !sent_role {
+                                        sent_role = true;
+                                        json!({"role": "assistant", "reasoning_content": s})
+                                    } else {
+                                        json!({"reasoning_content": s})
+                                    }
+                                }
+                                grammar::StreamDelta::ToolCall(tc) => {
+                                    let idx = tc_index;
+                                    tc_index += 1;
+                                    let tc_delta = json!([{
+                                        "index": idx,
+                                        "id": tc.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc.name,
+                                            "arguments": tc.arguments
+                                        }
+                                    }]);
+                                    if !sent_role {
+                                        sent_role = true;
+                                        json!({"role": "assistant", "content": serde_json::Value::Null, "tool_calls": tc_delta})
+                                    } else {
+                                        json!({"tool_calls": tc_delta})
+                                    }
+                                }
                             };
                             let chunk = json!({
                                 "id": req_id,
@@ -1285,12 +1496,42 @@ async fn chat_completions(
                         }
                     }
                     GenEvent::Done { finish_reason, .. } => {
+                        for d in parser.finish(&tok) {
+                            if let grammar::StreamDelta::ToolCall(tc) = d {
+                                let idx = tc_index;
+                                tc_index += 1;
+                                let tc_delta = json!([{
+                                    "index": idx,
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": tc.arguments
+                                    }
+                                }]);
+                                let d_obj = if !sent_role {
+                                    sent_role = true;
+                                    json!({"role": "assistant", "content": serde_json::Value::Null, "tool_calls": tc_delta})
+                                } else {
+                                    json!({"tool_calls": tc_delta})
+                                };
+                                let chunk = json!({
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [{"index": 0, "delta": d_obj, "finish_reason": null}]
+                                });
+                                let _ = sse_tx.send(Ok(Event::default().data(chunk.to_string())));
+                            }
+                        }
+                        let final_fr = if tc_index > 0 { "tool_calls" } else { finish_reason };
                         let done_chunk = json!({
                             "id": req_id,
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": model_id,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": final_fr}]
                         });
                         let _ = sse_tx.send(Ok(Event::default().data(done_chunk.to_string())));
                         let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
@@ -1309,7 +1550,7 @@ async fn chat_completions(
     }
 
     let (out_ids, prompt_n, cached_n, pp_ms, dec_ms, mut finish_reason) =
-        match collect_job(&st, prompt_ids, images, max_tokens, enable_thinking && !json_grammar, json_grammar).await {
+        match collect_job(&st, prompt_ids, images, max_tokens, initial_thinking, json_grammar).await {
             Ok(v) => v,
             Err(e) => {
                 st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
@@ -1318,19 +1559,20 @@ async fn chat_completions(
         };
     st.metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
     let pred_n = out_ids.len();
-    let raw_text = st.tokenizer.decode(&out_ids, false).unwrap_or_default();
-    let (reasoning, content) = split_thinking(&raw_text, enable_thinking && !json_grammar);
-    let mut msg_obj = if !allowed_tools.is_empty() {
-        if let Some(tcs) = grammar::parse_tool_calls(&content, &allowed_tools) {
-            finish_reason = "tool_calls";
-            json!({"role": "assistant", "content": serde_json::Value::Null, "tool_calls": tcs})
+    let parsed = grammar::parse_inkling_tokens(&out_ids, &st.tokenizer, initial_thinking, &allowed_tools, &call_prefix);
+    let mut msg_obj = if !parsed.tool_calls.is_empty() {
+        finish_reason = "tool_calls";
+        let tcs: Vec<serde_json::Value> = parsed.tool_calls.iter().map(|tc| tc.to_chat_json()).collect();
+        let content_val = if parsed.content.is_empty() {
+            serde_json::Value::Null
         } else {
-            json!({"role": "assistant", "content": content})
-        }
+            json!(parsed.content)
+        };
+        json!({"role": "assistant", "content": content_val, "tool_calls": tcs})
     } else {
-        json!({"role": "assistant", "content": content})
+        json!({"role": "assistant", "content": parsed.content})
     };
-    if let Some(r) = reasoning {
+    if let Some(r) = parsed.reasoning {
         msg_obj["reasoning_content"] = json!(r);
     }
     Json(json!({
@@ -1447,53 +1689,193 @@ async fn responses_http(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
     }
     let model_id = req.model.unwrap_or_else(|| "inkling-2-mini".into());
-    let max_tokens = req.max_output_tokens.unwrap_or(512).min(8192);
+    let max_tokens = req.max_output_tokens.unwrap_or(4096).min(16384);
     let stream = req.stream.unwrap_or(false);
-    let prompt = format_responses_input(&req.input, req.instructions.as_deref());
+    let enable_thinking = req
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.get("effort"))
+        .and_then(|e| e.as_str())
+        .map(|s| s != "none")
+        .unwrap_or(false);
+    let (prompt, images, allowed_tools) = format_responses_input_with_tools(
+        &req.input,
+        req.instructions.as_deref(),
+        req.tools.as_deref(),
+        enable_thinking,
+    );
     let enc = match st.tokenizer.encode(prompt, false) {
         Ok(e) => e,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e}")}))).into_response(),
     };
     let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
     let resp_id = next_id("resp");
+    let call_prefix = next_id("call");
+    let msg_id = next_id("msg");
     let created = now_unix();
 
     if stream {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, images: Vec::new(), max_tokens, enable_thinking: false, json_grammar: false, tx }).is_err() {
+        if st.job_tx.send(GenJob { prompt_ids, images, max_tokens, enable_thinking, json_grammar: false, tx }).is_err() {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response();
         }
         let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
         let tok = st.tokenizer.clone();
         tokio::spawn(async move {
-            let mut acc_ids: Vec<u32> = Vec::new();
-            let mut prev_len = 0usize;
+            let mut parser = grammar::InklingStreamParser::new(enable_thinking, call_prefix, allowed_tools);
+            let mut msg_started = false;
+            let mut output_items: Vec<serde_json::Value> = Vec::new();
+            let mut out_index = 0usize;
             let _ = sse_tx.send(Ok(Event::default().event("response.created").data(
-                json!({"type":"response.created","response":{"id":resp_id,"status":"in_progress","model":model_id,"created_at":created}}).to_string()
+                json!({"type":"response.created","response":{"id":resp_id,"object":"response","status":"in_progress","model":model_id,"created_at":created,"output":[]}}).to_string()
             )));
             while let Some(ev) = rx.recv().await {
                 match ev {
                     GenEvent::Prefill { .. } => {}
                     GenEvent::Token(t) => {
-                        acc_ids.push(t);
-                        let decoded = tok.decode(&acc_ids, true).unwrap_or_default();
-                        if decoded.len() > prev_len {
-                            let delta = decoded[prev_len..].to_string();
-                            prev_len = decoded.len();
-                            let _ = sse_tx.send(Ok(Event::default().event("response.output_text.delta").data(
-                                json!({"type":"response.output_text.delta","response_id":resp_id,"delta":delta}).to_string()
-                            )));
+                        for d in parser.push_token(t, &tok) {
+                            match d {
+                                grammar::StreamDelta::Text(delta) => {
+                                    if !msg_started {
+                                        msg_started = true;
+                                        let _ = sse_tx.send(Ok(Event::default().event("response.output_item.added").data(
+                                            json!({
+                                                "type": "response.output_item.added",
+                                                "output_index": out_index,
+                                                "item": {"id": msg_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+                                            }).to_string()
+                                        )));
+                                    }
+                                    let _ = sse_tx.send(Ok(Event::default().event("response.output_text.delta").data(
+                                        json!({"type":"response.output_text.delta","response_id":resp_id,"item_id":msg_id,"output_index":out_index,"content_index":0,"delta":delta}).to_string()
+                                    )));
+                                }
+                                grammar::StreamDelta::Reasoning(_) => {}
+                                grammar::StreamDelta::ToolCall(tc) => {
+                                    if msg_started {
+                                        let full_txt = parser.full_text(&tok);
+                                        let msg_item = json!({
+                                            "id": msg_id,
+                                            "type": "message",
+                                            "status": "completed",
+                                            "role": "assistant",
+                                            "content": [{"type": "output_text", "text": full_txt}]
+                                        });
+                                        let _ = sse_tx.send(Ok(Event::default().event("response.output_text.done").data(
+                                            json!({"type":"response.output_text.done","item_id":msg_id,"output_index":out_index,"content_index":0,"text":full_txt}).to_string()
+                                        )));
+                                        let _ = sse_tx.send(Ok(Event::default().event("response.output_item.done").data(
+                                            json!({"type":"response.output_item.done","output_index":out_index,"item":msg_item}).to_string()
+                                        )));
+                                        output_items.push(msg_item);
+                                        out_index += 1;
+                                        msg_started = false;
+                                    }
+                                    let fc_id = next_id("fc");
+                                    let fc_added = json!({
+                                        "id": fc_id,
+                                        "type": "function_call",
+                                        "status": "in_progress",
+                                        "call_id": tc.id,
+                                        "name": tc.name,
+                                        "arguments": ""
+                                    });
+                                    let _ = sse_tx.send(Ok(Event::default().event("response.output_item.added").data(
+                                        json!({"type":"response.output_item.added","output_index":out_index,"item":fc_added}).to_string()
+                                    )));
+                                    let _ = sse_tx.send(Ok(Event::default().event("response.function_call_arguments.delta").data(
+                                        json!({"type":"response.function_call_arguments.delta","item_id":fc_id,"output_index":out_index,"delta":tc.arguments}).to_string()
+                                    )));
+                                    let _ = sse_tx.send(Ok(Event::default().event("response.function_call_arguments.done").data(
+                                        json!({"type":"response.function_call_arguments.done","item_id":fc_id,"output_index":out_index,"arguments":tc.arguments}).to_string()
+                                    )));
+                                    let fc_done = json!({
+                                        "id": fc_id,
+                                        "type": "function_call",
+                                        "status": "completed",
+                                        "call_id": tc.id,
+                                        "name": tc.name,
+                                        "arguments": tc.arguments
+                                    });
+                                    let _ = sse_tx.send(Ok(Event::default().event("response.output_item.done").data(
+                                        json!({"type":"response.output_item.done","output_index":out_index,"item":fc_done}).to_string()
+                                    )));
+                                    output_items.push(fc_done);
+                                    out_index += 1;
+                                }
+                            }
                         }
                     }
                     GenEvent::Done { pred_n, dec_ms, .. } => {
-                        let full = tok.decode(&acc_ids, true).unwrap_or_default();
+                        for d in parser.finish(&tok) {
+                            if let grammar::StreamDelta::ToolCall(tc) = d {
+                                if msg_started {
+                                    let full_txt = parser.full_text(&tok);
+                                    let msg_item = json!({
+                                        "id": msg_id,
+                                        "type": "message",
+                                        "status": "completed",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": full_txt}]
+                                    });
+                                    let _ = sse_tx.send(Ok(Event::default().event("response.output_item.done").data(
+                                        json!({"type":"response.output_item.done","output_index":out_index,"item":msg_item}).to_string()
+                                    )));
+                                    output_items.push(msg_item);
+                                    out_index += 1;
+                                    msg_started = false;
+                                }
+                                let fc_id = next_id("fc");
+                                let fc_done = json!({
+                                    "id": fc_id,
+                                    "type": "function_call",
+                                    "status": "completed",
+                                    "call_id": tc.id,
+                                    "name": tc.name,
+                                    "arguments": tc.arguments
+                                });
+                                let _ = sse_tx.send(Ok(Event::default().event("response.output_item.added").data(
+                                    json!({"type":"response.output_item.added","output_index":out_index,"item":fc_done}).to_string()
+                                )));
+                                let _ = sse_tx.send(Ok(Event::default().event("response.function_call_arguments.delta").data(
+                                    json!({"type":"response.function_call_arguments.delta","item_id":fc_id,"output_index":out_index,"delta":tc.arguments}).to_string()
+                                )));
+                                let _ = sse_tx.send(Ok(Event::default().event("response.function_call_arguments.done").data(
+                                    json!({"type":"response.function_call_arguments.done","item_id":fc_id,"output_index":out_index,"arguments":tc.arguments}).to_string()
+                                )));
+                                let _ = sse_tx.send(Ok(Event::default().event("response.output_item.done").data(
+                                    json!({"type":"response.output_item.done","output_index":out_index,"item":fc_done}).to_string()
+                                )));
+                                output_items.push(fc_done);
+                                out_index += 1;
+                            }
+                        }
+                        let full = parser.full_text(&tok);
+                        if msg_started {
+                            let msg_item = json!({
+                                "id": msg_id,
+                                "type": "message",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": full}]
+                            });
+                            let _ = sse_tx.send(Ok(Event::default().event("response.output_text.done").data(
+                                json!({"type":"response.output_text.done","item_id":msg_id,"output_index":out_index,"content_index":0,"text":full}).to_string()
+                            )));
+                            let _ = sse_tx.send(Ok(Event::default().event("response.output_item.done").data(
+                                json!({"type":"response.output_item.done","output_index":out_index,"item":msg_item}).to_string()
+                            )));
+                            output_items.push(msg_item);
+                        }
                         let _ = sse_tx.send(Ok(Event::default().event("response.completed").data(
                             json!({
                                 "type":"response.completed",
                                 "response":{
                                     "id":resp_id,
+                                    "object":"response",
                                     "status":"completed",
                                     "model":model_id,
+                                    "output":output_items,
                                     "output_text":full,
                                     "timings":{"predicted_n":pred_n,"predicted_ms":dec_ms}
                                 }
@@ -1514,24 +1896,40 @@ async fn responses_http(
     }
 
     let (out_ids, prompt_n, cached_n, pp_ms, dec_ms, _) =
-        match collect_job(&st, prompt_ids, Vec::new(), max_tokens, false, false).await {
+        match collect_job(&st, prompt_ids, images, max_tokens, enable_thinking, false).await {
             Ok(v) => v,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
         };
     let pred_n = out_ids.len();
-    let text = st.tokenizer.decode(&out_ids, true).unwrap_or_default().trim().to_string();
+    let parsed = grammar::parse_inkling_tokens(&out_ids, &st.tokenizer, enable_thinking, &allowed_tools, &call_prefix);
+    let mut output_items: Vec<serde_json::Value> = Vec::new();
+    if !parsed.content.is_empty() || parsed.tool_calls.is_empty() {
+        output_items.push(json!({
+            "id": msg_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": parsed.content}]
+        }));
+    }
+    for tc in &parsed.tool_calls {
+        output_items.push(json!({
+            "id": next_id("fc"),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": tc.id,
+            "name": tc.name,
+            "arguments": tc.arguments
+        }));
+    }
     Json(json!({
         "id": resp_id,
         "object": "response",
         "created_at": created,
         "status": "completed",
         "model": model_id,
-        "output": [{
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text}]
-        }],
-        "output_text": text,
+        "output": output_items,
+        "output_text": parsed.content,
         "usage": {
             "input_tokens": prompt_n,
             "output_tokens": pred_n,
@@ -1581,10 +1979,11 @@ async fn handle_ws(mut socket: WebSocket, st: Arc<AppState>) {
         };
         let body = val.get("response").unwrap_or(&val);
         let model_id = body.get("model").and_then(|v| v.as_str()).unwrap_or("inkling-2-mini").to_string();
-        let max_tokens = body.get("max_output_tokens").and_then(|v| v.as_u64()).unwrap_or(512).min(8192) as usize;
+        let max_tokens = body.get("max_output_tokens").and_then(|v| v.as_u64()).unwrap_or(4096).min(16384) as usize;
         let instructions = body.get("instructions").and_then(|v| v.as_str());
         let input = body.get("input").cloned().unwrap_or_else(|| json!(""));
-        let prompt = format_responses_input(&input, instructions);
+        let tools_vec = body.get("tools").and_then(|v| v.as_array()).cloned();
+        let (prompt, images, allowed_tools) = format_responses_input_with_tools(&input, instructions, tools_vec.as_deref(), false);
         let enc = match st.tokenizer.encode(prompt, false) {
             Ok(e) => e,
             Err(e) => {
@@ -1594,18 +1993,22 @@ async fn handle_ws(mut socket: WebSocket, st: Arc<AppState>) {
         };
         let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
         let resp_id = next_id("resp");
+        let call_prefix = next_id("call");
+        let msg_id = next_id("msg");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, images: Vec::new(), max_tokens, enable_thinking: false, json_grammar: false, tx }).is_err() {
+        if st.job_tx.send(GenJob { prompt_ids, images, max_tokens, enable_thinking: false, json_grammar: false, tx }).is_err() {
             let _ = socket.send(Message::Text(json!({"type":"error","error":"scheduler closed"}).to_string())).await;
             break;
         }
         let _ = socket.send(Message::Text(json!({
             "type": "response.created",
-            "response": {"id": resp_id, "status": "in_progress", "model": model_id}
+            "response": {"id": resp_id, "object": "response", "status": "in_progress", "model": model_id, "output": []}
         }).to_string())).await;
 
-        let mut acc_ids: Vec<u32> = Vec::new();
-        let mut prev_len = 0usize;
+        let mut parser = grammar::InklingStreamParser::new(false, call_prefix, allowed_tools);
+        let mut output_items: Vec<serde_json::Value> = Vec::new();
+        let mut msg_started = false;
+        let mut out_index = 0usize;
         let mut prompt_n = 0usize;
         let mut cached_n = 0usize;
         let mut pp_ms = 0.0f64;
@@ -1617,28 +2020,93 @@ async fn handle_ws(mut socket: WebSocket, st: Arc<AppState>) {
                     pp_ms = pm;
                 }
                 GenEvent::Token(t) => {
-                    acc_ids.push(t);
-                    let decoded = st.tokenizer.decode(&acc_ids, true).unwrap_or_default();
-                    if decoded.len() > prev_len {
-                        let delta = decoded[prev_len..].to_string();
-                        prev_len = decoded.len();
-                        if socket.send(Message::Text(json!({
-                            "type": "response.output_text.delta",
-                            "response_id": resp_id,
-                            "delta": delta
-                        }).to_string())).await.is_err() {
-                            return;
+                    for d in parser.push_token(t, &st.tokenizer) {
+                        match d {
+                            grammar::StreamDelta::Text(delta) => {
+                                msg_started = true;
+                                if socket.send(Message::Text(json!({
+                                    "type": "response.output_text.delta",
+                                    "response_id": resp_id,
+                                    "item_id": msg_id,
+                                    "output_index": out_index,
+                                    "delta": delta
+                                }).to_string())).await.is_err() {
+                                    return;
+                                }
+                            }
+                            grammar::StreamDelta::Reasoning(_) => {}
+                            grammar::StreamDelta::ToolCall(tc) => {
+                                if msg_started {
+                                    let full_txt = parser.full_text(&st.tokenizer);
+                                    output_items.push(json!({
+                                        "id": msg_id,
+                                        "type": "message",
+                                        "status": "completed",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": full_txt}]
+                                    }));
+                                    out_index += 1;
+                                    msg_started = false;
+                                }
+                                let fc_id = next_id("fc");
+                                let fc_done = json!({
+                                    "id": fc_id,
+                                    "type": "function_call",
+                                    "status": "completed",
+                                    "call_id": tc.id,
+                                    "name": tc.name,
+                                    "arguments": tc.arguments
+                                });
+                                let _ = socket.send(Message::Text(json!({
+                                    "type": "response.output_item.done",
+                                    "output_index": out_index,
+                                    "item": fc_done
+                                }).to_string())).await;
+                                output_items.push(fc_done);
+                                out_index += 1;
+                            }
                         }
                     }
                 }
                 GenEvent::Done { pred_n, dec_ms, .. } => {
-                    let full = st.tokenizer.decode(&acc_ids, true).unwrap_or_default().trim().to_string();
+                    for d in parser.finish(&st.tokenizer) {
+                        if let grammar::StreamDelta::ToolCall(tc) = d {
+                            let fc_id = next_id("fc");
+                            let fc_done = json!({
+                                "id": fc_id,
+                                "type": "function_call",
+                                "status": "completed",
+                                "call_id": tc.id,
+                                "name": tc.name,
+                                "arguments": tc.arguments
+                            });
+                            let _ = socket.send(Message::Text(json!({
+                                "type": "response.output_item.done",
+                                "output_index": out_index,
+                                "item": fc_done
+                            }).to_string())).await;
+                            output_items.push(fc_done);
+                            out_index += 1;
+                        }
+                    }
+                    let full = parser.full_text(&st.tokenizer).trim().to_string();
+                    if msg_started || output_items.is_empty() {
+                        output_items.push(json!({
+                            "id": msg_id,
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": full}]
+                        }));
+                    }
                     let _ = socket.send(Message::Text(json!({
                         "type": "response.completed",
                         "response": {
                             "id": resp_id,
+                            "object": "response",
                             "status": "completed",
                             "model": model_id,
+                            "output": output_items,
                             "output_text": full,
                             "usage": {
                                 "input_tokens": prompt_n,
@@ -1936,7 +2404,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
     println!();
 
     let short_p = format_prompt(
-        &[ChatMessage { role: "user".into(), content: json!("Explain GPU memory bandwidth in one paragraph."), tool_calls: None, name: None }],
+        &[ChatMessage { role: "user".into(), content: json!("Explain GPU memory bandwidth in one paragraph."), tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }],
         false,
     );
     let short_ids: Vec<i32> = tokenizer.encode(short_p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
@@ -1972,7 +2440,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
         long_text.push_str(long_chunk);
     }
     let long_p = format_prompt(
-        &[ChatMessage { role: "user".into(), content: json!(long_text), tool_calls: None, name: None }],
+        &[ChatMessage { role: "user".into(), content: json!(long_text), tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }],
         false,
     );
     let base_ids: Vec<i32> = tokenizer.encode(long_p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
@@ -2058,7 +2526,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
             ("Prose", "Explain how modern GPU memory hierarchies work, from registers to L1/L2 caches and HBM, and why memory bandwidth limits LLM decoding."),
         ];
         for (label, text) in prompts {
-            let p = format_prompt(&[ChatMessage { role: "user".into(), content: json!(text), tool_calls: None, name: None }], false);
+            let p = format_prompt(&[ChatMessage { role: "user".into(), content: json!(text), tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }], false);
             let ids: Vec<i32> = tokenizer.encode(p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
             engine.reset_seq(0)?;
             d.reset_seq(0);
@@ -2103,7 +2571,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
             if b <= d.max_seqs() {
                 let mk = 4usize;
                 let code_p = format_prompt(
-                    &[ChatMessage { role: "user".into(), content: json!("Show me a Python implementation of quicksort and mergesort."), tool_calls: None, name: None }],
+                    &[ChatMessage { role: "user".into(), content: json!("Show me a Python implementation of quicksort and mergesort."), tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }],
                     false,
                 );
                 let ids: Vec<i32> = tokenizer.encode(code_p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
@@ -2207,7 +2675,7 @@ async fn main() -> anyhow::Result<()> {
             (Vec::new(), user_prompt)
         };
         let formatted = format_prompt(
-            &[ChatMessage { role: "user".into(), content: serde_json::Value::String(prompt_content), tool_calls: None, name: None }],
+            &[ChatMessage { role: "user".into(), content: serde_json::Value::String(prompt_content), tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }],
             opts.thinking,
         );
         let ids: Vec<i32> = tokenizer.encode(formatted, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();

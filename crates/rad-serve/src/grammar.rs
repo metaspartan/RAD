@@ -320,6 +320,122 @@ impl VocabGrammarTable {
     }
 }
 
+pub const TOK_ENDOFTEXT: u32 = 199999;
+pub const TOK_MSG_MODEL: u32 = 200001;
+pub const TOK_CONTENT_TEXT: u32 = 200004;
+pub const TOK_END_SAMPLING: u32 = 200006;
+pub const TOK_CONTENT_THINKING: u32 = 200008;
+pub const TOK_END_MESSAGE: u32 = 200010;
+pub const TOK_INVOKE_TOOL_JSON: u32 = 200049;
+pub const TOK_INVOKE_TOOL_TEXT: u32 = 200057;
+
+#[derive(Clone, Debug)]
+pub struct ParsedToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+impl ParsedToolCall {
+    pub fn to_chat_json(&self) -> Value {
+        serde_json::json!({
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": self.arguments
+            }
+        })
+    }
+}
+
+pub struct ParsedTurn {
+    pub reasoning: Option<String>,
+    pub content: String,
+    pub tool_calls: Vec<ParsedToolCall>,
+}
+
+fn extract_args_str(item: &Value) -> String {
+    let args = item
+        .get("arguments")
+        .or_else(|| item.get("args"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(s) = args.as_str() {
+        s.to_string()
+    } else {
+        serde_json::to_string(&args).unwrap_or_else(|_| "{}".into())
+    }
+}
+
+pub fn parse_single_tool_call(
+    payload: &str,
+    fallback_name: &str,
+    allowed_tools: &[String],
+    call_id: String,
+) -> Option<ParsedToolCall> {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let fb = fallback_name.trim();
+    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
+            if !allowed_tools.is_empty() && !allowed_tools.iter().any(|a| a == name) {
+                return None;
+            }
+            return Some(ParsedToolCall {
+                id: call_id,
+                name: name.to_string(),
+                arguments: extract_args_str(&val),
+            });
+        }
+        if !fb.is_empty() {
+            if !allowed_tools.is_empty() && !allowed_tools.iter().any(|a| a == fb) {
+                return None;
+            }
+            let args_str = serde_json::to_string(&val).unwrap_or_else(|_| "{}".into());
+            return Some(ParsedToolCall {
+                id: call_id,
+                name: fb.to_string(),
+                arguments: args_str,
+            });
+        }
+    }
+    if let Some(brace) = trimmed.find('{') {
+        let prefix = trimmed[..brace].trim();
+        let json_part = trimmed[brace..].trim();
+        let cand_name = if !prefix.is_empty() { prefix } else { fb };
+        if let Ok(val) = serde_json::from_str::<Value>(json_part) {
+            let name = val
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(cand_name);
+            if !name.is_empty() && (allowed_tools.is_empty() || allowed_tools.iter().any(|a| a == name)) {
+                let arguments = if val.get("arguments").is_some() || val.get("args").is_some() {
+                    extract_args_str(&val)
+                } else {
+                    serde_json::to_string(&val).unwrap_or_else(|_| "{}".into())
+                };
+                return Some(ParsedToolCall {
+                    id: call_id,
+                    name: name.to_string(),
+                    arguments,
+                });
+            }
+        }
+    }
+    if !fb.is_empty() && (allowed_tools.is_empty() || allowed_tools.iter().any(|a| a == fb)) {
+        let args_str = serde_json::json!({"input": trimmed}).to_string();
+        return Some(ParsedToolCall {
+            id: call_id,
+            name: fb.to_string(),
+            arguments: args_str,
+        });
+    }
+    None
+}
+
 pub fn parse_tool_calls(text: &str, allowed_tools: &[String]) -> Option<Vec<Value>> {
     let trimmed = text.trim();
     let candidate = if let Some(s) = trimmed.strip_prefix("```json") {
@@ -345,12 +461,7 @@ pub fn parse_tool_calls(text: &str, allowed_tools: &[String]) -> Option<Vec<Valu
         if !allowed_tools.is_empty() && !allowed_tools.iter().any(|a| a == name) {
             continue;
         }
-        let args = item.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
-        let args_str = if let Some(s) = args.as_str() {
-            s.to_string()
-        } else {
-            serde_json::to_string(&args).unwrap_or_else(|_| "{}".into())
-        };
+        let args_str = extract_args_str(item);
         out.push(serde_json::json!({
             "id": format!("call_rad_{idx}"),
             "type": "function",
@@ -361,4 +472,209 @@ pub fn parse_tool_calls(text: &str, allowed_tools: &[String]) -> Option<Vec<Valu
         }));
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StreamMode {
+    Thinking,
+    Text,
+    PendingHeader,
+    ToolJson,
+    ToolText,
+}
+
+pub struct InklingStreamParser {
+    pub mode: StreamMode,
+    thinking_ids: Vec<u32>,
+    thinking_len: usize,
+    text_ids: Vec<u32>,
+    text_len: usize,
+    header_ids: Vec<u32>,
+    tool_ids: Vec<u32>,
+    tool_name_hint: String,
+    call_prefix: String,
+    allowed_tools: Vec<String>,
+    pub emitted_calls: Vec<ParsedToolCall>,
+}
+
+pub enum StreamDelta {
+    Reasoning(String),
+    Text(String),
+    ToolCall(ParsedToolCall),
+}
+
+impl InklingStreamParser {
+    pub fn new(initial_thinking: bool, call_prefix: String, allowed_tools: Vec<String>) -> Self {
+        Self {
+            mode: if initial_thinking { StreamMode::Thinking } else { StreamMode::Text },
+            thinking_ids: Vec::new(),
+            thinking_len: 0,
+            text_ids: Vec::new(),
+            text_len: 0,
+            header_ids: Vec::new(),
+            tool_ids: Vec::new(),
+            tool_name_hint: String::new(),
+            call_prefix,
+            allowed_tools,
+            emitted_calls: Vec::new(),
+        }
+    }
+
+    fn flush_tool(&mut self, tok: &Tokenizer) -> Option<ParsedToolCall> {
+        if self.tool_ids.is_empty() {
+            return None;
+        }
+        let payload = tok.decode(&self.tool_ids, true).unwrap_or_default();
+        self.tool_ids.clear();
+        let idx = self.emitted_calls.len();
+        let cid = format!("{}_{}", self.call_prefix, idx);
+        let hint = std::mem::take(&mut self.tool_name_hint);
+        if let Some(tc) = parse_single_tool_call(&payload, &hint, &self.allowed_tools, cid) {
+            self.emitted_calls.push(tc.clone());
+            return Some(tc);
+        }
+        None
+    }
+
+    pub fn push_token(&mut self, t: u32, tok: &Tokenizer) -> Vec<StreamDelta> {
+        let mut out = Vec::new();
+        match t {
+            TOK_END_SAMPLING | TOK_ENDOFTEXT => {
+                if matches!(self.mode, StreamMode::ToolJson | StreamMode::ToolText) {
+                    if let Some(tc) = self.flush_tool(tok) {
+                        out.push(StreamDelta::ToolCall(tc));
+                    }
+                }
+            }
+            TOK_END_MESSAGE => {
+                if matches!(self.mode, StreamMode::ToolJson | StreamMode::ToolText) {
+                    if let Some(tc) = self.flush_tool(tok) {
+                        out.push(StreamDelta::ToolCall(tc));
+                    }
+                }
+                self.header_ids.clear();
+                self.mode = StreamMode::PendingHeader;
+            }
+            TOK_MSG_MODEL => {
+                if matches!(self.mode, StreamMode::ToolJson | StreamMode::ToolText) {
+                    if let Some(tc) = self.flush_tool(tok) {
+                        out.push(StreamDelta::ToolCall(tc));
+                    }
+                }
+                self.header_ids.clear();
+                self.mode = StreamMode::PendingHeader;
+            }
+            TOK_CONTENT_THINKING => {
+                self.header_ids.clear();
+                self.mode = StreamMode::Thinking;
+            }
+            TOK_CONTENT_TEXT => {
+                self.header_ids.clear();
+                self.mode = StreamMode::Text;
+            }
+            TOK_INVOKE_TOOL_JSON => {
+                self.tool_name_hint = tok.decode(&self.header_ids, true).unwrap_or_default().trim().to_string();
+                self.header_ids.clear();
+                self.tool_ids.clear();
+                self.mode = StreamMode::ToolJson;
+            }
+            TOK_INVOKE_TOOL_TEXT => {
+                self.tool_name_hint = tok.decode(&self.header_ids, true).unwrap_or_default().trim().to_string();
+                self.header_ids.clear();
+                self.tool_ids.clear();
+                self.mode = StreamMode::ToolText;
+            }
+            _ => match self.mode {
+                StreamMode::Thinking => {
+                    self.thinking_ids.push(t);
+                    let d = tok.decode(&self.thinking_ids, true).unwrap_or_default();
+                    if d.len() > self.thinking_len {
+                        let s = d[self.thinking_len..].to_string();
+                        self.thinking_len = d.len();
+                        out.push(StreamDelta::Reasoning(s));
+                    }
+                }
+                StreamMode::Text => {
+                    self.text_ids.push(t);
+                    let d = tok.decode(&self.text_ids, true).unwrap_or_default();
+                    if d.len() > self.text_len {
+                        let s = d[self.text_len..].to_string();
+                        self.text_len = d.len();
+                        out.push(StreamDelta::Text(s));
+                    }
+                }
+                StreamMode::PendingHeader => {
+                    self.header_ids.push(t);
+                }
+                StreamMode::ToolJson | StreamMode::ToolText => {
+                    self.tool_ids.push(t);
+                }
+            },
+        }
+        out
+    }
+
+    pub fn finish(&mut self, tok: &Tokenizer) -> Vec<StreamDelta> {
+        let mut out = Vec::new();
+        if matches!(self.mode, StreamMode::ToolJson | StreamMode::ToolText) {
+            if let Some(tc) = self.flush_tool(tok) {
+                out.push(StreamDelta::ToolCall(tc));
+            }
+        }
+        out
+    }
+
+    pub fn full_text(&self, tok: &Tokenizer) -> String {
+        tok.decode(&self.text_ids, true).unwrap_or_default()
+    }
+
+    pub fn full_reasoning(&self, tok: &Tokenizer) -> Option<String> {
+        if self.thinking_ids.is_empty() {
+            None
+        } else {
+            let s = tok.decode(&self.thinking_ids, true).unwrap_or_default().trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+    }
+}
+
+pub fn parse_inkling_tokens(
+    tokens: &[u32],
+    tok: &Tokenizer,
+    initial_thinking: bool,
+    allowed_tools: &[String],
+    call_prefix: &str,
+) -> ParsedTurn {
+    let mut p = InklingStreamParser::new(initial_thinking, call_prefix.to_string(), allowed_tools.to_vec());
+    for &t in tokens {
+        let _ = p.push_token(t, tok);
+    }
+    let _ = p.finish(tok);
+    let mut content = p.full_text(tok).trim().to_string();
+    let reasoning = p.full_reasoning(tok);
+    let mut tool_calls = p.emitted_calls;
+    if tool_calls.is_empty() && !allowed_tools.is_empty() {
+        if let Some(vals) = parse_tool_calls(&content, allowed_tools) {
+            for (idx, v) in vals.into_iter().enumerate() {
+                if let (Some(name), Some(args)) = (
+                    v.get("function").and_then(|f| f.get("name")).and_then(|x| x.as_str()),
+                    v.get("function").and_then(|f| f.get("arguments")).and_then(|x| x.as_str()),
+                ) {
+                    tool_calls.push(ParsedToolCall {
+                        id: format!("{call_prefix}_{idx}"),
+                        name: name.to_string(),
+                        arguments: args.to_string(),
+                    });
+                }
+            }
+            if !tool_calls.is_empty() {
+                content.clear();
+            }
+        }
+    }
+    ParsedTurn {
+        reasoning,
+        content,
+        tool_calls,
+    }
 }

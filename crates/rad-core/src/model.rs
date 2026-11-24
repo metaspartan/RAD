@@ -498,7 +498,7 @@ impl InklingEngine {
             let mut v_hist = DevBuf::new(max_seqs * kv_dim * 3 * 4).map_err(he)?;
             let mut attn_post_hist = DevBuf::new(max_seqs * cfg.n_embd * 3 * 4).map_err(he)?;
             let mut ffn_post_hist = DevBuf::new(max_seqs * cfg.n_embd * 3 * 4).map_err(he)?;
-            let snap_cap = (max_seqs.min(8) * 8).max(48);
+            let snap_cap = (max_seqs.min(8) * 8).max(64);
             let k_snap = DevBuf::new(snap_cap * kv_dim * 3 * 4).map_err(he)?;
             let v_snap = DevBuf::new(snap_cap * kv_dim * 3 * 4).map_err(he)?;
             let attn_post_snap = DevBuf::new(snap_cap * cfg.n_embd * 3 * 4).map_err(he)?;
@@ -1341,8 +1341,8 @@ impl InklingEngine {
         }
 
         let d_pos0 = self.bsc.d_pos0.ptr as *const i32;
-        let k_snap = if b <= 48 { sl.k_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
-        let v_snap = if b <= 48 { sl.v_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+        let k_snap = if b <= 64 { sl.k_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+        let v_snap = if b <= 64 { sl.v_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
         if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
             ops::ink_kv_conv_qkvr_store_batch_snap_q8kv(
                 s, q, k_raw, v_raw, r,
@@ -1401,7 +1401,7 @@ impl InklingEngine {
         }
 
         let attn_out = self.bsc.attn_out.ptr as *mut f32;
-        if b > 48 {
+        if b > 64 {
             if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
                 ops::ink_attn_batch_gated_flash_q8kv(
                     s, q, r, sinks,
@@ -1478,7 +1478,7 @@ impl InklingEngine {
         } else {
             std::ptr::null_mut()
         };
-        let ap_snap = if b <= 48 { sl.attn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+        let ap_snap = if b <= 64 { sl.attn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
         if l.wo.ty == WeightType::Q4_0 && (b == 4 || b == 6 || b == 8) {
             ops::ink_wo_conv_res_q4_batch_snap(s, l.wo.buf.ptr as *const u8, self.bsc.xq.ptr, l.attn_post_conv.ptr as *const f32, sl.attn_post_hist.ptr as *mut f32, ap_snap, cur, block_dst, ffn_inp, e, q_dim, bi);
         } else {
@@ -1624,7 +1624,7 @@ impl InklingEngine {
             }
             _ => unreachable!(),
         };
-        let fp_snap = if b <= 48 { sl.ffn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+        let fp_snap = if b <= 64 { sl.ffn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
         if b <= 32 && l.ffn_down_exps.ty == WeightType::Q4_0 {
             ops::ink_shortconv_res_batch_snap_clear(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, fp_snap, ffn_inp, std::ptr::null_mut(), cur, e, bi);
         } else {
@@ -1726,7 +1726,7 @@ impl InklingEngine {
 
     pub fn verify_batch(&mut self, tokens: &[i32]) -> Result<Vec<i32>> {
         let b = tokens.len();
-        assert!(b >= 1 && b <= 48);
+        assert!(b >= 1 && b <= 64);
         let pos0 = self.pos;
         let tok_bytes = unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, b * 4) };
         let key = (0usize, b);
@@ -1822,7 +1822,7 @@ impl InklingEngine {
             return Ok(out);
         }
         let b = tokens.len();
-        assert!(b >= 1 && b <= 48);
+        assert!(b >= 1 && b <= 64);
         let pos0 = self.seq_pos[seq];
         let tok_bytes = unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, b * 4) };
         let key = (seq, b);
@@ -2293,7 +2293,7 @@ impl InklingEngine {
                     self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
                     sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
                 );
-                if b > 48 {
+                if b > 64 {
                     ops::ink_attn_batch_gated_flash_q8kv(
                         s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
                         (sl.k_cache.ptr as *const i8).add(seq_kv_off),
@@ -2350,7 +2350,7 @@ impl InklingEngine {
                         sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
                     );
                 }
-                if b > 48 {
+                if b > 64 {
                     ops::ink_attn_batch_gated_flash(
                         s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
                         (sl.k_cache.ptr as *const u16).add(seq_kv_off),
@@ -3237,7 +3237,7 @@ impl InklingEngine {
                     let t3 = sync_t(s);
                     t_kvconv += (t3 - t2).as_secs_f64() * 1000.0;
                     unsafe {
-                        if b > 48 {
+                        if b > 64 {
                             if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
                                 ops::ink_attn_batch_gated_flash_q8kv(
                                     s, self.bsc.q.ptr as *const f32, self.bsc.r.ptr as *const f32, self.bsc.sinks.ptr as *const f32,
