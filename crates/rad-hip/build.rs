@@ -34,6 +34,14 @@ extern "C" {
     pub fn hipGraphInstantiate(e: *mut *mut core::ffi::c_void, g: *mut core::ffi::c_void, flags: u64) -> HipError;
     pub fn hipGraphLaunch(e: *mut core::ffi::c_void, s: HipStream) -> HipError;
     pub fn hipSetDevice(d: i32) -> HipError;
+    pub fn hipGetDevice(d: *mut i32) -> HipError;
+    pub fn hipGetDeviceCount(count: *mut i32) -> HipError;
+    pub fn hipDeviceCanAccessPeer(can_access: *mut i32, dev: i32, peer: i32) -> HipError;
+    pub fn hipDeviceEnablePeerAccess(peer: i32, flags: u32) -> HipError;
+    pub fn hipMemcpyPeerAsync(dst: *mut core::ffi::c_void, dst_dev: i32, src: *const core::ffi::c_void, src_dev: i32, size: usize, stream: HipStream) -> HipError;
+    pub fn hipHostMalloc(ptr: *mut *mut core::ffi::c_void, size: usize, flags: u32) -> HipError;
+    pub fn hipHostFree(ptr: *mut core::ffi::c_void) -> HipError;
+    pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipError;
     pub fn hipGetLastError() -> HipError;
 }
 

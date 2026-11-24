@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::StreamExt;
-use rad_core::{DFlash2Drafter, DsparkDrafter, InklingEngine, Tokenizer, VisionEncoder};
+use rad_core::{DFlash2Drafter, DsparkDrafter, GpuTopology, InklingEngine, Tokenizer, VisionEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -182,8 +182,35 @@ struct PrefillSlot {
     started_at: Instant,
 }
 
-struct AppState {
+struct InFlightGuard(Arc<AtomicU64>);
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct WorkerHandle {
+    #[allow(dead_code)]
+    dev_id: i32,
     job_tx: mpsc::UnboundedSender<GenJob>,
+    in_flight: Arc<AtomicU64>,
+    last_prefix_hash: Arc<AtomicU64>,
+}
+
+fn compute_prefix_hash(tokens: &[i32]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &t in tokens.iter().take(256) {
+        h ^= t as u32 as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+struct AppState {
+    workers: Vec<WorkerHandle>,
+    gpu_ids: Vec<i32>,
+    parallel_mode: &'static str,
+    p2p_links: usize,
     tokenizer: Arc<Tokenizer>,
     metrics: Arc<metrics::Metrics>,
     api_keys: Vec<String>,
@@ -197,10 +224,51 @@ struct AppState {
     port: u16,
 }
 
+impl AppState {
+    fn dispatch(&self, job: GenJob) -> Result<Arc<AtomicU64>, ()> {
+        if self.workers.is_empty() {
+            return Err(());
+        }
+        let ph = compute_prefix_hash(&job.prompt_ids);
+        let mut best_idx = 0usize;
+        if self.workers.len() > 1 {
+            let mut min_load = u64::MAX;
+            for (i, w) in self.workers.iter().enumerate() {
+                let load = w.in_flight.load(Ordering::Relaxed);
+                if load < min_load {
+                    min_load = load;
+                    best_idx = i;
+                }
+            }
+            for (i, w) in self.workers.iter().enumerate() {
+                if w.last_prefix_hash.load(Ordering::Relaxed) == ph {
+                    let load = w.in_flight.load(Ordering::Relaxed);
+                    if load <= min_load + 1 {
+                        best_idx = i;
+                        break;
+                    }
+                }
+            }
+        }
+        let w = &self.workers[best_idx];
+        w.last_prefix_hash.store(ph, Ordering::Relaxed);
+        w.in_flight.fetch_add(1, Ordering::Relaxed);
+        if w.job_tx.send(job).is_err() {
+            w.in_flight.fetch_sub(1, Ordering::Relaxed);
+            return Err(());
+        }
+        Ok(w.in_flight.clone())
+    }
+}
+
 #[derive(Serialize)]
 struct Health {
     status: &'static str,
     engine: &'static str,
+    gpu_count: usize,
+    gpu_ids: Vec<i32>,
+    parallel_mode: &'static str,
+    p2p_links: usize,
     speculative_decoding: bool,
     spec_mode: &'static str,
     vision_enabled: bool,
@@ -1288,8 +1356,8 @@ async fn collect_job(
     json_grammar: bool,
 ) -> Result<(Vec<u32>, usize, usize, f64, f64, &'static str), String> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    st.job_tx
-        .send(GenJob { prompt_ids, images, max_tokens, enable_thinking, json_grammar, tx })
+    let in_flight = st
+        .dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking, json_grammar, tx })
         .map_err(|_| "scheduler closed".to_string())?;
     let mut out_ids = Vec::with_capacity(max_tokens.min(4096));
     let mut prompt_n = 0usize;
@@ -1310,9 +1378,13 @@ async fn collect_job(
                 dec_ms = dm;
                 break;
             }
-            GenEvent::Error(e) => return Err(e),
+            GenEvent::Error(e) => {
+                in_flight.fetch_sub(1, Ordering::Relaxed);
+                return Err(e);
+            }
         }
     }
+    in_flight.fetch_sub(1, Ordering::Relaxed);
     Ok((out_ids, prompt_n, cached_n, pp_ms, dec_ms, finish_reason))
 }
 
@@ -1320,6 +1392,10 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<Health> {
     Json(Health {
         status: "ok",
         engine: "rad",
+        gpu_count: st.gpu_ids.len(),
+        gpu_ids: st.gpu_ids.clone(),
+        parallel_mode: st.parallel_mode,
+        p2p_links: st.p2p_links,
         speculative_decoding: st.spec_enabled,
         spec_mode: st.spec_mode,
         vision_enabled: st.vision_enabled,
@@ -1431,14 +1507,18 @@ async fn chat_completions(
 
     if stream {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, images, max_tokens, enable_thinking: initial_thinking, json_grammar, tx }).is_err() {
-            st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response();
-        }
+        let in_flight = match st.dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking: initial_thinking, json_grammar, tx }) {
+            Ok(g) => InFlightGuard(g),
+            Err(_) => {
+                st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response();
+            }
+        };
         st.metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
         let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
         let tok = st.tokenizer.clone();
         tokio::spawn(async move {
+            let _guard = in_flight;
             let mut parser = grammar::InklingStreamParser::new(initial_thinking, call_prefix, allowed_tools);
             let mut sent_role = false;
             let mut tc_index = 0usize;
@@ -1716,12 +1796,16 @@ async fn responses_http(
 
     if stream {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, images, max_tokens, enable_thinking, json_grammar: false, tx }).is_err() {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response();
-        }
+        let in_flight = match st.dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking, json_grammar: false, tx }) {
+            Ok(g) => InFlightGuard(g),
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response();
+            }
+        };
         let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
         let tok = st.tokenizer.clone();
         tokio::spawn(async move {
+            let _guard = in_flight;
             let mut parser = grammar::InklingStreamParser::new(enable_thinking, call_prefix, allowed_tools);
             let mut msg_started = false;
             let mut output_items: Vec<serde_json::Value> = Vec::new();
@@ -1996,10 +2080,13 @@ async fn handle_ws(mut socket: WebSocket, st: Arc<AppState>) {
         let call_prefix = next_id("call");
         let msg_id = next_id("msg");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, images, max_tokens, enable_thinking: false, json_grammar: false, tx }).is_err() {
-            let _ = socket.send(Message::Text(json!({"type":"error","error":"scheduler closed"}).to_string())).await;
-            break;
-        }
+        let _guard = match st.dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking: false, json_grammar: false, tx }) {
+            Ok(g) => InFlightGuard(g),
+            Err(_) => {
+                let _ = socket.send(Message::Text(json!({"type":"error","error":"scheduler closed"}).to_string())).await;
+                break;
+            }
+        };
         let _ = socket.send(Message::Text(json!({
             "type": "response.created",
             "response": {"id": resp_id, "object": "response", "status": "in_progress", "model": model_id, "output": []}
@@ -2149,6 +2236,8 @@ struct CliOpts {
     max_seqs: usize,
     max_tokens: usize,
     port: u16,
+    gpus: String,
+    tp: usize,
     use_spec: bool,
     use_vision: bool,
     thinking: bool,
@@ -2178,6 +2267,8 @@ fn print_usage() {
     println!("  -n, --max-tokens <N>           Max tokens for `rad run` [default: 256]");
     println!("      --api-key <KEY[,KEY2]>     Optional Bearer/X-API-Key auth (env: RAD_API_KEY)");
     println!("      --metrics-auth             Require API key for GET /metrics");
+    println!("      --gpus <LIST|auto>         HIP GPU IDs for multi-GPU data-parallel serving (e.g. 0,1 or auto) [env: RAD_GPUS]");
+    println!("      --tp <N>                   Tensor-parallel degree (default: 1) [env: RAD_TP]");
     println!("      --no-spec                  Disable speculative decoding (DFlash 2 / DSpark)");
     println!("      --no-vision                Disable vision encoder loading");
     println!("      --thinking                 Enable thinking tokens for `rad run`");
@@ -2228,6 +2319,8 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
     let mut max_seqs: usize = std::env::var("RAD_MAX_SEQS").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
     let mut max_tokens: usize = 256;
     let mut port: u16 = std::env::var("RAD_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6733);
+    let mut gpus = std::env::var("RAD_GPUS").unwrap_or_default();
+    let mut tp: usize = std::env::var("RAD_TP").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     let mut use_spec = std::env::var("RAD_SPEC").map(|v| v != "0").unwrap_or(true);
     let mut use_vision = std::env::var("RAD_VISION").map(|v| v != "0").unwrap_or(true);
     let mut thinking = false;
@@ -2284,6 +2377,14 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
             }
             "--metrics-auth" => {
                 metrics_auth = true;
+            }
+            "--gpus" => {
+                idx += 1;
+                gpus = args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --gpus value"))?;
+            }
+            "--tp" => {
+                idx += 1;
+                tp = args.get(idx).ok_or_else(|| anyhow::anyhow!("missing --tp value"))?.parse()?;
             }
             "--prefill-chunk-size" => {
                 idx += 1;
@@ -2342,6 +2443,8 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
         max_seqs,
         max_tokens,
         port,
+        gpus,
+        tp,
         use_spec,
         use_vision,
         thinking,
@@ -2635,6 +2738,41 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn resolve_gpu_ids(gpus_arg: &str) -> anyhow::Result<(Vec<i32>, usize)> {
+    let trimmed = gpus_arg.trim();
+    if trimmed.is_empty() {
+        let topo = GpuTopology::probe(Some(&[0]))?;
+        return Ok((vec![0], topo.p2p_pairs()));
+    }
+    if trimmed.eq_ignore_ascii_case("auto") {
+        let topo = GpuTopology::probe(None)?;
+        let min_vram = 16usize * 1024 * 1024 * 1024;
+        let mut selected: Vec<i32> = topo
+            .devices
+            .iter()
+            .filter(|d| d.total_bytes >= min_vram)
+            .map(|d| d.id)
+            .collect();
+        if selected.is_empty() && !topo.devices.is_empty() {
+            selected.push(topo.devices[0].id);
+        }
+        let sel_topo = GpuTopology::probe(Some(&selected))?;
+        return Ok((selected, sel_topo.p2p_pairs()));
+    }
+    let mut ids = Vec::new();
+    for part in trimmed.split(',') {
+        let p = part.trim();
+        if !p.is_empty() {
+            ids.push(p.parse::<i32>().map_err(|_| anyhow::anyhow!("invalid GPU id: {p}"))?);
+        }
+    }
+    if ids.is_empty() {
+        ids.push(0);
+    }
+    let topo = GpuTopology::probe(Some(&ids))?;
+    Ok((ids, topo.p2p_pairs()))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opts = parse_cli()?;
@@ -2654,7 +2792,21 @@ async fn main() -> anyhow::Result<()> {
         println!("  ctx:       {}", opts.ctx);
         println!("  max_seqs:  {}", opts.max_seqs);
         println!("  port:      {}", opts.port);
-        println!("  endpoints: /health, /v1/models, /v1/chat/completions, /v1/completions, /v1/responses (HTTP/SSE/WS)");
+        if let Ok(topo) = GpuTopology::probe(None) {
+            println!("  gpus:      {} detected (p2p_pairs={})", topo.devices.len(), topo.p2p_pairs());
+            for d in &topo.devices {
+                let free_gb = d.free_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                let tot_gb = d.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                println!("    GPU {}: {:.2} / {:.2} GB free", d.id, free_gb, tot_gb);
+            }
+            for i in 0..topo.devices.len() {
+                for j in (i + 1)..topo.devices.len() {
+                    let bi = topo.p2p[i][j] && topo.p2p[j][i];
+                    println!("    P2P GPU {} <-> GPU {}: {}", topo.devices[i].id, topo.devices[j].id, if bi { "enabled" } else { "host-staged" });
+                }
+            }
+        }
+        println!("  endpoints: /health, /metrics, /v1/models, /v1/chat/completions, /v1/completions, /v1/responses (HTTP/SSE/WS)");
         return Ok(());
     }
 
@@ -2738,17 +2890,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let t0 = Instant::now();
+    let (gpu_ids, p2p_links) = resolve_gpu_ids(&opts.gpus)?;
+    if opts.tp > 1 {
+        anyhow::bail!(
+            "tensor-parallel weight sharding (--tp {}) is staged next (detected {} GPU(s), p2p_links={}); for dual/multi-R9700 serving today use data-parallel mode: `--gpus 0,1` or `--gpus auto`",
+            opts.tp,
+            gpu_ids.len(),
+            p2p_links
+        );
+    }
     let tokenizer = Arc::new(Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?);
     let image_tok_id = tokenizer.token_to_id("<|content_image|>").map(|id| id as i32);
     std::env::set_var("RAD_KV_BLOCK_SIZE", opts.kv_block_size.to_string());
-    let mut engine = InklingEngine::load_multi(Path::new(&opts.model), opts.ctx, opts.max_seqs)?;
-    engine.capture_decode_graph()?;
-    let drafter = load_drafter(&opts, &mut engine, opts.max_seqs.min(8))?;
-    let vision = load_vision(&opts)?;
-    let spec_enabled = drafter.is_some();
-    let spec_mode = drafter.as_ref().map(|d| d.mode_name()).unwrap_or("none");
-    let vision_enabled = vision.is_some();
-    let vocab_grammar = Arc::new(grammar::VocabGrammarTable::build(&tokenizer, engine.cfg.vocab_unpadded));
     let metrics = Arc::new(metrics::Metrics::new());
     let api_keys: Vec<String> = opts
         .api_key
@@ -2756,9 +2909,47 @@ async fn main() -> anyhow::Result<()> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+
+    let mut workers: Vec<WorkerHandle> = Vec::with_capacity(gpu_ids.len());
+    let mut spec_enabled = false;
+    let mut spec_mode: &'static str = "none";
+    let mut vision_enabled = false;
+    let mut vocab_grammar: Option<Arc<grammar::VocabGrammarTable>> = None;
+
+    for &dev_id in &gpu_ids {
+        rad_hip::set_device(dev_id).map_err(|e| anyhow::anyhow!("hipSetDevice({dev_id}) failed: rc={e}"))?;
+        let mut engine = InklingEngine::load_multi(Path::new(&opts.model), opts.ctx, opts.max_seqs)?;
+        engine.capture_decode_graph()?;
+        let drafter = load_drafter(&opts, &mut engine, opts.max_seqs.min(8))?;
+        let vision = load_vision(&opts)?;
+        spec_enabled = drafter.is_some();
+        spec_mode = drafter.as_ref().map(|d| d.mode_name()).unwrap_or("none");
+        vision_enabled = vision.is_some();
+        let vg = vocab_grammar
+            .get_or_insert_with(|| Arc::new(grammar::VocabGrammarTable::build(&tokenizer, engine.cfg.vocab_unpadded)))
+            .clone();
+        let (job_tx, job_rx) = mpsc::unbounded_channel();
+        let sched_metrics = metrics.clone();
+        let prefill_chunk = opts.prefill_chunk_size;
+        std::thread::spawn(move || {
+            let _ = rad_hip::set_device(dev_id);
+            run_scheduler(engine, drafter, vision, image_tok_id, vg, sched_metrics, prefill_chunk, job_rx);
+        });
+        workers.push(WorkerHandle {
+            dev_id,
+            job_tx,
+            in_flight: Arc::new(AtomicU64::new(0)),
+            last_prefix_hash: Arc::new(AtomicU64::new(0)),
+        });
+    }
+
+    let parallel_mode = if gpu_ids.len() > 1 { "data-parallel" } else { "single" };
     eprintln!(
-        "rad serve ready in {:.2}s (ctx={}, max_seqs={}, chunk={}, kv_blk={}, spec={}, vision={}, auth={}, port={})",
+        "rad serve ready in {:.2}s (gpus={:?}, mode={}, p2p={}, ctx={}, max_seqs={}, chunk={}, kv_blk={}, spec={}, vision={}, auth={}, port={})",
         t0.elapsed().as_secs_f64(),
+        gpu_ids,
+        parallel_mode,
+        p2p_links,
         opts.ctx,
         opts.max_seqs,
         opts.prefill_chunk_size,
@@ -2769,14 +2960,11 @@ async fn main() -> anyhow::Result<()> {
         opts.port
     );
 
-    let (job_tx, job_rx) = mpsc::unbounded_channel();
-    let sched_gram = vocab_grammar.clone();
-    let sched_metrics = metrics.clone();
-    let prefill_chunk = opts.prefill_chunk_size;
-    std::thread::spawn(move || run_scheduler(engine, drafter, vision, image_tok_id, sched_gram, sched_metrics, prefill_chunk, job_rx));
-
     let state = Arc::new(AppState {
-        job_tx,
+        workers,
+        gpu_ids,
+        parallel_mode,
+        p2p_links,
         tokenizer,
         metrics,
         api_keys,

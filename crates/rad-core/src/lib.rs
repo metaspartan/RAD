@@ -1,3 +1,4 @@
+pub mod comm;
 pub mod dflash2;
 pub mod dspark;
 pub mod model;
@@ -6,6 +7,7 @@ pub mod paged_kv;
 pub mod safetensors;
 pub mod vision;
 
+pub use comm::{GpuDeviceInfo, GpuTopology, MultiGpuComm};
 pub use dflash2::DFlash2Drafter;
 pub use dspark::DsparkDrafter;
 pub use model::{InklingConfig, InklingEngine};

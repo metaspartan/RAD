@@ -22,6 +22,9 @@ The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybri
   - Custom `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` **FlashAttention-2** (reverse causal tile scheduling, bank-conflict-free LDS KV tile, register-preloaded `float4` relative-position projections, plus 4-warp Split-KV WMMA FlashAttention for `B=4..16`), fused multi-query `float4` state mixing (`mix_batch_f4_k`), register-cached `float4` RMSNorm, WMMA `sink_dyn_bf16`, single-pass `float4` & LDS WMMA loop controllers, and 64-CU `float4` router GEMM/GEMV.
 - **On-GPU `Q4_0_SOA` Weight Repacking & `hipGraph` Execution**
   - Converts `Q8_0`, `NVFP4`, and `BF16` tensors directly on GPU at load time (**~1.16 s** cold load) into 16-byte-aligned structure-of-arrays blocks for coalesced `uint4` loads and `sudot4` / WMMA execution.
+- **Multi-GPU R9700 Support (`--gpus 0,1` / `--gpus auto`) & P2P AllReduce Foundation**
+  - **Multi-GPU Data-Parallel Serving (Live):** Spawns one dedicated GPU scheduler + DFlash 2 + Vision + Paged KV worker per GPU with **prefix-aware least-loaded routing** (matching prompt prefixes stick to the same GPU for KV cache hits while balancing concurrent requests across all GPUs) — zero PCIe all-reduce overhead, linear multi-user throughput & KV capacity scaling on dual/multi-R9700 rigs.
+  - **P2P + Pinned-Host `MultiGpuComm` (`crates/rad-core/src/comm.rs`):** Automatic HIP peer-access detection (`hipDeviceCanAccessPeer` / `hipDeviceEnablePeerAccess`), direct `hipMemcpyPeerAsync` + on-GPU `ink_vec_add` AllReduce/Broadcast with pinned-host PCIe fallback, and GPU/P2P topology inspection via `rad info` and `GET /health`. Full tensor-parallel (`--tp 2`) row/column weight sharding inside `InklingEngine` builds on this layer next.
 - **vLLM-Style Continuous Batching, Paged KV Cache, Chunked Prefill, Tool-Calling Grammar & Prometheus Metrics (`rad`)**
   - Dedicated GPU scheduler thread with **Paged KV block management** (`--kv-block-size 16`, copy-on-write prefix sharing & refcounting), **Chunked Prefill** (`--prefill-chunk-size 512`, interleaving long prefills with active decoders), **JSON & Tool-Calling Grammar Constraints** (`response_format: json_object/json_schema`, `tools` + `tool_choice` -> OpenAI `tool_calls`), **Prometheus `GET /metrics`** (TTFT/ITL histograms, speculative acceptance rate, KV block utilization), optional **multi-key API auth** (`Authorization: Bearer` & `X-API-Key`, `--metrics-auth`), and non-conflicting default port **`6733`**.
   - Continuous batched decode (`step_multi` with GQA 3:1 attention) scaling up to `B=128` concurrent sequences (**`1,856.0 agg tok/s`**).
@@ -139,6 +142,8 @@ cargo build --release
 ```bash
 ./target/release/rad serve -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf --port 6733
 
+./target/release/rad serve -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf --gpus 0,1 --port 6733
+
 ./target/release/rad run "Show me a Python quicksort function." -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf
 
 ./target/release/rad run "Describe this image." --image /path/to/photo.png -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf
@@ -202,6 +207,8 @@ python3 scripts/test_serve.py
 | `RAD_CTX` | `8192` | Per-sequence KV context length |
 | `RAD_MAX_SEQS` | `32` | Maximum concurrent sequences in KV pool |
 | `RAD_PORT` | `6733` | HTTP/WebSocket bind port |
+| `RAD_GPUS` | `0` | Comma-separated HIP GPU IDs (`0,1`) or `auto` for multi-GPU data-parallel serving |
+| `RAD_TP` | `1` | Tensor-parallel degree (default `1`; P2P `MultiGpuComm` foundation ready, weight sharding staged next) |
 | `RAD_API_KEY` | *(empty)* | Optional comma-separated Bearer / `X-API-Key` tokens (disabled if empty) |
 | `RAD_ARCH` | `gfx1201` | Target GPU architecture for `kernels/build.sh` |
 
@@ -209,6 +216,7 @@ python3 scripts/test_serve.py
 
 ## Roadmap
 
+- **Multi-GPU Tensor Parallelism (`--tp 2/4/8`):** Row/column weight sharding inside `InklingEngine` on top of the shipped `MultiGpuComm` P2P + pinned-host AllReduce layer (Data-Parallel `--gpus 0,1` is live today in `v0.4.0`).
 - **Hardware backends:** CDNA (`gfx942` / MI300X), RDNA3 (`gfx1100`), NVIDIA CUDA, and Apple Metal backends behind a unified device trait.
 - **Model families:** Standard GQA/MLA transformers, Qwen3-MoE, Llama, DeepSeek, and hybrid SSM/attention architectures.
 - **Serving features (shipped in v0.2–v0.3):** Paged KV cache with prefix sharing, chunked prefill, JSON & tool-calling grammar constraints, Prometheus `/metrics`, optional multi-key API auth, INT8 full-attention KV cache, and hybrid DFlash 2 + `K=48` prompt-lookup speculation.

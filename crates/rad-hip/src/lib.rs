@@ -102,3 +102,96 @@ impl CapturedGraph {
         if rc == HIP_SUCCESS { Ok(()) } else { Err(rc) }
     }
 }
+
+pub struct PinnedBuf {
+    pub ptr: *mut core::ffi::c_void,
+    pub len: usize,
+}
+unsafe impl Send for PinnedBuf {}
+unsafe impl Sync for PinnedBuf {}
+
+impl PinnedBuf {
+    pub fn new(bytes: usize) -> Result<Self, HipError> {
+        let mut ptr = std::ptr::null_mut();
+        let rc = unsafe { hipHostMalloc(&mut ptr, bytes, 0) };
+        if rc != HIP_SUCCESS {
+            return Err(rc);
+        }
+        Ok(Self { ptr, len: bytes })
+    }
+
+    pub fn as_f32_slice(&self) -> &[f32] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *const f32, self.len / 4) }
+    }
+
+    pub fn as_f32_slice_mut(&mut self) -> &mut [f32] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut f32, self.len / 4) }
+    }
+}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        unsafe { hipHostFree(self.ptr) };
+    }
+}
+
+pub fn device_count() -> Result<i32, HipError> {
+    let mut n = 0i32;
+    let rc = unsafe { hipGetDeviceCount(&mut n) };
+    if rc == HIP_SUCCESS { Ok(n) } else { Err(rc) }
+}
+
+pub fn get_device() -> Result<i32, HipError> {
+    let mut d = 0i32;
+    let rc = unsafe { hipGetDevice(&mut d) };
+    if rc == HIP_SUCCESS { Ok(d) } else { Err(rc) }
+}
+
+pub fn set_device(dev: i32) -> Result<(), HipError> {
+    let rc = unsafe { hipSetDevice(dev) };
+    if rc == HIP_SUCCESS { Ok(()) } else { Err(rc) }
+}
+
+pub fn mem_info(dev: i32) -> Result<(usize, usize), HipError> {
+    let prev = get_device().unwrap_or(0);
+    set_device(dev)?;
+    let mut free = 0usize;
+    let mut total = 0usize;
+    let rc = unsafe { hipMemGetInfo(&mut free, &mut total) };
+    let _ = set_device(prev);
+    if rc == HIP_SUCCESS { Ok((free, total)) } else { Err(rc) }
+}
+
+pub fn can_access_peer(dev: i32, peer: i32) -> bool {
+    if dev == peer {
+        return true;
+    }
+    let mut can = 0i32;
+    let rc = unsafe { hipDeviceCanAccessPeer(&mut can, dev, peer) };
+    rc == HIP_SUCCESS && can != 0
+}
+
+pub fn enable_p2p_matrix(devs: &[i32]) -> Vec<Vec<bool>> {
+    let n = devs.len();
+    let prev = get_device().unwrap_or(0);
+    let mut mat = vec![vec![false; n]; n];
+    for i in 0..n {
+        mat[i][i] = true;
+        if set_device(devs[i]).is_err() {
+            continue;
+        }
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            if can_access_peer(devs[i], devs[j]) {
+                let rc = unsafe { hipDeviceEnablePeerAccess(devs[j], 0) };
+                if rc == HIP_SUCCESS || rc == 704 {
+                    mat[i][j] = true;
+                }
+            }
+        }
+    }
+    let _ = set_device(prev);
+    mat
+}
