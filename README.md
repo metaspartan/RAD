@@ -29,19 +29,28 @@ The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybri
 
 ## Benchmarks (AMD Radeon AI PRO R9700, `gfx1201`)
 
-![RAD Benchmarks on Radeon AI PRO R9700](assets/rad_benchmark.svg)
+### Single-User Decode & Prefill (RAD vs. Stock `llama.cpp` & RTX PRO 6000 Blackwell)
 
-Measured end-to-end on **Inkling-2-Mini** (`Inkling-2-Mini-UD-Q4_K_XL-v2.gguf` + `dspark-Inkling-2-Mini-Q8_0.gguf`, coherence-verified) on a single **AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)** — outperforming Unsloth's claimed **125 tok/s** on an **NVIDIA RTX PRO 6000 Blackwell (96 GB, ~\$8,500)**:
+![RAD vs Stock llama.cpp and RTX PRO 6000 Blackwell](assets/rad_benchmark.svg)
+
+Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)** with identical prompts (`Inkling-2-Mini-UD-Q4_K_XL` + `dspark-Inkling-2-Mini-Q8_0.gguf`, coherence-verified) — achieving **2.10× faster decode** and **2.16× faster prefill** than stock `llama.cpp`, and outperforming Unsloth's claimed **125 tok/s** on an **NVIDIA RTX PRO 6000 Blackwell (96 GB, ~\$8,500)** by **+18.5%**:
+
+| Engine / Hardware | Decode (`tok/s`) | Long Prefill (`1,639 tok`) | Notes |
+| --- | --- | --- | --- |
+| **Stock `llama.cpp` (R9700 + DSpark)** | `70.5 tok/s` | `765.5 tok/s` | `-fa on -ctk q8_0 -ctv q8_0 --spec-type draft-dspark` |
+| **RAD (R9700, No-Spec `hipGraph`)** | **`93.9 tok/s`** (`1.33×`) | **`1,651.7 tok/s`** (`2.16×`) | Beats stock `llama.cpp`+DSpark without speculation |
+| **Unsloth RTX PRO 6000 Blackwell** | `125.0 tok/s` *(claimed)* | — | 96 GB workstation GPU (~\$8,500) |
+| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (**`2.10×`**) | **`1,651.7 tok/s`** (**`2.16×`**) | **+18.5% vs. RTX PRO 6000 Blackwell**, `verify=23.7 ms` |
+
+### Multi-User Continuous Batching & Batched DSpark
+
+![RAD Multi-User Scaling on Single R9700](assets/rad_multiuser.svg)
 
 | Workload | Throughput / Latency | Notes |
 | --- | --- | --- |
 | **Cold Load (`max_seqs=128`)** | **1.17 s** | On-GPU `Q4_0_SOA` conversion + `hipGraph` capture (`48.1 ms`) |
-| **Long Prefill (`1,639 tok`)** | **1,651.7 tok/s** | RDNA4 WMMA INT8 (`16×32`) + WMMA FP16 FlashAttention-2 |
 | **Short Prompt TTFT (`27 tok`)** | **51.2 ms** | Split-K WMMA router + `Q4_0_SOA` |
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **32.5 ms** | Prefix-cache affinity hit |
-| **Single-User Decode (`B=1`, no-spec)** | **93.9 tok/s** | `hipGraph`-captured 48-visit loop + `half2` KV attention |
-| **Single-User Decode (DSpark `K=6`, code)** | **148.2 tok/s** | **+18.5% vs. Unsloth RTX PRO 6000 Blackwell (125 tok/s)** (`verify=23.7 ms`) |
-| **Single-User Decode (DSpark `K=8`, code)** | **140.5 tok/s** | `emit=4.92`, `verify=28.2 ms` |
 | **Multi-User Decode (`B=4`, Batched DSpark `K=4`)** | **318.8 agg tok/s** | **`79.7 tok/s/user`** (`draft=3.62 ms`, `verify=34.67 ms`) |
 | **Multi-User Decode (`B=8`, no-spec)** | **238.2 agg tok/s** | `29.8 tok/s/user` (`hipGraph` + fused `moe_gu_sudot4_to_q8`) |
 | **Multi-User Decode (`B=8`, Batched DSpark `K=4`)** | **458.6 agg tok/s** | **`57.3 tok/s/user`** (**+92%** over `B=8` no-spec, `draft=5.20 ms`) |

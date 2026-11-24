@@ -1,93 +1,69 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 660" width="960" height="660">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="960" height="520">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#0b1020"/>
       <stop offset="100%" stop-color="#11192e"/>
     </linearGradient>
-    <linearGradient id="cyanGrad" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#06b6d4"/>
-      <stop offset="100%" stop-color="#22d3ee"/>
-    </linearGradient>
     <linearGradient id="greenGrad" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0%" stop-color="#10b981"/>
       <stop offset="100%" stop-color="#34d399"/>
     </linearGradient>
-    <linearGradient id="purpleGrad" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#6366f1"/>
-      <stop offset="100%" stop-color="#a855f7"/>
+    <linearGradient id="cyanGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
     </linearGradient>
     <linearGradient id="amberGrad" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0%" stop-color="#f59e0b"/>
       <stop offset="100%" stop-color="#fbbf24"/>
     </linearGradient>
-    <linearGradient id="grayGrad" x1="0" y1="0" x2="1" y2="0">
+    <linearGradient id="slateGrad" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0%" stop-color="#475569"/>
       <stop offset="100%" stop-color="#64748b"/>
     </linearGradient>
+    <linearGradient id="redMuted" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#64748b"/>
+      <stop offset="100%" stop-color="#94a3b8"/>
+    </linearGradient>
   </defs>
 
-  <rect width="960" height="660" rx="16" fill="url(#bg)"/>
-  <rect x="1" y="1" width="958" height="658" rx="15" fill="none" stroke="#1e293b" stroke-width="2"/>
+  <rect width="960" height="520" rx="16" fill="url(#bg)"/>
+  <rect x="1" y="1" width="958" height="518" rx="15" fill="none" stroke="#1e293b" stroke-width="2"/>
 
-  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="24" font-weight="700" fill="#f8fafc">RAD Inference Engine — Inkling-2-Mini on Radeon AI PRO R9700</text>
-  <text x="36" y="70" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">Single AMD R9700 (32 GB, ~$1,250) vs. Unsloth RTX PRO 6000 Blackwell (96 GB, ~$8,500) 125 tok/s claim</text>
+  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="23" font-weight="700" fill="#f8fafc">RAD vs. Stock llama.cpp &amp; RTX PRO 6000 Blackwell — Inkling-2-Mini</text>
+  <text x="36" y="70" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">Single-User Decode &amp; Prefill on AMD Radeon AI PRO R9700 (32 GB, ~$1,250) — Higher is Better</text>
 
-  <rect x="36" y="90" width="888" height="196" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
-  <text x="56" y="118" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="15" font-weight="700" fill="#e2e8f0">Single-User Decode (tok/s) — Higher is Better</text>
+  <rect x="36" y="90" width="888" height="214" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
+  <text x="56" y="120" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="15" font-weight="700" fill="#e2e8f0">Single-User Decode Throughput (tok/s)</text>
 
-  <line x1="654" y1="130" x2="654" y2="270" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5,5" opacity="0.7"/>
-  <text x="660" y="142" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="11" fill="#94a3b8">Unsloth 6000 Pro (125)</text>
+  <line x1="654" y1="132" x2="654" y2="288" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5,5" opacity="0.65"/>
+  <text x="662" y="144" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="11.5" fill="#94a3b8">Unsloth 6000 Pro (125)</text>
 
-  <text x="56" y="160" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">RAD R9700 — B=1 No-Spec (hipGraph)</text>
-  <rect x="320" y="145" width="251" height="22" rx="5" fill="url(#amberGrad)"/>
-  <text x="580" y="161" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#fbbf24">93.9 tok/s</text>
+  <text x="56" y="166" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">Stock llama.cpp (R9700 + DSpark)</text>
+  <rect x="340" y="150" width="177" height="24" rx="5" fill="url(#slateGrad)"/>
+  <text x="527" y="167" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#94a3b8">70.5 tok/s (1.00×)</text>
 
-  <text x="56" y="196" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#94a3b8">Unsloth RTX PRO 6000 Blackwell (Claimed)</text>
-  <rect x="320" y="181" width="334" height="22" rx="5" fill="url(#grayGrad)"/>
-  <text x="663" y="197" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#94a3b8">125.0 tok/s</text>
+  <text x="56" y="204" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#cbd5e1">RAD (R9700, No-Spec hipGraph)</text>
+  <rect x="340" y="188" width="236" height="24" rx="5" fill="url(#cyanGrad)"/>
+  <text x="586" y="205" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#22d3ee">93.9 tok/s (1.33×)</text>
 
-  <text x="56" y="232" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#f8fafc" font-weight="600">RAD R9700 — B=1 + DSpark K=4 (Code)</text>
-  <rect x="320" y="217" width="366" height="22" rx="5" fill="url(#cyanGrad)"/>
-  <text x="695" y="233" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">137.1 tok/s (+9.7%)</text>
+  <text x="56" y="242" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">Unsloth RTX PRO 6000 Blackwell (Claimed)</text>
+  <rect x="340" y="226" width="314" height="24" rx="5" fill="url(#redMuted)"/>
+  <text x="664" y="243" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#cbd5e1">125.0 tok/s (~$8,500 GPU)</text>
 
-  <text x="56" y="268" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#f8fafc" font-weight="600">RAD R9700 — B=1 + DSpark K=6 (Code)</text>
-  <rect x="320" y="253" width="396" height="22" rx="5" fill="url(#greenGrad)"/>
-  <text x="725" y="269" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">148.2 tok/s (+18.5%)</text>
+  <text x="56" y="280" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#f8fafc">RAD (R9700 + DSpark K=6)</text>
+  <rect x="340" y="264" width="372" height="24" rx="5" fill="url(#greenGrad)"/>
+  <text x="722" y="281" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#34d399">148.2 tok/s (2.10× | +18.5%)</text>
 
-  <rect x="36" y="304" width="888" height="320" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
-  <text x="56" y="332" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="15" font-weight="700" fill="#e2e8f0">Multi-User Batched Decode &amp; Prefill Throughput on Single R9700 (Aggregate tok/s)</text>
+  <rect x="36" y="322" width="888" height="156" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
+  <text x="56" y="352" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="15" font-weight="700" fill="#e2e8f0">Long-Prompt Prefill Throughput (1,639 tokens, tok/s)</text>
 
-  <text x="56" y="366" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=8 No-Spec (29.8 tok/s/user)</text>
-  <rect x="320" y="351" width="66" height="22" rx="5" fill="url(#grayGrad)"/>
-  <text x="395" y="367" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#cbd5e1">238.2 tok/s</text>
+  <text x="56" y="398" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">Stock llama.cpp (R9700, FlashAttn)</text>
+  <rect x="340" y="382" width="185" height="26" rx="5" fill="url(#slateGrad)"/>
+  <text x="535" y="400" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#94a3b8">765.5 tok/s (1.00×)</text>
 
-  <text x="56" y="400" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#f8fafc" font-weight="600">B=4 Batched DSpark K=4 (77.4 tok/s/user)</text>
-  <rect x="320" y="385" width="86" height="22" rx="5" fill="url(#greenGrad)"/>
-  <text x="415" y="401" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">309.6 tok/s</text>
+  <text x="56" y="444" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#f8fafc">RAD (R9700, WMMA INT8 + FlashAttn-2)</text>
+  <rect x="340" y="428" width="400" height="26" rx="5" fill="url(#amberGrad)"/>
+  <text x="750" y="446" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#fbbf24">1,651.7 tok/s (2.16×)</text>
 
-  <text x="56" y="434" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=16 Continuous Batching (28.0 tok/s/user)</text>
-  <rect x="320" y="419" width="125" height="22" rx="5" fill="url(#cyanGrad)"/>
-  <text x="454" y="435" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">448.5 tok/s</text>
-
-  <text x="56" y="468" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#f8fafc" font-weight="600">B=8 Batched DSpark K=4 (57.3 tok/s/user)</text>
-  <rect x="320" y="453" width="128" height="22" rx="5" fill="url(#greenGrad)"/>
-  <text x="457" y="469" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">458.6 tok/s (+92% vs B=8)</text>
-
-  <text x="56" y="502" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=32 Continuous Batching (21.5 tok/s/user)</text>
-  <rect x="320" y="487" width="192" height="22" rx="5" fill="url(#cyanGrad)"/>
-  <text x="521" y="503" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">688.0 tok/s</text>
-
-  <text x="56" y="536" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=64 WMMA INT8 MoE (15.1 tok/s/user)</text>
-  <rect x="320" y="521" width="268" height="22" rx="5" fill="url(#cyanGrad)"/>
-  <text x="597" y="537" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">963.5 tok/s</text>
-
-  <text x="56" y="570" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#f8fafc" font-weight="600">B=128 WMMA INT8 MoE (9.9 tok/s/user)</text>
-  <rect x="320" y="555" width="353" height="22" rx="5" fill="url(#purpleGrad)"/>
-  <text x="682" y="571" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#c084fc">1,266.3 tok/s</text>
-
-  <text x="56" y="604" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#f8fafc" font-weight="600">Long Prefill (1,639 tok, WMMA FlashAttn-2)</text>
-  <rect x="320" y="589" width="460" height="22" rx="5" fill="url(#amberGrad)"/>
-  <text x="789" y="605" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#fbbf24">1,651.7 tok/s</text>
-
-  <text x="36" y="646" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="11.5" fill="#64748b">Measured end-to-end on AMD Radeon AI PRO R9700 (gfx1201, ROCm) with Inkling-2-Mini-UD-Q4_K_XL-v2 + DSpark Q8_0 | github.com/metaspartan/RAD</text>
+  <text x="36" y="502" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="11.5" fill="#64748b">Measured on identical AMD Radeon AI PRO R9700 (gfx1201, ROCm) with identical prompts | Inkling-2-Mini Q4_K_XL + DSpark Q8_0 | github.com/metaspartan/RAD</text>
 </svg>
