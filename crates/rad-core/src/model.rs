@@ -1607,6 +1607,9 @@ impl InklingEngine {
     pub fn single_dspark_feats_ptr(&self) -> *const f32 {
         self.sc.dspark_feats.ptr as *const f32
     }
+    pub fn batch_dspark_feats_ptr(&self) -> (*const f32, usize) {
+        (self.bsc.dspark_feats.ptr as *const f32, MAX_BATCH)
+    }
     pub fn gather_batch_dspark_feats_async(&self, s: HipStream, tok_idx: usize) -> *const f32 {
         unsafe {
             ops::ink_gather_dspark_feats(

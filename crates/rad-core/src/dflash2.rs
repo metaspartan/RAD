@@ -104,6 +104,12 @@ pub struct DFlash2Drafter {
     ctx_normed: DevBuf,
     ctx_k: DevBuf,
     ctx_v: DevBuf,
+    inj_feats: DevBuf,
+    inj_proj: DevBuf,
+    inj_normed: DevBuf,
+    inj_k: DevBuf,
+    inj_v: DevBuf,
+    inj_xq: DevBuf,
     d_mask_tok: DevBuf,
     mask_embd: DevBuf,
     x: DevBuf,
@@ -250,6 +256,12 @@ impl DFlash2Drafter {
             ctx_normed: DevBuf::new(n_embd * 4).map_err(he)?,
             ctx_k: DevBuf::new(kv_dim * 4).map_err(he)?,
             ctx_v: DevBuf::new(kv_dim * 4).map_err(he)?,
+            inj_feats: DevBuf::new(256 * 4 * n_embd * 4).map_err(he)?,
+            inj_proj: DevBuf::new(256 * n_embd * 4).map_err(he)?,
+            inj_normed: DevBuf::new(256 * n_embd * 4).map_err(he)?,
+            inj_k: DevBuf::new(256 * kv_dim * 4).map_err(he)?,
+            inj_v: DevBuf::new(256 * kv_dim * 4).map_err(he)?,
+            inj_xq: DevBuf::new(256 * (4 * n_embd / 32) * 40).map_err(he)?,
             d_mask_tok,
             mask_embd: DevBuf::new(n_embd * 4).map_err(he)?,
             x: DevBuf::new(max_seqs * kmax * n_embd * 4).map_err(he)?,
@@ -367,6 +379,65 @@ impl DFlash2Drafter {
 
     pub fn sync(&self) {
         unsafe { rad_hip::hipStreamSynchronize(self.stream); }
+    }
+
+    pub fn inject_target_feats_batch_seq(&mut self, seq: usize, bsc_feats: *const f32, max_batch: usize, start_tok: usize, pos0: i32, n_tok: usize) -> Result<()> {
+        if n_tok == 0 {
+            return Ok(());
+        }
+        let e = self.n_embd as i32;
+        let kv_dim = (self.n_head_kv * self.dh) as i32;
+        let mut off = 0usize;
+        while off < n_tok {
+            let chunk = (n_tok - off).min(256);
+            let ci = chunk as i32;
+            unsafe {
+                ops::ink_gather_dspark_feats_batch(
+                    self.stream,
+                    bsc_feats,
+                    self.inj_feats.ptr as *mut f32,
+                    (start_tok + off) as i32,
+                    max_batch as i32,
+                    e,
+                    ci,
+                );
+                if self.fc.ty == WeightType::Q4_0 {
+                    ops::ink_quantize_q8_1(self.stream, self.inj_feats.ptr as *const f32, self.inj_xq.ptr, 4 * e, ci);
+                }
+                self.gemm_w(self.stream, &self.fc, self.inj_feats.ptr as *const f32, self.inj_xq.ptr, self.inj_proj.ptr as *mut f32, e, 4 * e, ci);
+                ops::ink_rmsnorm_batch(self.stream, self.inj_proj.ptr as *const f32, self.hidden_norm.ptr as *const f32, self.inj_normed.ptr as *mut f32, e, ci, self.eps);
+                if self.layers[0].wk.ty == WeightType::Q4_0 {
+                    ops::ink_quantize_q8_1(self.stream, self.inj_normed.ptr as *const f32, self.inj_xq.ptr, e, ci);
+                }
+                for l in &self.layers {
+                    let kv_off = seq * self.n_head_kv * l.max_ctx * self.dh;
+                    self.gemm_w(self.stream, &l.wk, self.inj_normed.ptr as *const f32, self.inj_xq.ptr, self.inj_k.ptr as *mut f32, kv_dim, e, ci);
+                    self.gemm_w(self.stream, &l.wv, self.inj_normed.ptr as *const f32, self.inj_xq.ptr, self.inj_v.ptr as *mut f32, kv_dim, e, ci);
+                    ops::ink_dflash2_rope_norm_ctx_batch(
+                        self.stream,
+                        self.inj_k.ptr as *const f32,
+                        self.inj_v.ptr as *const f32,
+                        l.k_norm.ptr as *const f32,
+                        (l.k_cache.ptr as *mut u16).add(kv_off),
+                        (l.v_cache.ptr as *mut u16).add(kv_off),
+                        pos0 + off as i32,
+                        l.max_ctx as i32,
+                        self.n_head_kv as i32,
+                        self.dh as i32,
+                        self.freq_base,
+                        1,
+                        ci,
+                    );
+                }
+            }
+            off += chunk;
+        }
+        unsafe { rad_hip::hipStreamSynchronize(self.stream); }
+        self.seq_ctx_len[seq] = pos0 + n_tok as i32;
+        if seq == 0 {
+            self.ctx_len = pos0 + n_tok as i32;
+        }
+        Ok(())
     }
 
     pub fn inject_target_feats(&mut self, feats_ptr: *const f32, pos: i32) -> Result<()> {

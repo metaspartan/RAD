@@ -72,6 +72,20 @@ impl Drafter {
         }
     }
 
+    fn seq_ctx_len(&self, seq: usize) -> i32 {
+        match self {
+            Drafter::DFlash2(d) => d.seq_ctx_len.get(seq).copied().unwrap_or(-1),
+            Drafter::Dspark(d) => d.seq_ctx_len.get(seq).copied().unwrap_or(-1),
+        }
+    }
+
+    fn max_seqs(&self) -> usize {
+        match self {
+            Drafter::DFlash2(d) => d.max_seqs,
+            Drafter::Dspark(d) => d.max_seqs,
+        }
+    }
+
     fn reset_seq(&mut self, seq: usize) {
         match self {
             Drafter::DFlash2(d) => d.reset_seq(seq),
@@ -86,10 +100,33 @@ impl Drafter {
         }
     }
 
+    fn inject_batch_seq(&mut self, seq: usize, engine: &InklingEngine, start_tok: usize, pos0: i32, n_tok: usize) -> anyhow::Result<()> {
+        match self {
+            Drafter::DFlash2(d) => {
+                let (fptr, mb) = engine.batch_dspark_feats_ptr();
+                d.inject_target_feats_batch_seq(seq, fptr, mb, start_tok, pos0, n_tok)
+            }
+            Drafter::Dspark(d) => {
+                for j in 0..n_tok {
+                    let fptr = engine.gather_batch_dspark_feats(start_tok + j);
+                    d.inject_target_feats_seq(seq, fptr, pos0 + j as i32)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn draft(&mut self, anchor_tok: i32, target: &InklingEngine, k_len: usize) -> anyhow::Result<Vec<i32>> {
         match self {
             Drafter::DFlash2(d) => d.draft(anchor_tok, target, k_len),
             Drafter::Dspark(d) => d.draft(anchor_tok, target, k_len),
+        }
+    }
+
+    fn draft_multi(&mut self, seq_ids: &[i32], anchor_toks: &[i32], target: &InklingEngine, k_len: usize) -> anyhow::Result<Vec<Vec<i32>>> {
+        match self {
+            Drafter::DFlash2(d) => d.draft_multi(seq_ids, anchor_toks, target, k_len),
+            Drafter::Dspark(d) => d.draft_multi(seq_ids, anchor_toks, target, k_len),
         }
     }
 }
@@ -129,6 +166,10 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: serde_json::Value,
+    #[serde(default)]
+    tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -146,6 +187,8 @@ struct ChatRequest {
     max_tokens: Option<usize>,
     #[serde(default)]
     stream: Option<bool>,
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
@@ -276,22 +319,22 @@ fn format_responses_input(input: &serde_json::Value, instructions: Option<&str>)
     let mut msgs = Vec::new();
     if let Some(inst) = instructions {
         if !inst.is_empty() {
-            msgs.push(ChatMessage { role: "system".into(), content: json!(inst) });
+            msgs.push(ChatMessage { role: "system".into(), content: json!(inst), tool_calls: None, name: None });
         }
     }
     match input {
         serde_json::Value::String(s) => {
-            msgs.push(ChatMessage { role: "user".into(), content: json!(s) });
+            msgs.push(ChatMessage { role: "user".into(), content: json!(s), tool_calls: None, name: None });
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
                 let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string();
                 let content = item.get("content").cloned().unwrap_or_else(|| json!(""));
-                msgs.push(ChatMessage { role, content });
+                msgs.push(ChatMessage { role, content, tool_calls: None, name: None });
             }
         }
         _ => {
-            msgs.push(ChatMessage { role: "user".into(), content: json!("") });
+            msgs.push(ChatMessage { role: "user".into(), content: json!(""), tool_calls: None, name: None });
         }
     }
     format_prompt(&msgs, false)
@@ -358,11 +401,10 @@ fn prefill_with_drafter(
                     let seg = &prompt_ids[seg_start..idx];
                     if !seg.is_empty() {
                         let pos0 = engine.seq_pos[seq];
-                        last_tok = engine.prefill_tokens_seq(seq, seg)?;
+                        let _ = engine.prefill_tokens_seq(seq, seg)?;
                         if let Some(ref mut d) = drafter {
-                            for j in 0..seg.len() {
-                                let fptr = engine.gather_batch_dspark_feats(j);
-                                d.inject_target_feats_seq(seq, fptr, pos0 + j as i32)?;
+                            if seq < d.max_seqs() {
+                                d.inject_batch_seq(seq, engine, 0, pos0, seg.len())?;
                             }
                         }
                     }
@@ -371,9 +413,8 @@ fn prefill_with_drafter(
                     let pos0 = engine.seq_pos[seq];
                     last_tok = engine.prefill_embeds_seq(seq, &embeds, n_vis)?;
                     if let Some(ref mut d) = drafter {
-                        for j in 0..n_vis {
-                            let fptr = engine.gather_batch_dspark_feats(j);
-                            d.inject_target_feats_seq(seq, fptr, pos0 + j as i32)?;
+                        if seq < d.max_seqs() {
+                            d.inject_batch_seq(seq, engine, 0, pos0, n_vis)?;
                         }
                     }
                     img_idx += 1;
@@ -385,9 +426,8 @@ fn prefill_with_drafter(
                 let pos0 = engine.seq_pos[seq];
                 last_tok = engine.prefill_tokens_seq(seq, seg)?;
                 if let Some(ref mut d) = drafter {
-                    for j in 0..seg.len() {
-                        let fptr = engine.gather_batch_dspark_feats(j);
-                        d.inject_target_feats_seq(seq, fptr, pos0 + j as i32)?;
+                    if seq < d.max_seqs() {
+                        d.inject_batch_seq(seq, engine, 0, pos0, seg.len())?;
                     }
                 }
             }
@@ -397,29 +437,27 @@ fn prefill_with_drafter(
     match drafter {
         Some(Drafter::Dspark(d)) => engine.prefill_seq_dspark(seq, prompt_ids, Some(d)),
         Some(Drafter::DFlash2(d)) => {
-            if seq == 0 {
-                let cached = &engine.seq_tokens[0];
+            if seq < d.max_seqs {
+                let cached = &engine.seq_tokens[seq];
                 let mut common = 0usize;
                 let lim = cached.len().min(prompt_ids.len().saturating_sub(1));
                 while common < lim && cached[common] == prompt_ids[common] {
                     common += 1;
                 }
-                if common == 0 || common != cached.len() || d.ctx_len as usize != common {
-                    engine.reset_seq(0)?;
-                    d.reset_seq(0);
+                if common == 0 || common != cached.len() || d.seq_ctx_len[seq] as usize != common {
+                    engine.reset_seq(seq)?;
+                    d.reset_seq(seq);
                     common = 0;
                 }
                 let rem = &prompt_ids[common..];
                 let mut last = 0i32;
                 let mut i = 0usize;
                 while i < rem.len() {
-                    let chunk = &rem[i..(i + 256).min(rem.len())];
-                    let pos0 = engine.seq_pos[0];
-                    last = engine.prefill_tokens_seq(0, chunk)?;
-                    for j in 0..chunk.len() {
-                        let fptr = engine.gather_batch_dspark_feats(j);
-                        d.inject_target_feats_seq(0, fptr, pos0 + j as i32)?;
-                    }
+                    let chunk = &rem[i..(i + 1024).min(rem.len())];
+                    let pos0 = engine.seq_pos[seq];
+                    last = engine.prefill_tokens_seq(seq, chunk)?;
+                    let (fptr, mb) = engine.batch_dspark_feats_ptr();
+                    d.inject_target_feats_batch_seq(seq, fptr, mb, 0, pos0, chunk.len())?;
                     i += chunk.len();
                 }
                 Ok((last, common))
@@ -531,9 +569,8 @@ fn run_scheduler(
                         }
                         engine.rewind_verify_to(n_acc, spec_k)?;
                         engine.seq_pos[0] = engine.pos;
+                        d.inject_batch_seq(0, &engine, 0, pos0, n_acc)?;
                         for j in 0..n_acc {
-                            let fptr = engine.gather_batch_dspark_feats(j);
-                            d.inject_target_feats_seq(0, fptr, pos0 + j as i32)?;
                             engine.seq_tokens[0].push(draft[j]);
                         }
                         let mut emitted_toks = Vec::with_capacity(n_acc);
@@ -583,6 +620,100 @@ fn run_scheduler(
                         Err(e) => {
                             let _ = slot.tx.send(GenEvent::Error(format!("{e}")));
                             free[slot.seq] = true;
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if active.len() >= 2 && active.len() <= 8 {
+            if let Some(ref mut d) = drafter {
+                let all_ready = active.iter().all(|a| a.seq < d.max_seqs() && d.seq_ctx_len(a.seq) == engine.seq_pos[a.seq]);
+                if all_ready {
+                    let multi_k = 4usize;
+                    let seq_ids: Vec<i32> = active.iter().map(|a| a.seq as i32).collect();
+                    let anchors: Vec<i32> = active.iter().map(|a| a.next_tok).collect();
+                    let pos_before: Vec<i32> = active.iter().map(|a| engine.seq_pos[a.seq]).collect();
+                    let res = (|| -> anyhow::Result<Vec<Vec<i32>>> {
+                        let drafts = d.draft_multi(&seq_ids, &anchors, &engine, multi_k)?;
+                        let preds = engine.verify_multi(&seq_ids, &drafts)?;
+                        let mut emits = vec![0usize; active.len()];
+                        let mut outs = Vec::with_capacity(active.len());
+                        for u in 0..active.len() {
+                            let mut n_acc = 1usize;
+                            for j in 0..(multi_k - 1) {
+                                if preds[u][j] == drafts[u][j + 1] {
+                                    n_acc += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            emits[u] = n_acc;
+                            let mut tok_out = Vec::with_capacity(n_acc);
+                            for j in 1..n_acc {
+                                tok_out.push(drafts[u][j]);
+                            }
+                            tok_out.push(preds[u][n_acc - 1]);
+                            outs.push(tok_out);
+                        }
+                        engine.rewind_verify_multi(&seq_ids, &emits, multi_k)?;
+                        for u in 0..active.len() {
+                            let su = seq_ids[u] as usize;
+                            d.inject_batch_seq(su, &engine, u * multi_k, pos_before[u], emits[u])?;
+                            for j in 0..emits[u] {
+                                engine.seq_tokens[su].push(drafts[u][j]);
+                            }
+                        }
+                        Ok(outs)
+                    })();
+                    match res {
+                        Ok(all_outs) => {
+                            let mut keep = Vec::with_capacity(active.len());
+                            for (mut slot, toks_out) in active.into_iter().zip(all_outs.into_iter()) {
+                                let mut finished = false;
+                                let mut last_tok = slot.next_tok;
+                                for nxt in toks_out {
+                                    let is_stop = nxt == 200006 || (nxt == 200008 && !slot.enable_thinking);
+                                    if is_stop || slot.tx.is_closed() {
+                                        let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
+                                        let _ = slot.tx.send(GenEvent::Done {
+                                            finish_reason: "stop",
+                                            pred_n: slot.emitted,
+                                            dec_ms,
+                                        });
+                                        free[slot.seq] = true;
+                                        finished = true;
+                                        break;
+                                    }
+                                    slot.emitted += 1;
+                                    let _ = slot.tx.send(GenEvent::Token(nxt as u32));
+                                    last_tok = nxt;
+                                    if slot.emitted >= slot.max_tokens {
+                                        let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
+                                        let _ = slot.tx.send(GenEvent::Done {
+                                            finish_reason: "length",
+                                            pred_n: slot.emitted,
+                                            dec_ms,
+                                        });
+                                        free[slot.seq] = true;
+                                        finished = true;
+                                        break;
+                                    }
+                                }
+                                if !finished {
+                                    slot.next_tok = last_tok;
+                                    keep.push(slot);
+                                }
+                            }
+                            active = keep;
+                        }
+                        Err(e) => {
+                            let msg = format!("{e}");
+                            for slot in active.drain(..) {
+                                let _ = slot.tx.send(GenEvent::Error(msg.clone()));
+                                free[slot.seq] = true;
+                            }
                         }
                     }
                     continue;
@@ -719,7 +850,16 @@ async fn chat_completions(
     let max_tokens = req.max_tokens.unwrap_or(512).min(8192);
     let enable_thinking = req.chat_template_kwargs.and_then(|k| k.enable_thinking).unwrap_or(false);
     let stream = req.stream.unwrap_or(false);
-    let (prompt, images) = format_prompt_with_images(&req.messages, enable_thinking);
+    let (mut prompt, images) = format_prompt_with_images(&req.messages, enable_thinking);
+    if let Some(ref tools) = req.tools {
+        if !tools.is_empty() {
+            let tools_json = serde_json::to_string(tools).unwrap_or_default();
+            let tool_sys = format!("<|message_system|><|content_text|>Available tools: {tools_json}<|end_message|>");
+            if let Some(rest) = prompt.strip_prefix("<|begin_of_text|>") {
+                prompt = format!("<|begin_of_text|>{tool_sys}{rest}");
+            }
+        }
+    }
 
     let enc = match st.tokenizer.encode(prompt, false) {
         Ok(e) => e,
@@ -1158,6 +1298,7 @@ fn print_usage() {
     println!("USAGE:");
     println!("  rad serve [OPTIONS]            Start OpenAI HTTP/SSE/WebSocket server");
     println!("  rad run <PROMPT> [OPTIONS]     Run one-shot local generation");
+    println!("  rad bench [OPTIONS]            Run built-in decode, prefill, and multi-user benchmarks");
     println!("  rad info [OPTIONS]             Print engine configuration and detected files");
     println!();
     println!("OPTIONS:");
@@ -1195,7 +1336,7 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
     let mut idx = 0usize;
     if let Some(first) = args.first() {
         match first.as_str() {
-            "serve" | "run" | "info" => {
+            "serve" | "run" | "bench" | "info" => {
                 cmd = first.clone();
                 idx = 1;
             }
@@ -1360,10 +1501,196 @@ fn load_vision(opts: &CliOpts) -> anyhow::Result<Option<VisionEncoder>> {
     Ok(None)
 }
 
+fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
+    println!("RAD Benchmark Suite (v{})", env!("CARGO_PKG_VERSION"));
+    let t0 = Instant::now();
+    let tokenizer = Tokenizer::from_file(tok_path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let max_seqs = opts.max_seqs.max(16);
+    let mut engine = InklingEngine::load_multi(Path::new(&opts.model), opts.ctx.max(4096), max_seqs)?;
+    engine.capture_decode_graph()?;
+    let mut drafter = load_drafter(opts, &mut engine, max_seqs.min(8))?;
+    let load_s = t0.elapsed().as_secs_f64();
+    let spec_mode = drafter.as_ref().map(|d| d.mode_name()).unwrap_or("none");
+    println!("Loaded model in {:.2}s (spec={spec_mode}, ctx={}, max_seqs={max_seqs})", load_s, opts.ctx);
+    println!();
+
+    let short_p = format_prompt(
+        &[ChatMessage { role: "user".into(), content: json!("Explain GPU memory bandwidth in one paragraph."), tool_calls: None, name: None }],
+        false,
+    );
+    let short_ids: Vec<i32> = tokenizer.encode(short_p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+    engine.reset_seq(0)?;
+    let _ = engine.prefill_tokens_seq(0, &short_ids)?;
+    engine.reset_seq(0)?;
+    let ts = Instant::now();
+    let mut cur_tok = engine.prefill_tokens_seq(0, &short_ids)?;
+    let ttft_ms = ts.elapsed().as_secs_f64() * 1000.0;
+
+    let td = Instant::now();
+    let dec_n = 128usize;
+    for _ in 0..dec_n {
+        cur_tok = engine.step(cur_tok)?;
+    }
+    let b1_nospec_tps = dec_n as f64 / td.elapsed().as_secs_f64();
+
+    let long_chunk = "Modern GPU architectures execute thousands of lightweight threads in parallel across SIMD wavefronts while hiding global HBM latency with large register files, shared local data store memory, and multi-level caches. ";
+    let mut long_text = String::from("Summarize the following technical notes:\n");
+    for _ in 0..45 {
+        long_text.push_str(long_chunk);
+    }
+    let long_p = format_prompt(
+        &[ChatMessage { role: "user".into(), content: json!(long_text), tool_calls: None, name: None }],
+        false,
+    );
+    let long_ids: Vec<i32> = tokenizer.encode(long_p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+
+    engine.reset_seq(0)?;
+    let tpp = Instant::now();
+    let _ = engine.prefill_tokens_seq(0, &long_ids)?;
+    let pp_nospec_tps = long_ids.len() as f64 / tpp.elapsed().as_secs_f64();
+
+    let mut pp_spec_tps = 0.0f64;
+    if let Some(ref mut d) = drafter {
+        engine.reset_seq(0)?;
+        d.reset_seq(0);
+        let tps = Instant::now();
+        let _ = prefill_with_drafter(&mut engine, 0, &long_ids, &[], None, Some(d), None)?;
+        pp_spec_tps = long_ids.len() as f64 / tps.elapsed().as_secs_f64();
+    }
+
+    println!("| Benchmark | Result | Details |");
+    println!("| --- | --- | --- |");
+    println!("| Cold Load | {:.2} s | spec={spec_mode}, hipGraph captured |", load_s);
+    println!("| Short Prompt TTFT | {:.1} ms | {} tokens |", ttft_ms, short_ids.len());
+    println!("| Long Prefill (No-Spec) | {:.1} tok/s | {} tokens |", pp_nospec_tps, long_ids.len());
+    if pp_spec_tps > 0.0 {
+        println!("| Long Prefill ({spec_mode}) | {:.1} tok/s | {} tokens (batched feature inject) |", pp_spec_tps, long_ids.len());
+    }
+    println!("| Single-User Decode (No-Spec) | {:.1} tok/s | B=1 hipGraph ({dec_n} tok) |", b1_nospec_tps);
+
+    if let Some(ref mut d) = drafter {
+        let k_len = d.spec_k();
+        let prompts = [
+            ("Code", "Show me a Python implementation of quicksort and mergesort with a benchmark comparing them on random arrays."),
+            ("Math", "Derive the closed-form formula for the sum of squares 1^2 + 2^2 + ... + n^2 step by step and verify for n=5."),
+            ("Prose", "Explain how modern GPU memory hierarchies work, from registers to L1/L2 caches and HBM, and why memory bandwidth limits LLM decoding."),
+        ];
+        for (label, text) in prompts {
+            let p = format_prompt(&[ChatMessage { role: "user".into(), content: json!(text), tool_calls: None, name: None }], false);
+            let ids: Vec<i32> = tokenizer.encode(p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+            engine.reset_seq(0)?;
+            d.reset_seq(0);
+            let (mut ct, _) = prefill_with_drafter(&mut engine, 0, &ids, &[], None, Some(d), None)?;
+            let mut gen = 0usize;
+            let mut rounds = 0usize;
+            let mut d_ms = 0.0f64;
+            let mut v_ms = 0.0f64;
+            let mut i_ms = 0.0f64;
+            let t1 = Instant::now();
+            while gen < 160 {
+                let td0 = Instant::now();
+                let draft = d.draft(ct, &engine, k_len)?;
+                d_ms += td0.elapsed().as_secs_f64() * 1000.0;
+                let pos0 = engine.pos;
+                let tv0 = Instant::now();
+                let preds = engine.verify_batch(&draft)?;
+                v_ms += tv0.elapsed().as_secs_f64() * 1000.0;
+                let mut n_acc = 1usize;
+                for j in 0..(k_len - 1) {
+                    if preds[j] == draft[j + 1] { n_acc += 1; } else { break; }
+                }
+                engine.rewind_verify_to(n_acc, k_len)?;
+                engine.seq_pos[0] = engine.pos;
+                let ti0 = Instant::now();
+                d.inject_batch_seq(0, &engine, 0, pos0, n_acc)?;
+                i_ms += ti0.elapsed().as_secs_f64() * 1000.0;
+                ct = preds[n_acc - 1];
+                gen += n_acc;
+                rounds += 1;
+                if ct == 200006 || ct == 200008 { break; }
+            }
+            let tps = gen as f64 / t1.elapsed().as_secs_f64();
+            let avg_e = gen as f64 / rounds.max(1) as f64;
+            println!(
+                "| Single-User {label} ({spec_mode} K={k_len}) | {:.1} tok/s | emit={:.2}, draft={:.2}ms, verify={:.2}ms, inject={:.2}ms |",
+                tps, avg_e, d_ms / rounds as f64, v_ms / rounds as f64, i_ms / rounds as f64
+            );
+        }
+
+        for &b in &[4usize, 8usize] {
+            if b <= d.max_seqs() {
+                let mk = 4usize;
+                let code_p = format_prompt(
+                    &[ChatMessage { role: "user".into(), content: json!("Show me a Python implementation of quicksort and mergesort."), tool_calls: None, name: None }],
+                    false,
+                );
+                let ids: Vec<i32> = tokenizer.encode(code_p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+                let seq_ids: Vec<i32> = (0..b as i32).collect();
+                let mut cur = vec![0i32; b];
+                for u in 0..b {
+                    engine.reset_seq(u)?;
+                    d.reset_seq(u);
+                    let (t, _) = prefill_with_drafter(&mut engine, u, &ids, &[], None, Some(d), None)?;
+                    cur[u] = t;
+                }
+                let _ = d.draft_multi(&seq_ids, &cur, &engine, mk)?;
+                let mut tot = 0usize;
+                let t1 = Instant::now();
+                while tot < b * 80 {
+                    let drafts = d.draft_multi(&seq_ids, &cur, &engine, mk)?;
+                    let pos0: Vec<i32> = (0..b).map(|u| engine.seq_pos[u]).collect();
+                    let preds = engine.verify_multi(&seq_ids, &drafts)?;
+                    let mut emits = vec![0usize; b];
+                    for u in 0..b {
+                        let mut n_acc = 1usize;
+                        for j in 0..(mk - 1) {
+                            if preds[u][j] == drafts[u][j + 1] { n_acc += 1; } else { break; }
+                        }
+                        emits[u] = n_acc;
+                        cur[u] = preds[u][n_acc - 1];
+                        tot += n_acc;
+                    }
+                    engine.rewind_verify_multi(&seq_ids, &emits, mk)?;
+                    for u in 0..b {
+                        d.inject_batch_seq(u, &engine, u * mk, pos0[u], emits[u])?;
+                    }
+                }
+                let agg = tot as f64 / t1.elapsed().as_secs_f64();
+                println!("| Multi-User B={b} ({spec_mode} K={mk}) | {:.1} agg tok/s | {:.1} tok/s/user |", agg, agg / b as f64);
+            }
+        }
+    }
+
+    for &b in &[8usize, 16usize] {
+        if b <= max_seqs {
+            let seq_ids: Vec<i32> = (0..b as i32).collect();
+            let mut cur = vec![0i32; b];
+            for u in 0..b {
+                engine.reset_seq(u)?;
+                cur[u] = engine.prefill_tokens_seq(u, &short_ids)?;
+            }
+            let _ = engine.step_multi(&seq_ids, &cur)?;
+            let steps = 48usize;
+            let t1 = Instant::now();
+            for _ in 0..steps {
+                cur = engine.step_multi(&seq_ids, &cur)?;
+            }
+            let agg = (b * steps) as f64 / t1.elapsed().as_secs_f64();
+            println!("| Multi-User B={b} (No-Spec) | {:.1} agg tok/s | {:.1} tok/s/user |", agg, agg / b as f64);
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opts = parse_cli()?;
     let tok_path = opts.tokenizer.clone().unwrap_or_else(|| "./models/tokenizer.json".into());
+
+    if opts.cmd == "bench" {
+        return run_bench(&opts, &tok_path);
+    }
 
     if opts.cmd == "info" {
         println!("RAD v{}", env!("CARGO_PKG_VERSION"));
@@ -1396,7 +1723,7 @@ async fn main() -> anyhow::Result<()> {
             (Vec::new(), user_prompt)
         };
         let formatted = format_prompt(
-            &[ChatMessage { role: "user".into(), content: serde_json::Value::String(prompt_content) }],
+            &[ChatMessage { role: "user".into(), content: serde_json::Value::String(prompt_content), tool_calls: None, name: None }],
             opts.thinking,
         );
         let ids: Vec<i32> = tokenizer.encode(formatted, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
@@ -1422,10 +1749,9 @@ async fn main() -> anyhow::Result<()> {
                     let t = draft[j];
                     if t == 200006 || t == 200008 { stop = true; break; }
                     emitted.push(t as u32);
-                    let fptr = engine.gather_batch_dspark_feats(j);
-                    dr.inject_target_feats_seq(0, fptr, pos_before + j as i32)?;
                     if emitted.len() >= opts.max_tokens { stop = true; break; }
                 }
+                dr.inject_batch_seq(0, &engine, 0, pos_before, n_acc)?;
                 let txt = tokenizer.decode(&emitted, true).unwrap_or_default();
                 if txt.len() > prev_len {
                     print!("{}", &txt[prev_len..]);

@@ -238,6 +238,83 @@ extern "C" int ink_dflash2_topk16(hipStream_t s, const float* logits, int* cand_
     return 0;
 }
 
+extern "C" __global__ void gather_dspark_feats_batch_k(const float* __restrict__ bsc_feats,
+                                                       float* __restrict__ dst,
+                                                       int start_tok, int max_batch,
+                                                       int n_embd, int n_tok) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    if (c >= n_embd || t >= n_tok) return;
+    int src_tok = start_tok + t;
+    float* dp = dst + (size_t)t * (4 * n_embd);
+#pragma unroll
+    for (int f = 0; f < 4; ++f) {
+        dp[(size_t)f * n_embd + c] = bsc_feats[((size_t)f * max_batch + src_tok) * n_embd + c];
+    }
+}
+
+extern "C" __global__ void dflash2_rope_norm_ctx_batch_k(const float* __restrict__ K_in,
+                                                         const float* __restrict__ V_in,
+                                                         const float* __restrict__ k_norm_w,
+                                                         __half* __restrict__ kc,
+                                                         __half* __restrict__ vc,
+                                                         int pos0, int max_ctx,
+                                                         int n_head_kv, int dh,
+                                                         float freq_base, int is_swa) {
+    int h = blockIdx.x;
+    int t = blockIdx.y;
+    int lane = threadIdx.x;
+    int pos = pos0 + t;
+    int slot = is_swa ? (pos % max_ctx) : pos;
+    int kv_dim = n_head_kv * dh;
+    const float* kh = K_in + (size_t)t * kv_dim + h * dh;
+    const float* vh = V_in + (size_t)t * kv_dim + h * dh;
+    __half* kd = kc + ((size_t)h * max_ctx + slot) * dh;
+    __half* vd = vc + ((size_t)h * max_ctx + slot) * dh;
+    float kv[4];
+    float ss = 0.0f;
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        int d = lane + p * 32;
+        kv[p] = kh[d];
+        ss += kv[p] * kv[p];
+        vd[d] = __float2half(vh[d]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += __shfl_xor(ss, off, 32);
+    }
+    float inv = rsqrtf(ss / (float)dh + 1e-6f);
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        int d = lane + p * 32;
+        kv[p] = kv[p] * inv * k_norm_w[d];
+    }
+    int half_dh = dh >> 1;
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        int d = lane + p * 32;
+        float freq = powf(freq_base, -2.0f * (float)d / (float)dh);
+        float ang = (float)pos * freq;
+        float ca = cosf(ang);
+        float sa = sinf(ang);
+        float x0 = kv[p];
+        float x1 = kv[p + 2];
+        kd[d] = __float2half(x0 * ca - x1 * sa);
+        kd[d + half_dh] = __float2half(x0 * sa + x1 * ca);
+    }
+}
+
+extern "C" int ink_gather_dspark_feats_batch(hipStream_t s, const float* bsc_feats, float* dst, int start_tok, int max_batch, int n_embd, int n_tok) {
+    gather_dspark_feats_batch_k<<<dim3((n_embd + 255) / 256, n_tok), dim3(256), 0, s>>>(bsc_feats, dst, start_tok, max_batch, n_embd, n_tok);
+    return 0;
+}
+
+extern "C" int ink_dflash2_rope_norm_ctx_batch(hipStream_t s, const float* k_in, const float* v_in, const float* k_norm_w, __half* kc, __half* vc, int pos0, int max_ctx, int n_head_kv, int dh, float freq_base, int is_swa, int n_tok) {
+    dflash2_rope_norm_ctx_batch_k<<<dim3(n_head_kv, n_tok), dim3(32), 0, s>>>(k_in, v_in, k_norm_w, kc, vc, pos0, max_ctx, n_head_kv, dh, freq_base, is_swa);
+    return 0;
+}
+
 extern "C" int ink_dflash2_select_path(hipStream_t s, const int* cand_ids, const float* cand_vals, const float* h_proj, const uint16_t* pred_cb, const uint16_t* succ_cb, int* d_draft_toks, int n_users, int K_len, int rank, float softcap) {
     dflash2_select_path_k<<<dim3(n_users), dim3(256), 0, s>>>(cand_ids, cand_vals, h_proj, pred_cb, succ_cb, d_draft_toks, K_len, rank, softcap);
     return 0;

@@ -8,9 +8,9 @@ The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybri
 
 ## Highlights
 
-- **Native `incoai/Inkling-2-Mini-DFlash2` Speculative Decoding (`194.1 tok/s` Single-User)**
-  - Zero-copy `safetensors` loader + 5-layer parallel block-diffusion drafter with grouped dynamic convolutions (`conv_kernel_size=2`, `conv_group_size=16`), 1 parallel `lm_head` pass, and GPU top-16 candidate path selector (`draft=3.48 ms`, `avg_emit=6.52` on code, `5.52` on math).
-  - Full `hipGraph`-captured draft & verify loops for both single-user (`B=1`) and multi-user (`B=4..8`), plus fallback support for **DSpark** (`dspark-Inkling-2-Mini-Q8_0.gguf`).
+- **Native `incoai/Inkling-2-Mini-DFlash2` Speculative Decoding (`198.4 tok/s` Single-User, `1,644.9 tok/s` Prefill)**
+  - Zero-copy `safetensors` loader + 5-layer parallel block-diffusion drafter with grouped dynamic convolutions (`conv_kernel_size=2`, `conv_group_size=16`), 1 parallel `lm_head` pass, GPU top-16 candidate path selector, and batched WMMA feature-injection kernels (`draft=3.60 ms`, `inject=0.20 ms`, `avg_emit=6.56` on code).
+  - Full `hipGraph`-captured draft & verify loops for both single-user (`B=1`) and multi-user (`B=4..8`, up to **`535.1 agg tok/s`**), plus fallback support for **DSpark** (`dspark-Inkling-2-Mini-Q8_0.gguf`).
 - **Native GPU Vision (`mmproj-F16.gguf`, Enabled by Default)**
   - Full 23-layer HIP ViT encoder (`640×640`, `20×20` patches, LayerScale `ls1`/`ls2`, bidirectional self-attention, `2×2` spatial merge, `inkling2v` MLP projector) outputting 256 multimodal embeddings directly into `InklingEngine` and `DFlash2Drafter`.
   - Works out of the box via OpenAI `image_url` (data URLs / local files) in `/v1/chat/completions` and `rad run --image <PATH>`.
@@ -31,15 +31,15 @@ The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybri
 
 ![RAD vs Stock llama.cpp and RTX PRO 6000 Blackwell](assets/rad_benchmark.svg)
 
-Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)** (`Inkling-2-Mini-UD-Q4_K_XL` + `incoai/Inkling-2-Mini-DFlash2` / `dspark-Inkling-2-Mini-Q8_0.gguf`, coherence-verified) — achieving **2.75× faster decode** and **2.16× faster prefill** than stock `llama.cpp`, and outperforming Unsloth's claimed **125 tok/s** on an **NVIDIA RTX PRO 6000 Blackwell (96 GB, ~\$8,500)** by **+55.3%**:
+Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)** (`Inkling-2-Mini-UD-Q4_K_XL` + `incoai/Inkling-2-Mini-DFlash2` / `dspark-Inkling-2-Mini-Q8_0.gguf`, coherence-verified via `rad bench`) — achieving **2.81× faster decode** and **2.16× faster prefill** than stock `llama.cpp`, and outperforming Unsloth's claimed **125 tok/s** on an **NVIDIA RTX PRO 6000 Blackwell (96 GB, ~\$8,500)** by **+58.7%**:
 
-| Engine / Hardware | Decode (`tok/s`) | Long Prefill (`1,639 tok`) | Notes |
+| Engine / Hardware | Decode (`tok/s`) | Long Prefill (`tok/s`) | Notes |
 | --- | --- | --- | --- |
 | **Stock `llama.cpp` (R9700 + DSpark)** | `70.5 tok/s` | `765.5 tok/s` | `-fa on -ctk q8_0 -ctv q8_0 --spec-type draft-dspark` |
-| **RAD (R9700, No-Spec `hipGraph`)** | **`93.9 tok/s`** (`1.33×`) | **`1,651.7 tok/s`** (`2.16×`) | Beats stock `llama.cpp`+DSpark without speculation |
+| **RAD (R9700, No-Spec `hipGraph`)** | **`93.9 tok/s`** (`1.33×`) | **`1,652.4 tok/s`** (`2.16×`) | Beats stock `llama.cpp`+DSpark without speculation |
 | **Unsloth RTX PRO 6000 Blackwell** | `125.0 tok/s` *(claimed)* | — | 96 GB workstation GPU (~\$8,500) |
-| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`1,651.7 tok/s`** (`2.16×`) | `verify=23.7 ms`, `avg_emit=4.27` |
-| **RAD (R9700 + DFlash 2 `K=8`)** | **`194.1 tok/s`** (**`2.75×`**) | **`1,651.7 tok/s`** (**`2.16×`**) | **+55.3% vs. RTX PRO 6000 Blackwell**, `draft=3.48 ms`, `avg_emit=6.52` (code), `173.6 tok/s` (math) |
+| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`1,652.4 tok/s`** (`2.16×`) | `verify=23.7 ms`, `avg_emit=4.27` |
+| **RAD (R9700 + DFlash 2 `K=8`)** | **`198.4 tok/s`** (**`2.81×`**) | **`1,644.9 tok/s`** (**`2.15×`**) | **+58.7% vs. RTX PRO 6000 Blackwell**, `draft=3.60 ms`, `inject=0.20 ms`, `avg_emit=6.56` (code) |
 
 ### Multi-User Continuous Batching & Batched Speculative Decoding
 
@@ -47,14 +47,14 @@ Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)** (`
 
 | Workload | Throughput / Latency | Notes |
 | --- | --- | --- |
-| **Cold Load (`max_seqs=128`)** | **1.17 s** | On-GPU `Q4_0_SOA` conversion + `hipGraph` capture (`48.1 ms`) |
-| **Short Prompt TTFT (`27 tok`)** | **51.2 ms** | Split-K WMMA router + `Q4_0_SOA` |
+| **Cold Load (`max_seqs=16`, DFlash 2)** | **1.82 s** | On-GPU `Q4_0_SOA` conversion + `hipGraph` capture |
+| **Short Prompt TTFT (`15 tok`)** | **37.2 ms** | Split-K WMMA router + `Q4_0_SOA` |
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **32.5 ms** | Prefix-cache affinity hit |
-| **Multi-User Decode (`B=4`, Batched DSpark `K=4`)** | **318.8 agg tok/s** | **`79.7 tok/s/user`** (`draft=3.62 ms`, `verify=34.67 ms`) |
-| **Multi-User Decode (`B=8`, no-spec)** | **238.2 agg tok/s** | `29.8 tok/s/user` (`hipGraph` + fused `moe_gu_sudot4_to_q8`) |
-| **Multi-User Decode (`B=8`, Batched DFlash 2 `K=4`)** | **416.5 agg tok/s** | **`52.1 tok/s/user`** (`draft=7.08 ms`, `verify=48.86 ms`) |
-| **Multi-User Decode (`B=8`, Batched DSpark `K=4`)** | **458.6 agg tok/s** | **`57.3 tok/s/user`** (**+92%** over `B=8` no-spec, `draft=5.20 ms`) |
-| **Multi-User Decode (`B=16`, no-spec)** | **448.5 agg tok/s** | `28.0 tok/s/user` |
+| **Multi-User Decode (`B=4`, Batched DFlash 2 `K=4`)** | **374.3 agg tok/s** | **`93.6 tok/s/user`** (batched feature inject) |
+| **Multi-User Decode (`B=8`, no-spec)** | **389.4 agg tok/s** | `48.7 tok/s/user` (`hipGraph` + fused `moe_gu_sudot4_to_q8`) |
+| **Multi-User Decode (`B=8`, Batched DSpark `K=4`)** | **458.6 agg tok/s** | `57.3 tok/s/user` |
+| **Multi-User Decode (`B=8`, Batched DFlash 2 `K=4`)** | **535.1 agg tok/s** | **`66.9 tok/s/user`** (8 concurrent users at ~single-user `llama.cpp` speed) |
+| **Multi-User Decode (`B=16`, no-spec)** | **580.3 agg tok/s** | `36.3 tok/s/user` |
 | **Multi-User Decode (`B=32`, no-spec)** | **688.0 agg tok/s** | `21.5 tok/s/user` (~83% of peak R9700 HBM bandwidth) |
 | **Multi-User Decode (`B=64`, no-spec)** | **963.5 agg tok/s** | `15.1 tok/s/user` (WMMA INT8 MoE active at `B >= 48`) |
 | **Multi-User Decode (`B=128`, no-spec)** | **1,266.3 agg tok/s** | `9.9 tok/s/user` |
@@ -125,13 +125,10 @@ cargo build --release
 ./target/release/rad info -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf
 ```
 
-### 4. Run Benchmarks
+### 4. Run Built-In Benchmarks (`rad bench`)
 
 ```bash
-cargo run --release --example bench_dflash2 -- \
-  /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf \
-  /path/to/inkling2-dflash2 \
-  /path/to/tokenizer.json
+./target/release/rad bench -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf --ctx 4096 --max-seqs 16
 
 python3 scripts/test_serve.py
 ```
