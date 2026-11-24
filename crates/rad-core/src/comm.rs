@@ -108,7 +108,17 @@ impl MultiGpuComm {
         let prev = rad_hip::get_device().unwrap_or(0);
 
         if w == 2 && self.p2p[0][1] && self.p2p[1][0] {
+            let mut ev0: rad_hip::HipEvent = std::ptr::null_mut();
+            let mut ev1: rad_hip::HipEvent = std::ptr::null_mut();
             rad_hip::set_device(self.devices[0]).map_err(he)?;
+            let _ = rad_hip::hipEventCreateWithFlags(&mut ev0, 2);
+            let _ = rad_hip::hipEventRecord(ev0, streams[0]);
+            rad_hip::set_device(self.devices[1]).map_err(he)?;
+            let _ = rad_hip::hipEventCreateWithFlags(&mut ev1, 2);
+            let _ = rad_hip::hipEventRecord(ev1, streams[1]);
+
+            rad_hip::set_device(self.devices[0]).map_err(he)?;
+            let _ = rad_hip::hipStreamWaitEvent(streams[0], ev1, 0);
             let rc0 = rad_hip::hipMemcpyPeerAsync(
                 self.stage_dev[0].ptr,
                 self.devices[0],
@@ -118,10 +128,13 @@ impl MultiGpuComm {
                 streams[0],
             );
             if rc0 != rad_hip::HIP_SUCCESS {
+                let _ = rad_hip::hipEventDestroy(ev0);
+                let _ = rad_hip::hipEventDestroy(ev1);
                 let _ = rad_hip::set_device(prev);
                 return Err(he(rc0));
             }
             rad_hip::set_device(self.devices[1]).map_err(he)?;
+            let _ = rad_hip::hipStreamWaitEvent(streams[1], ev0, 0);
             let rc1 = rad_hip::hipMemcpyPeerAsync(
                 self.stage_dev[1].ptr,
                 self.devices[1],
@@ -131,13 +144,21 @@ impl MultiGpuComm {
                 streams[1],
             );
             if rc1 != rad_hip::HIP_SUCCESS {
+                let _ = rad_hip::hipEventDestroy(ev0);
+                let _ = rad_hip::hipEventDestroy(ev1);
                 let _ = rad_hip::set_device(prev);
                 return Err(he(rc1));
             }
+            let _ = rad_hip::hipEventRecord(ev1, streams[1]);
             rad_hip::set_device(self.devices[0]).map_err(he)?;
+            let _ = rad_hip::hipEventRecord(ev0, streams[0]);
+            let _ = rad_hip::hipStreamWaitEvent(streams[0], ev1, 0);
             ops::ink_vec_add(streams[0], bufs[0] as *const f32, self.stage_dev[0].ptr as *const f32, bufs[0], n as i32);
             rad_hip::set_device(self.devices[1]).map_err(he)?;
+            let _ = rad_hip::hipStreamWaitEvent(streams[1], ev0, 0);
             ops::ink_vec_add(streams[1], bufs[1] as *const f32, self.stage_dev[1].ptr as *const f32, bufs[1], n as i32);
+            let _ = rad_hip::hipEventDestroy(ev0);
+            let _ = rad_hip::hipEventDestroy(ev1);
             let _ = rad_hip::set_device(prev);
             return Ok(());
         }

@@ -22,10 +22,10 @@ RAD natively runs **Inkling-2-Mini** (26B MoE, 48 looped visits, hybrid SWA + fu
   - Custom `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` **FlashAttention-2** (reverse causal tile scheduling, bank-conflict-free LDS KV tiles, register-preloaded `float4` relative-position projections, and Split-KV WMMA FlashAttention up to 64 splits).
 - **Multi-GPU R9700 Data-Parallel Serving (`--gpus 0,1` / `--gpus auto`) & HIP P2P Collective Layer**
   - Spawns one dedicated GPU scheduler + DFlash 2 + Vision + Paged KV worker per GPU with **prefix-aware least-loaded routing** (matching prompt prefixes stick to the same GPU for KV cache hits while balancing concurrent requests across all GPUs) — zero PCIe all-reduce overhead and linear multi-user throughput & KV capacity scaling.
-  - Automatic HIP peer-access detection (`hipDeviceCanAccessPeer` / `hipDeviceEnablePeerAccess`), direct `hipMemcpyPeerAsync` + on-GPU `ink_vec_add` AllReduce/Broadcast with pinned-host fallback (`crates/rad-core/src/comm.rs`), tensor-parallel sharding plan (`crates/rad-core/src/tp.rs`), and GPU/P2P topology inspection via `rad info` and `GET /health`.
+  - Automatic HIP peer-access detection (`hipDeviceCanAccessPeer` / `hipDeviceEnablePeerAccess`), cross-stream HIP event-synchronized (`hipEventRecord` / `hipStreamWaitEvent`) direct `hipMemcpyPeerAsync` + on-GPU `ink_vec_add` AllReduce/Broadcast with pinned-host fallback (`crates/rad-core/src/comm.rs`), tensor-parallel sharding plan (`crates/rad-core/src/tp.rs`), and GPU/P2P topology inspection via `rad info` and `GET /health`.
 - **Production OpenAI-Compatible Serving (`rad serve`)**
-  - Continuous batching up to `B=128` (**`1,856.0 agg tok/s`**), **Paged KV block manager** (`--kv-block-size 16`, copy-on-write prefix sharing & refcounting), **Chunked Prefill** (`--prefill-chunk-size 512`), **JSON & Tool-Calling Grammar Constraints**, **`stop` sequences**, **`seed` / `presence_penalty` / `frequency_penalty`**, **`400 context_length_exceeded`** overflow guard, **Prometheus `GET /metrics`**, optional **multi-key API auth** (`Authorization: Bearer` & `X-API-Key`, `--metrics-auth`), CORS + `x-request-id` middleware, and non-conflicting default port **`6733`**.
-  - Endpoints: `GET /health`, `GET /metrics`, `GET /v1/models`, `GET /v1/models/:id`, `POST /v1/tokenize`, `POST /v1/detokenize`, `POST /v1/chat/completions` (JSON + SSE + `stream_options.include_usage`), `POST /v1/completions` (single + batch), `POST /v1/responses` (HTTP + SSE), `GET /v1/responses` (WebSocket).
+  - Continuous batching up to `B=128` (**`1,856.0 agg tok/s`**), **Paged KV block manager** (`--kv-block-size 16`, copy-on-write prefix sharing & refcounting), **Budgeted Chunked Prefill** (`--prefill-chunk-size 512`, draining concurrent short prefills into batched decode without ramp-up stalls — **`604.1 agg tok/s` live 8-user SSE**), **JSON & Tool-Calling Grammar Constraints**, **`stop` sequences**, **`seed` / `presence_penalty` / `frequency_penalty`**, **`400 context_length_exceeded`** overflow guard, **Prometheus `GET /metrics`**, optional **multi-key API auth** (`Authorization: Bearer` & `X-API-Key`, `--metrics-auth`), CORS + `x-request-id` middleware, and non-conflicting default port **`6733`**.
+  - Endpoints: `GET /health`, `GET /metrics`, `GET /v1/models`, `GET /v1/models/:id`, `POST /v1/tokenize`, `POST /v1/detokenize`, `POST /v1/chat/completions` (JSON + SSE + `stream_options.include_usage`), `POST /v1/completions` (single + batch), `POST /v1/responses` (HTTP + SSE with `usage` in `response.completed`), `GET /v1/responses` (WebSocket).
 
 ---
 
@@ -80,6 +80,8 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **Multi-User Decode (`B=32`, no-spec)** | **867.2 agg tok/s** | `27.1 tok/s/user` |
 | **Multi-User Decode (`B=64`, no-spec)** | **1,162.2 agg tok/s** | `18.2 tok/s/user` (8-warp `128×64` LDS WMMA MoE) |
 | **Multi-User Decode (`B=128`, no-spec)** | **1,856.0 agg tok/s** | **`14.5 tok/s/user`** (fused WMMA MoE-to-`Q8_1` + `float4` slot reduction) |
+| **Live SSE API (`/v1/chat/completions` & `/v1/responses`, 32K)** | **579.9 / 585.1 tok/s** | Live HTTP SSE at `32,452` prompt tokens (`3,604–3,622 tok/s` prefill, `252.3–265.7 tok/s` Code pure-gen) |
+| **Live SSE API (8-User Concurrent, DFlash 2 `K=4`)** | **604.1 agg tok/s** | **`75.5 tok/s/user`** decode window (`591.2 agg tok/s` end-to-end wall-clock incl. prefill) |
 
 ---
 
@@ -183,8 +185,8 @@ python3 scripts/test_serve.py
 - **Debian / Ubuntu (`.deb`):**
   Download `rad_<version>_amd64.deb` from GitHub Releases or build locally:
   ```bash
-  bash packaging/deb/build_deb.sh 0.6.0
-  sudo dpkg -i dist/rad_0.6.0_amd64.deb
+  bash packaging/deb/build_deb.sh 0.12.0
+  sudo dpkg -i dist/rad_0.12.0_amd64.deb
   ```
 - **Homebrew (Linuxbrew):**
   ```bash

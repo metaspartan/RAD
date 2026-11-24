@@ -19,6 +19,7 @@ fn main() {
 pub type HipError = i32;
 pub const HIP_SUCCESS: i32 = 0;
 pub type HipStream = *mut core::ffi::c_void;
+pub type HipEvent = *mut core::ffi::c_void;
 pub type HipDevicePtr = u64;
 
 extern "C" {
@@ -28,6 +29,10 @@ extern "C" {
     pub fn hipMemcpyAsync(dst: *mut core::ffi::c_void, src: *const core::ffi::c_void, size: usize, kind: i32, stream: HipStream) -> HipError;
     pub fn hipStreamCreate(s: *mut HipStream) -> HipError;
     pub fn hipStreamSynchronize(s: HipStream) -> HipError;
+    pub fn hipEventCreateWithFlags(ev: *mut HipEvent, flags: u32) -> HipError;
+    pub fn hipEventDestroy(ev: HipEvent) -> HipError;
+    pub fn hipEventRecord(ev: HipEvent, s: HipStream) -> HipError;
+    pub fn hipStreamWaitEvent(s: HipStream, ev: HipEvent, flags: u32) -> HipError;
     pub fn hipMemsetD32Async(dst: *mut core::ffi::c_void, value: i32, count: usize, stream: HipStream) -> HipError;
     pub fn hipStreamBeginCapture(s: HipStream, mode: i32) -> HipError;
     pub fn hipStreamEndCapture(s: HipStream, g: *mut *mut core::ffi::c_void) -> HipError;

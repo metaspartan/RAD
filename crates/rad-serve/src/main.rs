@@ -1105,10 +1105,12 @@ fn run_scheduler(
             }
         }
 
-        if let Some(mut pf) = prefilling.pop_front() {
-            let chunk_lim = if active.is_empty() { 1024 } else { prefill_chunk_size.max(64).min(1024) };
-            let end = (pf.offset + chunk_lim).min(pf.job.prompt_ids.len());
+        let mut pf_budget = if active.is_empty() { 1024 } else { prefill_chunk_size.max(64).min(1024) };
+        while pf_budget > 0 {
+            let Some(mut pf) = prefilling.pop_front() else { break; };
+            let end = (pf.offset + pf_budget).min(pf.job.prompt_ids.len());
             let chunk = &pf.job.prompt_ids[pf.offset..end];
+            pf_budget = pf_budget.saturating_sub(chunk.len());
             let pos0 = engine.seq_pos[pf.seq];
             match engine.prefill_tokens_seq(pf.seq, chunk) {
                 Ok(mut last_tok) => {
@@ -1137,6 +1139,7 @@ fn run_scheduler(
                     pf.offset = end;
                     if pf.offset < pf.job.prompt_ids.len() {
                         prefilling.push_back(pf);
+                        break;
                     } else {
                         let pp_s = pf.started_at.elapsed().as_secs_f64();
                         let pp_ms = pp_s * 1000.0;
@@ -1311,6 +1314,7 @@ fn run_scheduler(
                     let seq_ids: Vec<i32> = active.iter().map(|a| a.seq as i32).collect();
                     let anchors: Vec<i32> = active.iter().map(|a| a.next_tok).collect();
                     let pos_before: Vec<i32> = active.iter().map(|a| engine.seq_pos[a.seq]).collect();
+                    let t_step = Instant::now();
                     let res = (|| -> anyhow::Result<Vec<Vec<i32>>> {
                         let drafts = d.draft_multi(&seq_ids, &anchors, &engine, multi_k)?;
                         let preds = engine.verify_multi(&seq_ids, &drafts)?;
@@ -1340,12 +1344,22 @@ fn run_scheduler(
                             for j in 0..emits[u] {
                                 engine.seq_tokens[su].push(drafts[u][j]);
                             }
+                            let _ = engine.paged_kv.ensure_tokens(su, engine.seq_pos[su] as usize, &engine.seq_tokens[su]);
                         }
                         d.sync();
                         Ok(outs)
                     })();
+                    let step_s = t_step.elapsed().as_secs_f64();
+                    sync_kv_metrics(&engine, &metrics);
                     match res {
                         Ok(all_outs) => {
+                            let tot_out: usize = all_outs.iter().map(|v| v.len()).sum();
+                            metrics.spec_rounds_total.fetch_add(1, Ordering::Relaxed);
+                            metrics.spec_accepted_tokens_total.fetch_add(tot_out as u64, Ordering::Relaxed);
+                            metrics.decode_us_total.fetch_add((step_s * 1e6) as u64, Ordering::Relaxed);
+                            if tot_out > 0 {
+                                metrics.observe_itl(step_s / (tot_out as f64 / active.len().max(1) as f64));
+                            }
                             let mut keep = Vec::with_capacity(active.len());
                             for (mut slot, toks_out) in active.into_iter().zip(all_outs.into_iter()) {
                                 let mut finished = false;
@@ -1364,6 +1378,7 @@ fn run_scheduler(
                                         break;
                                     }
                                     slot.emitted += 1;
+                                    metrics.generated_tokens_total.fetch_add(1, Ordering::Relaxed);
                                     let _ = slot.tx.send(GenEvent::Token(nxt as u32));
                                     last_tok = nxt;
                                     if slot.emitted >= slot.max_tokens {
@@ -2079,12 +2094,17 @@ async fn responses_http(
             let mut msg_started = false;
             let mut output_items: Vec<serde_json::Value> = Vec::new();
             let mut out_index = 0usize;
+            let mut prompt_n = 0usize;
+            let mut cached_n = 0usize;
             let _ = sse_tx.send(Ok(Event::default().event("response.created").data(
                 json!({"type":"response.created","response":{"id":resp_id,"object":"response","status":"in_progress","model":model_id,"created_at":created,"output":[]}}).to_string()
             )));
             while let Some(ev) = rx.recv().await {
                 match ev {
-                    GenEvent::Prefill { .. } => {}
+                    GenEvent::Prefill { prompt_n: pn, cached_n: cn, .. } => {
+                        prompt_n = pn;
+                        cached_n = cn;
+                    }
                     GenEvent::Token(t) => {
                         for d in parser.push_token(t, &tok) {
                             match d {
@@ -2230,6 +2250,12 @@ async fn responses_http(
                                     "model":model_id,
                                     "output":output_items,
                                     "output_text":full,
+                                    "usage":{
+                                        "input_tokens":prompt_n,
+                                        "input_tokens_details":{"cached_tokens":cached_n},
+                                        "output_tokens":pred_n,
+                                        "total_tokens":prompt_n + pred_n
+                                    },
                                     "timings":{"predicted_n":pred_n,"predicted_ms":dec_ms}
                                 }
                             }).to_string()
@@ -3243,8 +3269,7 @@ async fn main() -> anyhow::Result<()> {
     let (gpu_ids, p2p_links) = resolve_gpu_ids(&opts.gpus)?;
     if opts.tp > 1 {
         anyhow::bail!(
-            "tensor-parallel weight sharding (--tp {}) is staged next (detected {} GPU(s), p2p_links={}); for dual/multi-R9700 serving today use data-parallel mode: `--gpus 0,1` or `--gpus auto`",
-            opts.tp,
+            "use data-parallel multi-GPU serving via `--gpus 0,1` or `--gpus auto` (detected {} GPU(s), p2p_links={})",
             gpu_ids.len(),
             p2p_links
         );
