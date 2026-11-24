@@ -342,8 +342,253 @@ extern "C" int ink_dflash2_conv(hipStream_t s, const float* hidden, const float*
     return 0;
 }
 
+__device__ float g_df2_topk_v[64 * 16 * 16];
+__device__ int g_df2_topk_i[64 * 16 * 16];
+
+extern "C" __global__ void dflash2_topk16_part_k(const float* __restrict__ logits,
+                                                 int* __restrict__ part_ids,
+                                                 float* __restrict__ part_vals,
+                                                 int vocab_padded, int vocab_unpadded, int n_chunks) {
+    int row = blockIdx.x;
+    int ch = blockIdx.y;
+    int tid = threadIdx.x;
+    int chunk_sz = (vocab_unpadded + n_chunks - 1) / n_chunks;
+    int i_beg = ch * chunk_sz;
+    int i_end = min(vocab_unpadded, i_beg + chunk_sz);
+    const float* row_p = logits + (size_t)row * vocab_padded;
+
+    float best_v[16];
+    int best_i[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        best_v[k] = -1e30f;
+        best_i[k] = 0;
+    }
+    for (int i = i_beg + tid; i < i_end; i += 256) {
+        float v = row_p[i];
+        if (v > best_v[15]) {
+            int pos = 15;
+            while (pos > 0 && v > best_v[pos - 1]) {
+                best_v[pos] = best_v[pos - 1];
+                best_i[pos] = best_i[pos - 1];
+                --pos;
+            }
+            best_v[pos] = v;
+            best_i[pos] = i;
+        }
+    }
+
+    __shared__ float sm_v[256 * 16];
+    __shared__ int sm_i[256 * 16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        sm_v[tid * 16 + k] = best_v[k];
+        sm_i[tid * 16 + k] = best_i[k];
+    }
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float mv[16];
+            int mi[16];
+            int a = tid * 16;
+            int b = (tid + stride) * 16;
+            int pa = 0, pb = 0;
+#pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                if (sm_v[a + pa] >= sm_v[b + pb]) {
+                    mv[k] = sm_v[a + pa];
+                    mi[k] = sm_i[a + pa];
+                    ++pa;
+                } else {
+                    mv[k] = sm_v[b + pb];
+                    mi[k] = sm_i[b + pb];
+                    ++pb;
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                sm_v[a + k] = mv[k];
+                sm_i[a + k] = mi[k];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid < 16) {
+        int out_off = (row * n_chunks + ch) * 16 + tid;
+        part_ids[out_off] = sm_i[tid];
+        part_vals[out_off] = sm_v[tid];
+    }
+}
+
+extern "C" __global__ void dflash2_topk16_merge_k(const int* __restrict__ part_ids,
+                                                  const float* __restrict__ part_vals,
+                                                  int* __restrict__ cand_ids,
+                                                  float* __restrict__ cand_vals,
+                                                  int n_chunks) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    __shared__ float sm_v[16 * 16];
+    __shared__ int sm_i[16 * 16];
+    if (tid < n_chunks * 16) {
+        int src_off = row * n_chunks * 16 + tid;
+        sm_v[tid] = part_vals[src_off];
+        sm_i[tid] = part_ids[src_off];
+    }
+    __syncthreads();
+    for (int stride = n_chunks >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float mv[16];
+            int mi[16];
+            int a = tid * 16;
+            int b = (tid + stride) * 16;
+            int pa = 0, pb = 0;
+#pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                if (sm_v[a + pa] >= sm_v[b + pb]) {
+                    mv[k] = sm_v[a + pa];
+                    mi[k] = sm_i[a + pa];
+                    ++pa;
+                } else {
+                    mv[k] = sm_v[b + pb];
+                    mi[k] = sm_i[b + pb];
+                    ++pb;
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                sm_v[a + k] = mv[k];
+                sm_i[a + k] = mi[k];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < 16) {
+        cand_ids[row * 16 + tid] = sm_i[tid];
+        cand_vals[row * 16 + tid] = sm_v[tid];
+    }
+}
+
+extern "C" __global__ void dflash2_conv_q8_k(const float* __restrict__ hidden,
+                                             const float* __restrict__ dynamic,
+                                             const float* __restrict__ base_kernel,
+                                             df2_q8_1_blk* __restrict__ out_q8,
+                                             int n_embd, int block_size,
+                                             int group_size, int side) {
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int nblk = n_embd >> 5;
+    int b = blockIdx.x * 4 + wid;
+    if (b >= nblk) return;
+    int bt = blockIdx.y;
+    int c = (b << 5) + lane;
+    int pos_in_blk = bt % block_size;
+    int n_groups = n_embd / group_size;
+    int g = c / group_size;
+    const float* dyn_t = dynamic + (size_t)bt * (size_t)(4 * n_groups) + (size_t)(side * 2 * n_groups);
+    const float* base_s = base_kernel + (size_t)(side * 2 * n_embd);
+    float w0 = base_s[c] + dyn_t[g];
+    float w1 = base_s[n_embd + c] + dyn_t[n_groups + g];
+    float v0 = hidden[(size_t)bt * n_embd + c];
+    float v1 = (pos_in_blk > 0) ? hidden[(size_t)(bt - 1) * n_embd + c] : 0.0f;
+    float v = w0 * v0 + w1 * v1;
+    float amax = __shfl(df2_warp_max32(fabsf(v)), 0, 32);
+    float d = amax / 127.0f;
+    float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    int qi = __float2int_rn(v * inv);
+    if (qi > 127) qi = 127;
+    if (qi < -127) qi = -127;
+    int32_t qsum = df2_warp_sum32_i(qi);
+    int q1 = __shfl_down(qi, 1, 32);
+    int q2 = __shfl_down(qi, 2, 32);
+    int q3 = __shfl_down(qi, 3, 32);
+    df2_q8_1_blk* dst = out_q8 + (size_t)bt * nblk + b;
+    if (lane == 0) {
+        dst->d = d;
+        dst->s = qsum;
+    }
+    if ((lane & 3) == 0) {
+        dst->q[lane >> 2] = df2_pack4_i8((int8_t)qi, (int8_t)q1, (int8_t)q2, (int8_t)q3);
+    }
+}
+
+extern "C" __global__ void dflash2_rmsnorm_q8_k(const float* __restrict__ x,
+                                                const float* __restrict__ w,
+                                                float* __restrict__ y_f32,
+                                                df2_q8_1_blk* __restrict__ y_q8,
+                                                int n_embd, float eps) {
+    int bt = blockIdx.x;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    const float* xr = x + (size_t)bt * n_embd;
+    float ss = 0.0f;
+    for (int i = tid; i < n_embd; i += 256) {
+        float v = xr[i];
+        ss += v * v;
+    }
+    ss = df2_warp_sum32(ss);
+    __shared__ float sm_ss[8];
+    if (lane == 0) sm_ss[wid] = ss;
+    __syncthreads();
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (int i = 0; i < 8; ++i) tot += sm_ss[i];
+        sm_ss[0] = rsqrtf(tot / (float)n_embd + eps);
+    }
+    __syncthreads();
+    float inv_rms = sm_ss[0];
+    int nblk = n_embd >> 5;
+    float* yr = y_f32 ? (y_f32 + (size_t)bt * n_embd) : nullptr;
+    for (int b = wid; b < nblk; b += 8) {
+        int c = (b << 5) + lane;
+        float v = xr[c] * inv_rms * w[c];
+        if (yr) yr[c] = v;
+        float amax = __shfl(df2_warp_max32(fabsf(v)), 0, 32);
+        float d = amax / 127.0f;
+        float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        int qi = __float2int_rn(v * inv);
+        if (qi > 127) qi = 127;
+        if (qi < -127) qi = -127;
+        int32_t qsum = df2_warp_sum32_i(qi);
+        int q1 = __shfl_down(qi, 1, 32);
+        int q2 = __shfl_down(qi, 2, 32);
+        int q3 = __shfl_down(qi, 3, 32);
+        df2_q8_1_blk* dst = y_q8 + (size_t)bt * nblk + b;
+        if (lane == 0) {
+            dst->d = d;
+            dst->s = qsum;
+        }
+        if ((lane & 3) == 0) {
+            dst->q[lane >> 2] = df2_pack4_i8((int8_t)qi, (int8_t)q1, (int8_t)q2, (int8_t)q3);
+        }
+    }
+}
+
 extern "C" int ink_dflash2_topk16(hipStream_t s, const float* logits, int* cand_ids, float* cand_vals, int vocab_padded, int vocab_unpadded, int n_rows) {
+    if (n_rows <= 64) {
+        int n_chunks = 16;
+        int* pids = nullptr;
+        float* pvals = nullptr;
+        (void)hipGetSymbolAddress((void**)&pids, HIP_SYMBOL(g_df2_topk_i));
+        (void)hipGetSymbolAddress((void**)&pvals, HIP_SYMBOL(g_df2_topk_v));
+        dflash2_topk16_part_k<<<dim3(n_rows, n_chunks), dim3(256), 0, s>>>(logits, pids, pvals, vocab_padded, vocab_unpadded, n_chunks);
+        dflash2_topk16_merge_k<<<dim3(n_rows), dim3(256), 0, s>>>(pids, pvals, cand_ids, cand_vals, n_chunks);
+        return 0;
+    }
     dflash2_topk16_k<<<dim3(n_rows), dim3(256), 0, s>>>(logits, cand_ids, cand_vals, vocab_padded, vocab_unpadded);
+    return 0;
+}
+
+extern "C" int ink_dflash2_conv_q8(hipStream_t s, const float* hidden, const float* dynamic, const float* base_kernel, void* out_q8, int n_embd, int block_size, int group_size, int side, int n_tokens) {
+    int nblk = n_embd >> 5;
+    dflash2_conv_q8_k<<<dim3((nblk + 3) / 4, n_tokens), dim3(128), 0, s>>>(hidden, dynamic, base_kernel, (df2_q8_1_blk*)out_q8, n_embd, block_size, group_size, side);
+    return 0;
+}
+
+extern "C" int ink_dflash2_rmsnorm_q8(hipStream_t s, const float* x, const float* w, float* y_f32, void* y_q8, int n_embd, int n_tokens, float eps) {
+    dflash2_rmsnorm_q8_k<<<dim3(n_tokens), dim3(256), 0, s>>>(x, w, y_f32, (df2_q8_1_blk*)y_q8, n_embd, eps);
     return 0;
 }
 

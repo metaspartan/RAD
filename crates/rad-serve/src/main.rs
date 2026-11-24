@@ -535,14 +535,24 @@ fn prefill_with_drafter(
                     common = 0;
                 }
                 let rem = &prompt_ids[common..];
+                let total_len = prompt_ids.len();
+                let inj_start = total_len.saturating_sub(d.swa_window);
                 let mut last = 0i32;
                 let mut i = 0usize;
                 while i < rem.len() {
                     let chunk = &rem[i..(i + 1024).min(rem.len())];
                     let pos0 = engine.seq_pos[seq];
                     last = engine.prefill_tokens_seq(seq, chunk)?;
-                    let (fptr, mb) = engine.batch_dspark_feats_ptr();
-                    d.inject_target_feats_batch_seq(seq, fptr, mb, 0, pos0, chunk.len())?;
+                    let chunk_start = common + i;
+                    let chunk_end = chunk_start + chunk.len();
+                    if chunk_end > inj_start {
+                        let s0 = inj_start.saturating_sub(chunk_start);
+                        let cnt = chunk.len() - s0;
+                        let (fptr, mb) = engine.batch_dspark_feats_ptr();
+                        d.inject_target_feats_batch_seq(seq, fptr, mb, s0, pos0 + s0 as i32, cnt)?;
+                    } else {
+                        d.advance_ctx_len_seq(seq, pos0 + chunk.len() as i32);
+                    }
                     i += chunk.len();
                 }
                 Ok((last, common))
@@ -552,6 +562,60 @@ fn prefill_with_drafter(
         }
         None => engine.prefill_seq_dspark(seq, prompt_ids, None),
     }
+}
+
+fn ngram_bucket_len(avail: usize) -> usize {
+    if avail >= 48 { 48 }
+    else if avail >= 32 { 32 }
+    else if avail >= 24 { 24 }
+    else if avail >= 16 { 16 }
+    else if avail >= 12 { 12 }
+    else if avail >= 8 { 8 }
+    else { 0 }
+}
+
+fn ngram_lookup_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<i32>> {
+    let n = history.len();
+    if n < 16 || max_k < 8 {
+        return None;
+    }
+    let min_follow = 8usize;
+    if n >= 3 {
+        let a = history[n - 3];
+        let b = history[n - 2];
+        let c = history[n - 1];
+        let mut i = n.saturating_sub(min_follow + 1);
+        while i >= 3 {
+            if history[i] == anchor && history[i - 1] == c && history[i - 2] == b && history[i - 3] == a {
+                let take = ngram_bucket_len((n - i).min(max_k));
+                if take >= min_follow {
+                    let mut out = Vec::with_capacity(take);
+                    out.push(anchor);
+                    out.extend_from_slice(&history[(i + 1)..(i + take)]);
+                    return Some(out);
+                }
+            }
+            i -= 1;
+        }
+    }
+    if n >= 2 {
+        let b = history[n - 2];
+        let c = history[n - 1];
+        let mut i = n.saturating_sub(min_follow + 1);
+        while i >= 2 {
+            if history[i] == anchor && history[i - 1] == c && history[i - 2] == b {
+                let take = ngram_bucket_len((n - i).min(max_k));
+                if take >= min_follow {
+                    let mut out = Vec::with_capacity(take);
+                    out.push(anchor);
+                    out.extend_from_slice(&history[(i + 1)..(i + take)]);
+                    return Some(out);
+                }
+            }
+            i -= 1;
+        }
+    }
+    None
 }
 
 fn sync_kv_metrics(engine: &InklingEngine, metrics: &metrics::Metrics) {
@@ -687,7 +751,22 @@ fn run_scheduler(
                 Ok(mut last_tok) => {
                     if let Some(ref mut d) = drafter {
                         if pf.seq < d.max_seqs() {
-                            let _ = d.inject_batch_seq(pf.seq, &engine, 0, pos0, chunk.len());
+                            match d {
+                                Drafter::DFlash2(df) => {
+                                    let inj_start = pf.job.prompt_ids.len().saturating_sub(df.swa_window);
+                                    if end > inj_start {
+                                        let s0 = inj_start.saturating_sub(pf.offset);
+                                        let cnt = chunk.len() - s0;
+                                        let (fptr, mb) = engine.batch_dspark_feats_ptr();
+                                        let _ = df.inject_target_feats_batch_seq(pf.seq, fptr, mb, s0, pos0 + s0 as i32, cnt);
+                                    } else {
+                                        df.advance_ctx_len_seq(pf.seq, pos0 + chunk.len() as i32);
+                                    }
+                                }
+                                Drafter::Dspark(_) => {
+                                    let _ = d.inject_batch_seq(pf.seq, &engine, 0, pos0, chunk.len());
+                                }
+                            }
                         }
                     }
                     let _ = engine.paged_kv.ensure_tokens(pf.seq, engine.seq_pos[pf.seq] as usize, &engine.seq_tokens[pf.seq]);
@@ -767,21 +846,24 @@ fn run_scheduler(
                     let pos0 = engine.seq_pos[seq];
                     let t_step = Instant::now();
                     let res = (|| -> anyhow::Result<Vec<i32>> {
-                        let draft = if seq == 0 {
+                        let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[seq], slot.next_tok, 48) {
+                            ng
+                        } else if seq == 0 {
                             d.draft(slot.next_tok, &engine, spec_k)?
                         } else {
                             d.draft_seq(seq, slot.next_tok, &engine, spec_k)?
                         };
+                        let dk = draft.len();
                         let verified = engine.verify_batch_seq(seq, &draft)?;
                         let mut n_acc = 1usize;
-                        for j in 0..(spec_k - 1) {
+                        for j in 0..(dk - 1) {
                             if verified[j] == draft[j + 1] {
                                 n_acc += 1;
                             } else {
                                 break;
                             }
                         }
-                        engine.rewind_verify_seq_to(seq, n_acc, spec_k)?;
+                        engine.rewind_verify_seq_to(seq, n_acc, dk)?;
                         d.inject_batch_seq_async(seq, &engine, 0, pos0, n_acc)?;
                         for j in 0..n_acc {
                             engine.seq_tokens[seq].push(draft[j]);

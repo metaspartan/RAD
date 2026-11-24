@@ -250,6 +250,8 @@ struct SlotState {
     max_ctx: usize,
     k_cache: DevBuf,
     v_cache: DevBuf,
+    k_scale: Option<DevBuf>,
+    v_scale: Option<DevBuf>,
     k_hist: DevBuf,
     v_hist: DevBuf,
     attn_post_hist: DevBuf,
@@ -475,18 +477,32 @@ impl InklingEngine {
             };
             let is_swa = cfg.is_swa[ip];
             let slot_ctx = if is_swa { (cfg.swa_window + 16).min(max_ctx) } else { max_ctx };
-            let kv_bytes = max_seqs * cfg.n_head_kv * slot_ctx * cfg.dh * 2;
+            let kv_bytes = if is_swa {
+                max_seqs * cfg.n_head_kv * slot_ctx * cfg.dh * 2
+            } else {
+                max_seqs * cfg.n_head_kv * slot_ctx * cfg.dh
+            };
             let mut k_cache = DevBuf::new(kv_bytes).map_err(he)?;
             let mut v_cache = DevBuf::new(kv_bytes).map_err(he)?;
+            let (k_scale, v_scale) = if is_swa {
+                (None, None)
+            } else {
+                let sc_bytes = max_seqs * cfg.n_head_kv * slot_ctx * 2;
+                let mut ks = DevBuf::new(sc_bytes).map_err(he)?;
+                let mut vs = DevBuf::new(sc_bytes).map_err(he)?;
+                ks.zero().map_err(he)?;
+                vs.zero().map_err(he)?;
+                (Some(ks), Some(vs))
+            };
             let mut k_hist = DevBuf::new(max_seqs * kv_dim * 3 * 4).map_err(he)?;
             let mut v_hist = DevBuf::new(max_seqs * kv_dim * 3 * 4).map_err(he)?;
             let mut attn_post_hist = DevBuf::new(max_seqs * cfg.n_embd * 3 * 4).map_err(he)?;
             let mut ffn_post_hist = DevBuf::new(max_seqs * cfg.n_embd * 3 * 4).map_err(he)?;
-            let snap_users = max_seqs.min(8);
-            let k_snap = DevBuf::new(snap_users * 8 * kv_dim * 3 * 4).map_err(he)?;
-            let v_snap = DevBuf::new(snap_users * 8 * kv_dim * 3 * 4).map_err(he)?;
-            let attn_post_snap = DevBuf::new(snap_users * 8 * cfg.n_embd * 3 * 4).map_err(he)?;
-            let ffn_post_snap = DevBuf::new(snap_users * 8 * cfg.n_embd * 3 * 4).map_err(he)?;
+            let snap_cap = (max_seqs.min(8) * 8).max(48);
+            let k_snap = DevBuf::new(snap_cap * kv_dim * 3 * 4).map_err(he)?;
+            let v_snap = DevBuf::new(snap_cap * kv_dim * 3 * 4).map_err(he)?;
+            let attn_post_snap = DevBuf::new(snap_cap * cfg.n_embd * 3 * 4).map_err(he)?;
+            let ffn_post_snap = DevBuf::new(snap_cap * cfg.n_embd * 3 * 4).map_err(he)?;
             k_cache.zero().map_err(he)?;
             v_cache.zero().map_err(he)?;
             k_hist.zero().map_err(he)?;
@@ -498,6 +514,8 @@ impl InklingEngine {
                 max_ctx: slot_ctx,
                 k_cache,
                 v_cache,
+                k_scale,
+                v_scale,
                 k_hist,
                 v_hist,
                 attn_post_hist,
@@ -650,6 +668,15 @@ impl InklingEngine {
         }
         unsafe { rad_hip::hipStreamSynchronize(std::ptr::null_mut()) };
         self.pos = 0;
+        for p in &mut self.seq_pos {
+            *p = 0;
+        }
+        for t in &mut self.seq_tokens {
+            t.clear();
+        }
+        for s in 0..self.max_seqs {
+            self.paged_kv.free_seq(s);
+        }
         Ok(())
     }
 
@@ -792,30 +819,58 @@ impl InklingEngine {
         }
 
         let d_pos = self.sc.d_pos.ptr as *const i32;
-        ops::ink_kv_conv_qkvr_store(
-            s, q, k_raw, v_raw, r,
-            l.attn_k_conv.ptr as *const f32,
-            l.attn_v_conv.ptr as *const f32,
-            if l.is_swa { std::ptr::null() } else { k_dyn },
-            if l.is_swa { std::ptr::null() } else { v_dyn },
-            sl.k_hist.ptr as *mut f32,
-            sl.v_hist.ptr as *mut f32,
-            l.attn_q_clip.ptr as *const f32,
-            l.attn_rel_clip.ptr as *const f32,
-            sl.k_cache.ptr as *mut u16,
-            sl.v_cache.ptr as *mut u16,
-            d_pos,
-            if sl.is_swa { 1 } else { 0 },
-            self.cfg.n_head as i32,
-            self.cfg.n_head_kv as i32,
-            self.cfg.dh as i32,
-            self.cfg.d_rel as i32,
-            sl.max_ctx as i32,
-            self.cfg.qk_clip,
-            self.cfg.rel_clip,
-            self.cfg.log_floor,
-            self.cfg.log_alpha,
-        );
+        if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
+            ops::ink_kv_conv_qkvr_store_b1_q8kv(
+                s, q, k_raw, v_raw, r,
+                l.attn_k_conv.ptr as *const f32,
+                l.attn_v_conv.ptr as *const f32,
+                if l.is_swa { std::ptr::null() } else { k_dyn },
+                if l.is_swa { std::ptr::null() } else { v_dyn },
+                sl.k_hist.ptr as *mut f32,
+                sl.v_hist.ptr as *mut f32,
+                l.attn_q_clip.ptr as *const f32,
+                l.attn_rel_clip.ptr as *const f32,
+                sl.k_cache.ptr as *mut i8,
+                sl.v_cache.ptr as *mut i8,
+                ks.ptr as *mut u16,
+                vs.ptr as *mut u16,
+                d_pos,
+                self.cfg.n_head as i32,
+                self.cfg.n_head_kv as i32,
+                self.cfg.dh as i32,
+                self.cfg.d_rel as i32,
+                sl.max_ctx as i32,
+                self.cfg.qk_clip,
+                self.cfg.rel_clip,
+                self.cfg.log_floor,
+                self.cfg.log_alpha,
+            );
+        } else {
+            ops::ink_kv_conv_qkvr_store(
+                s, q, k_raw, v_raw, r,
+                l.attn_k_conv.ptr as *const f32,
+                l.attn_v_conv.ptr as *const f32,
+                if l.is_swa { std::ptr::null() } else { k_dyn },
+                if l.is_swa { std::ptr::null() } else { v_dyn },
+                sl.k_hist.ptr as *mut f32,
+                sl.v_hist.ptr as *mut f32,
+                l.attn_q_clip.ptr as *const f32,
+                l.attn_rel_clip.ptr as *const f32,
+                sl.k_cache.ptr as *mut u16,
+                sl.v_cache.ptr as *mut u16,
+                d_pos,
+                if sl.is_swa { 1 } else { 0 },
+                self.cfg.n_head as i32,
+                self.cfg.n_head_kv as i32,
+                self.cfg.dh as i32,
+                self.cfg.d_rel as i32,
+                sl.max_ctx as i32,
+                self.cfg.qk_clip,
+                self.cfg.rel_clip,
+                self.cfg.log_floor,
+                self.cfg.log_alpha,
+            );
+        }
 
         let block_dst = if ip % self.cfg.attn_res_block == 0 {
             let dst = blocks.add((*n_blocks) * self.cfg.n_embd);
@@ -826,22 +881,41 @@ impl InklingEngine {
         };
 
         if l.wo.ty == WeightType::Q4_0 {
-            ops::ink_attn_decode_gated_q8(
-                s, q, r, sinks,
-                l.attn_rel_bias.ptr as *const f32,
-                sl.k_cache.ptr as *const u16,
-                sl.v_cache.ptr as *const u16,
-                gate_out,
-                d_pos, xq0,
-                self.cfg.n_head as i32,
-                self.cfg.n_head_kv as i32,
-                self.cfg.dh as i32,
-                self.cfg.d_rel as i32,
-                self.cfg.rel_extent as i32,
-                self.cfg.swa_window as i32,
-                if sl.is_swa { 1 } else { 0 },
-                sl.max_ctx as i32,
-            );
+            if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
+                ops::ink_attn_decode_gated_q8_q8kv(
+                    s, q, r, sinks,
+                    l.attn_rel_bias.ptr as *const f32,
+                    sl.k_cache.ptr as *const i8,
+                    sl.v_cache.ptr as *const i8,
+                    ks.ptr as *const u16,
+                    vs.ptr as *const u16,
+                    gate_out,
+                    d_pos, xq0,
+                    self.cfg.n_head as i32,
+                    self.cfg.n_head_kv as i32,
+                    self.cfg.dh as i32,
+                    self.cfg.d_rel as i32,
+                    self.cfg.rel_extent as i32,
+                    sl.max_ctx as i32,
+                );
+            } else {
+                ops::ink_attn_decode_gated_q8(
+                    s, q, r, sinks,
+                    l.attn_rel_bias.ptr as *const f32,
+                    sl.k_cache.ptr as *const u16,
+                    sl.v_cache.ptr as *const u16,
+                    gate_out,
+                    d_pos, xq0,
+                    self.cfg.n_head as i32,
+                    self.cfg.n_head_kv as i32,
+                    self.cfg.dh as i32,
+                    self.cfg.d_rel as i32,
+                    self.cfg.rel_extent as i32,
+                    self.cfg.swa_window as i32,
+                    if sl.is_swa { 1 } else { 0 },
+                    sl.max_ctx as i32,
+                );
+            }
             ops::ink_wo_conv_res_q4_0_sudot4(
                 s,
                 l.wo.buf.ptr as *const u8,
@@ -1267,53 +1341,117 @@ impl InklingEngine {
         }
 
         let d_pos0 = self.bsc.d_pos0.ptr as *const i32;
-        let k_snap = if b <= 8 { sl.k_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
-        let v_snap = if b <= 8 { sl.v_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
-        ops::ink_kv_conv_qkvr_store_batch_snap(
-            s, q, k_raw, v_raw, r,
-            l.attn_k_conv.ptr as *const f32,
-            l.attn_v_conv.ptr as *const f32,
-            if l.is_swa { std::ptr::null() } else { k_dyn },
-            if l.is_swa { std::ptr::null() } else { v_dyn },
-            sl.k_hist.ptr as *mut f32,
-            sl.v_hist.ptr as *mut f32,
-            k_snap,
-            v_snap,
-            l.attn_q_clip.ptr as *const f32,
-            l.attn_rel_clip.ptr as *const f32,
-            sl.k_cache.ptr as *mut u16,
-            sl.v_cache.ptr as *mut u16,
-            d_pos0, bi,
-            if sl.is_swa { 1 } else { 0 },
-            self.cfg.n_head as i32,
-            self.cfg.n_head_kv as i32,
-            self.cfg.dh as i32,
-            self.cfg.d_rel as i32,
-            sl.max_ctx as i32,
-            self.cfg.qk_clip,
-            self.cfg.rel_clip,
-            self.cfg.log_floor,
-            self.cfg.log_alpha,
-        );
+        let k_snap = if b <= 48 { sl.k_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+        let v_snap = if b <= 48 { sl.v_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+        if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
+            ops::ink_kv_conv_qkvr_store_batch_snap_q8kv(
+                s, q, k_raw, v_raw, r,
+                l.attn_k_conv.ptr as *const f32,
+                l.attn_v_conv.ptr as *const f32,
+                if l.is_swa { std::ptr::null() } else { k_dyn },
+                if l.is_swa { std::ptr::null() } else { v_dyn },
+                sl.k_hist.ptr as *mut f32,
+                sl.v_hist.ptr as *mut f32,
+                k_snap,
+                v_snap,
+                l.attn_q_clip.ptr as *const f32,
+                l.attn_rel_clip.ptr as *const f32,
+                sl.k_cache.ptr as *mut i8,
+                sl.v_cache.ptr as *mut i8,
+                ks.ptr as *mut u16,
+                vs.ptr as *mut u16,
+                d_pos0, bi,
+                self.cfg.n_head as i32,
+                self.cfg.n_head_kv as i32,
+                self.cfg.dh as i32,
+                self.cfg.d_rel as i32,
+                sl.max_ctx as i32,
+                self.cfg.qk_clip,
+                self.cfg.rel_clip,
+                self.cfg.log_floor,
+                self.cfg.log_alpha,
+            );
+        } else {
+            ops::ink_kv_conv_qkvr_store_batch_snap(
+                s, q, k_raw, v_raw, r,
+                l.attn_k_conv.ptr as *const f32,
+                l.attn_v_conv.ptr as *const f32,
+                if l.is_swa { std::ptr::null() } else { k_dyn },
+                if l.is_swa { std::ptr::null() } else { v_dyn },
+                sl.k_hist.ptr as *mut f32,
+                sl.v_hist.ptr as *mut f32,
+                k_snap,
+                v_snap,
+                l.attn_q_clip.ptr as *const f32,
+                l.attn_rel_clip.ptr as *const f32,
+                sl.k_cache.ptr as *mut u16,
+                sl.v_cache.ptr as *mut u16,
+                d_pos0, bi,
+                if sl.is_swa { 1 } else { 0 },
+                self.cfg.n_head as i32,
+                self.cfg.n_head_kv as i32,
+                self.cfg.dh as i32,
+                self.cfg.d_rel as i32,
+                sl.max_ctx as i32,
+                self.cfg.qk_clip,
+                self.cfg.rel_clip,
+                self.cfg.log_floor,
+                self.cfg.log_alpha,
+            );
+        }
 
         let attn_out = self.bsc.attn_out.ptr as *mut f32;
-        if b >= 16 {
-            ops::ink_attn_batch_gated_flash(
+        if b > 48 {
+            if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
+                ops::ink_attn_batch_gated_flash_q8kv(
+                    s, q, r, sinks,
+                    l.attn_rel_bias.ptr as *const f32,
+                    sl.k_cache.ptr as *const i8,
+                    sl.v_cache.ptr as *const i8,
+                    ks.ptr as *const u16,
+                    vs.ptr as *const u16,
+                    gate_out, d_pos0, attn_out,
+                    self.cfg.n_head as i32,
+                    self.cfg.n_head_kv as i32,
+                    self.cfg.dh as i32,
+                    self.cfg.d_rel as i32,
+                    self.cfg.rel_extent as i32,
+                    sl.max_ctx as i32, bi,
+                );
+            } else {
+                ops::ink_attn_batch_gated_flash(
+                    s, q, r, sinks,
+                    l.attn_rel_bias.ptr as *const f32,
+                    sl.k_cache.ptr as *const u16,
+                    sl.v_cache.ptr as *const u16,
+                    gate_out, d_pos0, attn_out,
+                    self.cfg.n_head as i32,
+                    self.cfg.n_head_kv as i32,
+                    self.cfg.dh as i32,
+                    self.cfg.d_rel as i32,
+                    self.cfg.rel_extent as i32,
+                    self.cfg.swa_window as i32,
+                    if sl.is_swa { 1 } else { 0 },
+                    sl.max_ctx as i32, bi,
+                );
+            }
+            ops::ink_quantize_q8_1(s, attn_out, self.bsc.xq.ptr, q_dim, bi);
+        } else if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
+            ops::ink_attn_b8_flash_q8_q8kv(
                 s, q, r, sinks,
                 l.attn_rel_bias.ptr as *const f32,
-                sl.k_cache.ptr as *const u16,
-                sl.v_cache.ptr as *const u16,
-                gate_out, d_pos0, attn_out,
+                sl.k_cache.ptr as *const i8,
+                sl.v_cache.ptr as *const i8,
+                ks.ptr as *const u16,
+                vs.ptr as *const u16,
+                gate_out, d_pos0, self.bsc.xq.ptr,
                 self.cfg.n_head as i32,
                 self.cfg.n_head_kv as i32,
                 self.cfg.dh as i32,
                 self.cfg.d_rel as i32,
                 self.cfg.rel_extent as i32,
-                self.cfg.swa_window as i32,
-                if sl.is_swa { 1 } else { 0 },
                 sl.max_ctx as i32, bi,
             );
-            ops::ink_quantize_q8_1(s, attn_out, self.bsc.xq.ptr, q_dim, bi);
         } else {
             ops::ink_attn_batch_gated_q8(
                 s, q, r, sinks,
@@ -1340,7 +1478,7 @@ impl InklingEngine {
         } else {
             std::ptr::null_mut()
         };
-        let ap_snap = if b <= 8 { sl.attn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+        let ap_snap = if b <= 48 { sl.attn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
         if l.wo.ty == WeightType::Q4_0 && (b == 4 || b == 6 || b == 8) {
             ops::ink_wo_conv_res_q4_batch_snap(s, l.wo.buf.ptr as *const u8, self.bsc.xq.ptr, l.attn_post_conv.ptr as *const f32, sl.attn_post_hist.ptr as *mut f32, ap_snap, cur, block_dst, ffn_inp, e, q_dim, bi);
         } else {
@@ -1463,6 +1601,14 @@ impl InklingEngine {
                         self.bsc.wt_sorted.ptr as *const f32, self.bsc.moe_dn_slots.ptr as *mut f32, moe_raw,
                         e, self.cfg.n_ff_exp as i32, self.cfg.n_expert_used as i32, bi,
                     );
+                } else if b <= 32 {
+                    ops::ink_moe_dn_q4_0_sudot4_nozero(
+                        s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
+                        self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
+                        self.bsc.tok_sorted.ptr as *const i32, self.bsc.slot_sorted.ptr as *const i32,
+                        self.bsc.wt_sorted.ptr as *const f32, moe_raw,
+                        e, self.cfg.n_ff_exp as i32, self.cfg.n_expert_used as i32, bi,
+                    );
                 } else {
                     ops::ink_moe_dn_q4_0_sudot4(
                         s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
@@ -1478,8 +1624,12 @@ impl InklingEngine {
             }
             _ => unreachable!(),
         };
-        let fp_snap = if b <= 8 { sl.ffn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
-        ops::ink_shortconv_res_batch_snap(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, fp_snap, ffn_inp, std::ptr::null_mut(), cur, e, bi);
+        let fp_snap = if b <= 48 { sl.ffn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+        if b <= 32 && l.ffn_down_exps.ty == WeightType::Q4_0 {
+            ops::ink_shortconv_res_batch_snap_clear(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, fp_snap, ffn_inp, std::ptr::null_mut(), cur, e, bi);
+        } else {
+            ops::ink_shortconv_res_batch_snap(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, fp_snap, ffn_inp, std::ptr::null_mut(), cur, e, bi);
+        }
     }
 
     pub unsafe fn enqueue_forward_batch(&self, s: HipStream, b: usize, all_logits: bool) {
@@ -1487,6 +1637,9 @@ impl InklingEngine {
         let mb = MAX_BATCH as i32;
         let bi = b as i32;
         let be = (b * self.cfg.n_embd) as i32;
+        if b <= 32 {
+            ops::ink_zero_f32(s, self.bsc.moe_raw.ptr as *mut f32, be);
+        }
         let cur = self.bsc.cur.ptr as *mut f32;
         let blocks = self.bsc.blocks.ptr as *mut f32;
         let prelude = self.bsc.prelude.ptr as *mut f32;
@@ -1567,31 +1720,25 @@ impl InklingEngine {
 
     pub fn capture_verify_graph(&mut self, b: usize) -> Result<()> {
         let g = unsafe { CapturedGraph::capture(|s| self.enqueue_forward_batch(s, b, true)) }.map_err(he)?;
-        self.verify_graph = Some((b, g));
+        self.seq_verify_graphs.insert((0usize, b), g);
         Ok(())
     }
 
     pub fn verify_batch(&mut self, tokens: &[i32]) -> Result<Vec<i32>> {
         let b = tokens.len();
-        assert!(b >= 1 && b <= 8);
+        assert!(b >= 1 && b <= 48);
         let pos0 = self.pos;
         let tok_bytes = unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, b * 4) };
-        if let Some((gb, ref g)) = self.verify_graph {
-            if gb == b {
-                self.bsc.d_toks.copy_from(tok_bytes, Some(g.stream)).map_err(he)?;
-                self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(g.stream)).map_err(he)?;
-                g.launch().map_err(he)?;
-                g.sync().map_err(he)?;
-            } else {
-                self.bsc.d_toks.copy_from(tok_bytes, Some(self.stream)).map_err(he)?;
-                self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
-                unsafe { self.enqueue_forward_batch(self.stream, b, true); rad_hip::hipStreamSynchronize(self.stream); }
-            }
-        } else {
-            self.bsc.d_toks.copy_from(tok_bytes, Some(self.stream)).map_err(he)?;
-            self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
-            unsafe { self.enqueue_forward_batch(self.stream, b, true); rad_hip::hipStreamSynchronize(self.stream); }
+        let key = (0usize, b);
+        if !self.seq_verify_graphs.contains_key(&key) {
+            let g = unsafe { CapturedGraph::capture(|s| self.enqueue_forward_batch(s, b, true)) }.map_err(he)?;
+            self.seq_verify_graphs.insert(key, g);
         }
+        let g = self.seq_verify_graphs.get(&key).unwrap();
+        self.bsc.d_toks.copy_from(tok_bytes, Some(g.stream)).map_err(he)?;
+        self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(g.stream)).map_err(he)?;
+        g.launch().map_err(he)?;
+        g.sync().map_err(he)?;
         let mut out_b = vec![0u8; b * 4];
         let rc = unsafe {
             rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
@@ -1675,7 +1822,7 @@ impl InklingEngine {
             return Ok(out);
         }
         let b = tokens.len();
-        assert!(b >= 1 && b <= 8);
+        assert!(b >= 1 && b <= 48);
         let pos0 = self.seq_pos[seq];
         let tok_bytes = unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, b * 4) };
         let key = (seq, b);
@@ -1721,11 +1868,7 @@ impl InklingEngine {
                 self.rewind_graphs.insert(key, g);
             }
             let g = self.rewind_graphs.get(&key).unwrap();
-            let target_s = if seq == 0 {
-                self.verify_graph.as_ref().map(|(_, vg)| vg.stream).unwrap_or(self.stream)
-            } else {
-                self.seq_verify_graphs.get(&(seq, b)).map(|vg| vg.stream).unwrap_or(self.stream)
-            };
+            let target_s = self.seq_verify_graphs.get(&(seq, b)).map(|vg| vg.stream).unwrap_or(self.stream);
             g.launch_on(target_s).map_err(he)?;
             self.seq_pos[seq] -= (b - n_acc) as i32;
             if seq == 0 {
@@ -2128,61 +2271,151 @@ impl InklingEngine {
         if let Some(seq) = seq_opt {
             let seq_kv_off = seq * self.cfg.n_head_kv * sl.max_ctx * self.cfg.dh;
             let seq_kh_off = seq * (kv_dim as usize) * 3;
+            let seq_sc_off = seq * self.cfg.n_head_kv * sl.max_ctx;
             let d_pos0 = self.bsc.d_pos0.ptr as *const i32;
-            if multi_k > 1 {
-                ops::ink_kv_conv_qkvr_store_batch_snap(
+            if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
+                let k_snap_p = if multi_k > 1 { sl.k_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+                let v_snap_p = if multi_k > 1 { sl.v_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+                ops::ink_kv_conv_qkvr_store_batch_snap_q8kv(
                     s, q, k_raw, v_raw, r,
                     l.attn_k_conv.ptr as *const f32, l.attn_v_conv.ptr as *const f32,
                     if l.is_swa { std::ptr::null() } else { k_dyn },
                     if l.is_swa { std::ptr::null() } else { v_dyn },
                     (sl.k_hist.ptr as *mut f32).add(seq_kh_off),
                     (sl.v_hist.ptr as *mut f32).add(seq_kh_off),
+                    k_snap_p, v_snap_p,
+                    l.attn_q_clip.ptr as *const f32, l.attn_rel_clip.ptr as *const f32,
+                    (sl.k_cache.ptr as *mut i8).add(seq_kv_off),
+                    (sl.v_cache.ptr as *mut i8).add(seq_kv_off),
+                    (ks.ptr as *mut u16).add(seq_sc_off),
+                    (vs.ptr as *mut u16).add(seq_sc_off),
+                    d_pos0, bi,
+                    self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                    sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
+                );
+                if b > 48 {
+                    ops::ink_attn_batch_gated_flash_q8kv(
+                        s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
+                        (sl.k_cache.ptr as *const i8).add(seq_kv_off),
+                        (sl.v_cache.ptr as *const i8).add(seq_kv_off),
+                        (ks.ptr as *const u16).add(seq_sc_off),
+                        (vs.ptr as *const u16).add(seq_sc_off),
+                        gate_out, d_pos0, attn_out,
+                        self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                        self.cfg.rel_extent as i32, sl.max_ctx as i32, bi,
+                    );
+                } else {
+                    ops::ink_attn_b8_flash_q8_q8kv(
+                        s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
+                        (sl.k_cache.ptr as *const i8).add(seq_kv_off),
+                        (sl.v_cache.ptr as *const i8).add(seq_kv_off),
+                        (ks.ptr as *const u16).add(seq_sc_off),
+                        (vs.ptr as *const u16).add(seq_sc_off),
+                        gate_out, d_pos0, self.bsc.xq.ptr,
+                        self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                        self.cfg.rel_extent as i32, sl.max_ctx as i32, bi,
+                    );
+                    attn_already_q8 = true;
+                }
+            } else {
+                if multi_k > 1 {
+                    ops::ink_kv_conv_qkvr_store_batch_snap(
+                        s, q, k_raw, v_raw, r,
+                        l.attn_k_conv.ptr as *const f32, l.attn_v_conv.ptr as *const f32,
+                        if l.is_swa { std::ptr::null() } else { k_dyn },
+                        if l.is_swa { std::ptr::null() } else { v_dyn },
+                        (sl.k_hist.ptr as *mut f32).add(seq_kh_off),
+                        (sl.v_hist.ptr as *mut f32).add(seq_kh_off),
+                        sl.k_snap.ptr as *mut f32, sl.v_snap.ptr as *mut f32,
+                        l.attn_q_clip.ptr as *const f32, l.attn_rel_clip.ptr as *const f32,
+                        (sl.k_cache.ptr as *mut u16).add(seq_kv_off),
+                        (sl.v_cache.ptr as *mut u16).add(seq_kv_off),
+                        d_pos0, bi, if sl.is_swa { 1 } else { 0 },
+                        self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                        sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
+                    );
+                } else {
+                    ops::ink_kv_conv_qkvr_store_batch(
+                        s, q, k_raw, v_raw, r,
+                        l.attn_k_conv.ptr as *const f32, l.attn_v_conv.ptr as *const f32,
+                        if l.is_swa { std::ptr::null() } else { k_dyn },
+                        if l.is_swa { std::ptr::null() } else { v_dyn },
+                        (sl.k_hist.ptr as *mut f32).add(seq_kh_off),
+                        (sl.v_hist.ptr as *mut f32).add(seq_kh_off),
+                        l.attn_q_clip.ptr as *const f32, l.attn_rel_clip.ptr as *const f32,
+                        (sl.k_cache.ptr as *mut u16).add(seq_kv_off),
+                        (sl.v_cache.ptr as *mut u16).add(seq_kv_off),
+                        d_pos0, bi, if sl.is_swa { 1 } else { 0 },
+                        self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                        sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
+                    );
+                }
+                if b > 48 {
+                    ops::ink_attn_batch_gated_flash(
+                        s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
+                        (sl.k_cache.ptr as *const u16).add(seq_kv_off),
+                        (sl.v_cache.ptr as *const u16).add(seq_kv_off),
+                        gate_out, d_pos0, attn_out,
+                        self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                        self.cfg.rel_extent as i32, self.cfg.swa_window as i32, if sl.is_swa { 1 } else { 0 },
+                        sl.max_ctx as i32, bi,
+                    );
+                } else {
+                    ops::ink_attn_batch_gated_q8(
+                        s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
+                        (sl.k_cache.ptr as *const u16).add(seq_kv_off),
+                        (sl.v_cache.ptr as *const u16).add(seq_kv_off),
+                        gate_out, d_pos0, self.bsc.xq.ptr,
+                        self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                        self.cfg.rel_extent as i32, self.cfg.swa_window as i32, if sl.is_swa { 1 } else { 0 },
+                        sl.max_ctx as i32, bi,
+                    );
+                    attn_already_q8 = true;
+                }
+            }
+        } else if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
+            if multi_k > 1 {
+                let n_users = (b / multi_k) as i32;
+                ops::ink_kv_conv_qkvr_store_multi_snap_q8kv(
+                    s, q, k_raw, v_raw, r,
+                    l.attn_k_conv.ptr as *const f32, l.attn_v_conv.ptr as *const f32,
+                    if l.is_swa { std::ptr::null() } else { k_dyn },
+                    if l.is_swa { std::ptr::null() } else { v_dyn },
+                    sl.k_hist.ptr as *mut f32, sl.v_hist.ptr as *mut f32,
                     sl.k_snap.ptr as *mut f32, sl.v_snap.ptr as *mut f32,
                     l.attn_q_clip.ptr as *const f32, l.attn_rel_clip.ptr as *const f32,
-                    (sl.k_cache.ptr as *mut u16).add(seq_kv_off),
-                    (sl.v_cache.ptr as *mut u16).add(seq_kv_off),
-                    d_pos0, bi, if sl.is_swa { 1 } else { 0 },
+                    sl.k_cache.ptr as *mut i8, sl.v_cache.ptr as *mut i8,
+                    ks.ptr as *mut u16, vs.ptr as *mut u16,
+                    self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
+                    n_users, multi_k as i32,
                     self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
                     sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
                 );
             } else {
-                ops::ink_kv_conv_qkvr_store_batch(
+                ops::ink_kv_conv_qkvr_store_multi_q8kv(
                     s, q, k_raw, v_raw, r,
                     l.attn_k_conv.ptr as *const f32, l.attn_v_conv.ptr as *const f32,
                     if l.is_swa { std::ptr::null() } else { k_dyn },
                     if l.is_swa { std::ptr::null() } else { v_dyn },
-                    (sl.k_hist.ptr as *mut f32).add(seq_kh_off),
-                    (sl.v_hist.ptr as *mut f32).add(seq_kh_off),
+                    sl.k_hist.ptr as *mut f32, sl.v_hist.ptr as *mut f32,
                     l.attn_q_clip.ptr as *const f32, l.attn_rel_clip.ptr as *const f32,
-                    (sl.k_cache.ptr as *mut u16).add(seq_kv_off),
-                    (sl.v_cache.ptr as *mut u16).add(seq_kv_off),
-                    d_pos0, bi, if sl.is_swa { 1 } else { 0 },
+                    sl.k_cache.ptr as *mut i8, sl.v_cache.ptr as *mut i8,
+                    ks.ptr as *mut u16, vs.ptr as *mut u16,
+                    self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
+                    bi,
                     self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
                     sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
                 );
             }
-            if b >= 16 {
-                ops::ink_attn_batch_gated_flash(
-                    s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
-                    (sl.k_cache.ptr as *const u16).add(seq_kv_off),
-                    (sl.v_cache.ptr as *const u16).add(seq_kv_off),
-                    gate_out, d_pos0, attn_out,
-                    self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
-                    self.cfg.rel_extent as i32, self.cfg.swa_window as i32, if sl.is_swa { 1 } else { 0 },
-                    sl.max_ctx as i32, bi,
-                );
-            } else {
-                ops::ink_attn_batch_gated_q8(
-                    s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
-                    (sl.k_cache.ptr as *const u16).add(seq_kv_off),
-                    (sl.v_cache.ptr as *const u16).add(seq_kv_off),
-                    gate_out, d_pos0, self.bsc.xq.ptr,
-                    self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
-                    self.cfg.rel_extent as i32, self.cfg.swa_window as i32, if sl.is_swa { 1 } else { 0 },
-                    sl.max_ctx as i32, bi,
-                );
-                attn_already_q8 = true;
-            }
+            ops::ink_attn_multi_gated_q8_q8kv(
+                s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
+                sl.k_cache.ptr as *const i8, sl.v_cache.ptr as *const i8,
+                ks.ptr as *const u16, vs.ptr as *const u16,
+                gate_out, self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
+                self.bsc.xq.ptr,
+                self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                self.cfg.rel_extent as i32, sl.max_ctx as i32, bi,
+            );
         } else {
             if multi_k > 1 {
                 let n_users = (b / multi_k) as i32;
@@ -2375,6 +2608,14 @@ impl InklingEngine {
                         self.bsc.wt_sorted.ptr as *const f32, self.bsc.moe_dn_slots.ptr as *mut f32, moe_raw,
                         e, self.cfg.n_ff_exp as i32, self.cfg.n_expert_used as i32, bi,
                     );
+                } else if seq_opt.is_some() && multi_k > 1 && b <= 32 {
+                    ops::ink_moe_dn_q4_0_sudot4_nozero(
+                        s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
+                        self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
+                        self.bsc.tok_sorted.ptr as *const i32, self.bsc.slot_sorted.ptr as *const i32,
+                        self.bsc.wt_sorted.ptr as *const f32, moe_raw,
+                        e, self.cfg.n_ff_exp as i32, self.cfg.n_expert_used as i32, bi,
+                    );
                 } else {
                     ops::ink_moe_dn_q4_0_sudot4(
                         s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
@@ -2393,7 +2634,11 @@ impl InklingEngine {
         if let Some(seq) = seq_opt {
             let seq_eh_off = seq * self.cfg.n_embd * 3;
             if multi_k > 1 {
-                ops::ink_shortconv_res_batch_snap(s, moe_raw, l.ffn_post_conv.ptr as *const f32, (sl.ffn_post_hist.ptr as *mut f32).add(seq_eh_off), sl.ffn_post_snap.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, e, bi);
+                if b <= 32 && l.ffn_down_exps.ty == WeightType::Q4_0 {
+                    ops::ink_shortconv_res_batch_snap_clear(s, moe_raw, l.ffn_post_conv.ptr as *const f32, (sl.ffn_post_hist.ptr as *mut f32).add(seq_eh_off), sl.ffn_post_snap.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, e, bi);
+                } else {
+                    ops::ink_shortconv_res_batch_snap(s, moe_raw, l.ffn_post_conv.ptr as *const f32, (sl.ffn_post_hist.ptr as *mut f32).add(seq_eh_off), sl.ffn_post_snap.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, e, bi);
+                }
             } else {
                 ops::ink_shortconv_res_batch(s, moe_raw, l.ffn_post_conv.ptr as *const f32, (sl.ffn_post_hist.ptr as *mut f32).add(seq_eh_off), ffn_inp, std::ptr::null_mut(), cur, e, bi);
             }
@@ -2485,6 +2730,9 @@ impl InklingEngine {
         let mb = MAX_BATCH as i32;
         let bi = b as i32;
         let be = (b * self.cfg.n_embd) as i32;
+        if seq_opt.is_some() && multi_k > 1 && b <= 32 {
+            ops::ink_zero_f32(s, self.bsc.moe_raw.ptr as *mut f32, be);
+        }
         let cur = self.bsc.cur.ptr as *mut f32;
         let blocks = self.bsc.blocks.ptr as *mut f32;
         let prelude = self.bsc.prelude.ptr as *mut f32;
@@ -2958,32 +3206,66 @@ impl InklingEngine {
                     let t2 = sync_t(s);
                     t_qkvrg += (t2 - t1).as_secs_f64() * 1000.0;
                     unsafe {
-                        let k_snap = if b <= 8 { sl.k_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
-                        let v_snap = if b <= 8 { sl.v_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
-                        ops::ink_kv_conv_qkvr_store_batch_snap(
-                            s, self.bsc.q.ptr as *mut f32, self.bsc.k_raw.ptr as *const f32, self.bsc.v_raw.ptr as *const f32, self.bsc.r.ptr as *mut f32,
-                            l.attn_k_conv.ptr as *const f32, l.attn_v_conv.ptr as *const f32,
-                            if l.is_swa { std::ptr::null() } else { self.bsc.k_dyn.ptr as *const f32 },
-                            if l.is_swa { std::ptr::null() } else { self.bsc.v_dyn.ptr as *const f32 },
-                            sl.k_hist.ptr as *mut f32, sl.v_hist.ptr as *mut f32, k_snap, v_snap,
-                            l.attn_q_clip.ptr as *const f32, l.attn_rel_clip.ptr as *const f32,
-                            sl.k_cache.ptr as *mut u16, sl.v_cache.ptr as *mut u16, self.bsc.d_pos0.ptr as *const i32,
-                            bi, if sl.is_swa { 1 } else { 0 }, self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
-                            sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
-                        );
+                        let k_snap = if b <= 16 { sl.k_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+                        let v_snap = if b <= 16 { sl.v_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+                        if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
+                            ops::ink_kv_conv_qkvr_store_batch_snap_q8kv(
+                                s, self.bsc.q.ptr as *mut f32, self.bsc.k_raw.ptr as *const f32, self.bsc.v_raw.ptr as *const f32, self.bsc.r.ptr as *mut f32,
+                                l.attn_k_conv.ptr as *const f32, l.attn_v_conv.ptr as *const f32,
+                                if l.is_swa { std::ptr::null() } else { self.bsc.k_dyn.ptr as *const f32 },
+                                if l.is_swa { std::ptr::null() } else { self.bsc.v_dyn.ptr as *const f32 },
+                                sl.k_hist.ptr as *mut f32, sl.v_hist.ptr as *mut f32, k_snap, v_snap,
+                                l.attn_q_clip.ptr as *const f32, l.attn_rel_clip.ptr as *const f32,
+                                sl.k_cache.ptr as *mut i8, sl.v_cache.ptr as *mut i8, ks.ptr as *mut u16, vs.ptr as *mut u16, self.bsc.d_pos0.ptr as *const i32,
+                                bi, self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                                sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
+                            );
+                        } else {
+                            ops::ink_kv_conv_qkvr_store_batch_snap(
+                                s, self.bsc.q.ptr as *mut f32, self.bsc.k_raw.ptr as *const f32, self.bsc.v_raw.ptr as *const f32, self.bsc.r.ptr as *mut f32,
+                                l.attn_k_conv.ptr as *const f32, l.attn_v_conv.ptr as *const f32,
+                                if l.is_swa { std::ptr::null() } else { self.bsc.k_dyn.ptr as *const f32 },
+                                if l.is_swa { std::ptr::null() } else { self.bsc.v_dyn.ptr as *const f32 },
+                                sl.k_hist.ptr as *mut f32, sl.v_hist.ptr as *mut f32, k_snap, v_snap,
+                                l.attn_q_clip.ptr as *const f32, l.attn_rel_clip.ptr as *const f32,
+                                sl.k_cache.ptr as *mut u16, sl.v_cache.ptr as *mut u16, self.bsc.d_pos0.ptr as *const i32,
+                                bi, if sl.is_swa { 1 } else { 0 }, self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                                sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
+                            );
+                        }
                     }
                     let t3 = sync_t(s);
                     t_kvconv += (t3 - t2).as_secs_f64() * 1000.0;
                     unsafe {
-                        if b >= 16 {
-                            ops::ink_attn_batch_gated_flash(
-                                s, self.bsc.q.ptr as *const f32, self.bsc.r.ptr as *const f32, self.bsc.sinks.ptr as *const f32,
-                                l.attn_rel_bias.ptr as *const f32, sl.k_cache.ptr as *const u16, sl.v_cache.ptr as *const u16,
-                                self.bsc.gate_out.ptr as *const f32, self.bsc.d_pos0.ptr as *const i32, self.bsc.attn_out.ptr as *mut f32,
-                                self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
-                                self.cfg.rel_extent as i32, self.cfg.swa_window as i32, if sl.is_swa { 1 } else { 0 }, sl.max_ctx as i32, bi,
-                            );
+                        if b > 48 {
+                            if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
+                                ops::ink_attn_batch_gated_flash_q8kv(
+                                    s, self.bsc.q.ptr as *const f32, self.bsc.r.ptr as *const f32, self.bsc.sinks.ptr as *const f32,
+                                    l.attn_rel_bias.ptr as *const f32, sl.k_cache.ptr as *const i8, sl.v_cache.ptr as *const i8,
+                                    ks.ptr as *const u16, vs.ptr as *const u16,
+                                    self.bsc.gate_out.ptr as *const f32, self.bsc.d_pos0.ptr as *const i32, self.bsc.attn_out.ptr as *mut f32,
+                                    self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                                    self.cfg.rel_extent as i32, sl.max_ctx as i32, bi,
+                                );
+                            } else {
+                                ops::ink_attn_batch_gated_flash(
+                                    s, self.bsc.q.ptr as *const f32, self.bsc.r.ptr as *const f32, self.bsc.sinks.ptr as *const f32,
+                                    l.attn_rel_bias.ptr as *const f32, sl.k_cache.ptr as *const u16, sl.v_cache.ptr as *const u16,
+                                    self.bsc.gate_out.ptr as *const f32, self.bsc.d_pos0.ptr as *const i32, self.bsc.attn_out.ptr as *mut f32,
+                                    self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                                    self.cfg.rel_extent as i32, self.cfg.swa_window as i32, if sl.is_swa { 1 } else { 0 }, sl.max_ctx as i32, bi,
+                                );
+                            }
                             ops::ink_quantize_q8_1(s, self.bsc.attn_out.ptr as *const f32, xq0, q_dim, bi);
+                        } else if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
+                            ops::ink_attn_b8_flash_q8_q8kv(
+                                s, self.bsc.q.ptr as *const f32, self.bsc.r.ptr as *const f32, self.bsc.sinks.ptr as *const f32,
+                                l.attn_rel_bias.ptr as *const f32, sl.k_cache.ptr as *const i8, sl.v_cache.ptr as *const i8,
+                                ks.ptr as *const u16, vs.ptr as *const u16,
+                                self.bsc.gate_out.ptr as *const f32, self.bsc.d_pos0.ptr as *const i32, xq0,
+                                self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                                self.cfg.rel_extent as i32, sl.max_ctx as i32, bi,
+                            );
                         } else {
                             ops::ink_attn_batch_gated_q8(
                                 s, self.bsc.q.ptr as *const f32, self.bsc.r.ptr as *const f32, self.bsc.sinks.ptr as *const f32,

@@ -23,6 +23,7 @@ pub struct PagedKvManager {
     free_blocks: Vec<i32>,
     ref_counts: Vec<u32>,
     seq_tables: Vec<Vec<i32>>,
+    seq_last_hash: Vec<u64>,
     prefix_index: HashMap<u64, i32>,
     block_hashes: Vec<Option<u64>>,
 }
@@ -39,6 +40,7 @@ impl PagedKvManager {
             free_blocks,
             ref_counts: vec![0; total_blocks],
             seq_tables: vec![Vec::new(); max_seqs],
+            seq_last_hash: vec![0; max_seqs],
             prefix_index: HashMap::new(),
             block_hashes: vec![None; total_blocks],
         }
@@ -58,6 +60,7 @@ impl PagedKvManager {
             return;
         }
         let blks = std::mem::take(&mut self.seq_tables[seq]);
+        self.seq_last_hash[seq] = 0;
         for b in blks {
             let bi = b as usize;
             if bi < self.ref_counts.len() && self.ref_counts[bi] > 0 {
@@ -79,14 +82,10 @@ impl PagedKvManager {
             return false;
         }
         let needed = (total_tokens + self.block_size - 1) / self.block_size;
-        let mut prev_h = 0u64;
-        for blk_idx in 0..self.seq_tables[seq].len() {
-            let start = blk_idx * self.block_size;
-            let end = (start + self.block_size).min(token_ids.len());
-            if end - start == self.block_size {
-                prev_h = Self::hash_block(prev_h, &token_ids[start..end]);
-            }
+        if self.seq_tables[seq].len() >= needed {
+            return true;
         }
+        let mut prev_h = self.seq_last_hash[seq];
         while self.seq_tables[seq].len() < needed {
             let blk_idx = self.seq_tables[seq].len();
             let start = blk_idx * self.block_size;
@@ -94,6 +93,7 @@ impl PagedKvManager {
             if end - start == self.block_size {
                 let h = Self::hash_block(prev_h, &token_ids[start..end]);
                 prev_h = h;
+                self.seq_last_hash[seq] = h;
                 if let Some(&existing) = self.prefix_index.get(&h) {
                     let ei = existing as usize;
                     if self.ref_counts[ei] > 0 {

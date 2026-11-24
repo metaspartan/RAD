@@ -1891,9 +1891,43 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
         for (int b = lane4; b < nblk; b += 4) {
             uint4 q4 = qrow[b];
             float dw = __half2float(drow[b]);
-            a0 += dot_q4_soa_q8_1_blk(q4, dw, act_q[((size_t)t0i * n_used + s0i) * nblk + b]);
-            a1 += dot_q4_soa_q8_1_blk(q4, dw, act_q[((size_t)t1i * n_used + s1i) * nblk + b]);
-            a2 += dot_q4_soa_q8_1_blk(q4, dw, act_q[((size_t)t2i * n_used + s2i) * nblk + b]);
+            int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu), w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+            int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu), w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+            int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+            int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
+            const q8_1_blk ab0 = act_q[((size_t)t0i * n_used + s0i) * nblk + b];
+            int32_t p0 = 0;
+            p0 = __builtin_amdgcn_sudot4(false, w0, true, ab0.q[0], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w1, true, ab0.q[1], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w2, true, ab0.q[2], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w3, true, ab0.q[3], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w4, true, ab0.q[4], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w5, true, ab0.q[5], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w6, true, ab0.q[6], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w7, true, ab0.q[7], p0, false);
+            a0 = fmaf(dw * ab0.d, (float)(p0 - 8 * ab0.s), a0);
+            const q8_1_blk ab1 = act_q[((size_t)t1i * n_used + s1i) * nblk + b];
+            int32_t p1 = 0;
+            p1 = __builtin_amdgcn_sudot4(false, w0, true, ab1.q[0], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w1, true, ab1.q[1], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w2, true, ab1.q[2], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w3, true, ab1.q[3], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w4, true, ab1.q[4], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w5, true, ab1.q[5], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w6, true, ab1.q[6], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w7, true, ab1.q[7], p1, false);
+            a1 = fmaf(dw * ab1.d, (float)(p1 - 8 * ab1.s), a1);
+            const q8_1_blk ab2 = act_q[((size_t)t2i * n_used + s2i) * nblk + b];
+            int32_t p2 = 0;
+            p2 = __builtin_amdgcn_sudot4(false, w0, true, ab2.q[0], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w1, true, ab2.q[1], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w2, true, ab2.q[2], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w3, true, ab2.q[3], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w4, true, ab2.q[4], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w5, true, ab2.q[5], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w6, true, ab2.q[6], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w7, true, ab2.q[7], p2, false);
+            a2 = fmaf(dw * ab2.d, (float)(p2 - 8 * ab2.s), a2);
         }
         float v0 = s_warp_sum4(a0) * wt_sorted[off0];
         float v1 = s_warp_sum4(a1) * wt_sorted[off0 + 1];
@@ -1914,10 +1948,54 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
         for (int b = lane4; b < nblk; b += 4) {
             uint4 q4 = qrow[b];
             float dw = __half2float(drow[b]);
-            a0 += dot_q4_soa_q8_1_blk(q4, dw, act_q[((size_t)t0i * n_used + s0i) * nblk + b]);
-            a1 += dot_q4_soa_q8_1_blk(q4, dw, act_q[((size_t)t1i * n_used + s1i) * nblk + b]);
-            a2 += dot_q4_soa_q8_1_blk(q4, dw, act_q[((size_t)t2i * n_used + s2i) * nblk + b]);
-            a3 += dot_q4_soa_q8_1_blk(q4, dw, act_q[((size_t)t3i * n_used + s3i) * nblk + b]);
+            int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu), w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+            int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu), w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+            int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+            int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
+            const q8_1_blk ab0 = act_q[((size_t)t0i * n_used + s0i) * nblk + b];
+            int32_t p0 = 0;
+            p0 = __builtin_amdgcn_sudot4(false, w0, true, ab0.q[0], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w1, true, ab0.q[1], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w2, true, ab0.q[2], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w3, true, ab0.q[3], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w4, true, ab0.q[4], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w5, true, ab0.q[5], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w6, true, ab0.q[6], p0, false);
+            p0 = __builtin_amdgcn_sudot4(false, w7, true, ab0.q[7], p0, false);
+            a0 = fmaf(dw * ab0.d, (float)(p0 - 8 * ab0.s), a0);
+            const q8_1_blk ab1 = act_q[((size_t)t1i * n_used + s1i) * nblk + b];
+            int32_t p1 = 0;
+            p1 = __builtin_amdgcn_sudot4(false, w0, true, ab1.q[0], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w1, true, ab1.q[1], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w2, true, ab1.q[2], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w3, true, ab1.q[3], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w4, true, ab1.q[4], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w5, true, ab1.q[5], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w6, true, ab1.q[6], p1, false);
+            p1 = __builtin_amdgcn_sudot4(false, w7, true, ab1.q[7], p1, false);
+            a1 = fmaf(dw * ab1.d, (float)(p1 - 8 * ab1.s), a1);
+            const q8_1_blk ab2 = act_q[((size_t)t2i * n_used + s2i) * nblk + b];
+            int32_t p2 = 0;
+            p2 = __builtin_amdgcn_sudot4(false, w0, true, ab2.q[0], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w1, true, ab2.q[1], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w2, true, ab2.q[2], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w3, true, ab2.q[3], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w4, true, ab2.q[4], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w5, true, ab2.q[5], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w6, true, ab2.q[6], p2, false);
+            p2 = __builtin_amdgcn_sudot4(false, w7, true, ab2.q[7], p2, false);
+            a2 = fmaf(dw * ab2.d, (float)(p2 - 8 * ab2.s), a2);
+            const q8_1_blk ab3 = act_q[((size_t)t3i * n_used + s3i) * nblk + b];
+            int32_t p3 = 0;
+            p3 = __builtin_amdgcn_sudot4(false, w0, true, ab3.q[0], p3, false);
+            p3 = __builtin_amdgcn_sudot4(false, w1, true, ab3.q[1], p3, false);
+            p3 = __builtin_amdgcn_sudot4(false, w2, true, ab3.q[2], p3, false);
+            p3 = __builtin_amdgcn_sudot4(false, w3, true, ab3.q[3], p3, false);
+            p3 = __builtin_amdgcn_sudot4(false, w4, true, ab3.q[4], p3, false);
+            p3 = __builtin_amdgcn_sudot4(false, w5, true, ab3.q[5], p3, false);
+            p3 = __builtin_amdgcn_sudot4(false, w6, true, ab3.q[6], p3, false);
+            p3 = __builtin_amdgcn_sudot4(false, w7, true, ab3.q[7], p3, false);
+            a3 = fmaf(dw * ab3.d, (float)(p3 - 8 * ab3.s), a3);
         }
         float v0 = s_warp_sum4(a0) * wt_sorted[off0];
         float v1 = s_warp_sum4(a1) * wt_sorted[off0 + 1];
@@ -1990,7 +2068,8 @@ __global__ void qkvrg_q4_nt_k(const uint8_t* __restrict__ wq,
                               int r_dim, int n_head, int dyn_dim) {
     int grp = threadIdx.x >> 3;
     int lane8 = threadIdx.x & 7;
-    int gid = blockIdx.x * 32 + grp;
+    int blk_gid0 = blockIdx.x * 32;
+    int gid = blk_gid0 + grp;
     int o1 = q_dim;
     int o2 = o1 + kv_dim;
     int o3 = o2 + kv_dim;
@@ -1999,6 +2078,77 @@ __global__ void qkvrg_q4_nt_k(const uint8_t* __restrict__ wq,
     int o6 = o5 + n_head;
     int o7 = o6 + dyn_dim;
     int o8 = o7 + dyn_dim;
+
+    const q8_1_blk* blk_xq = nullptr;
+    if (blk_gid0 + 31 < o5) {
+        if (blk_gid0 + 31 < o1 || (blk_gid0 >= o3 && blk_gid0 + 31 < o5)) blk_xq = Xq0;
+        else if (blk_gid0 >= o1 && blk_gid0 + 31 < o2) blk_xq = Xq1;
+        else if (blk_gid0 >= o2 && blk_gid0 + 31 < o3) blk_xq = Xq2;
+    }
+    __shared__ q8_1_blk sm_x[NT][8];
+
+    if (blk_xq) {
+        const uint8_t* W;
+        float* Y;
+        int row, n_out;
+        if (gid < o1) { W = wq; Y = Q; row = gid; n_out = q_dim; }
+        else if (gid < o2) { W = wk; Y = K; row = gid - o1; n_out = kv_dim; }
+        else if (gid < o3) { W = wv; Y = V; row = gid - o2; n_out = kv_dim; }
+        else if (gid < o4) { W = wr; Y = R; row = gid - o3; n_out = r_dim; }
+        else { W = wg; Y = G; row = gid - o4; n_out = q_dim; }
+
+        int nblk = k >> 5;
+        size_t rbytes = q4_soa_row_bytes(nblk);
+        const uint8_t* wrow = W + (size_t)row * rbytes;
+        const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
+        const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
+        float acc[NT];
+#pragma unroll
+        for (int m = 0; m < NT; ++m) acc[m] = 0.0f;
+        for (int b0 = 0; b0 < nblk; b0 += 8) {
+            if (threadIdx.x < NT * 8) {
+                int tm = threadIdx.x >> 3;
+                int tb = threadIdx.x & 7;
+                if (b0 + tb < nblk) sm_x[tm][tb] = blk_xq[(size_t)tm * nblk + b0 + tb];
+            }
+            __syncthreads();
+            int b = b0 + lane8;
+            if (b < nblk) {
+                uint4 q4 = qrow[b];
+                float dw = __half2float(drow[b]);
+                int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu);
+                int32_t w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+                int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu);
+                int32_t w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+                int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu);
+                int32_t w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+                int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu);
+                int32_t w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
+#pragma unroll
+                for (int m = 0; m < NT; ++m) {
+                    const q8_1_blk xb = sm_x[m][lane8];
+                    int32_t sumi = 0;
+                    sumi = __builtin_amdgcn_sudot4(false, w0, true, xb.q[0], sumi, false);
+                    sumi = __builtin_amdgcn_sudot4(false, w1, true, xb.q[1], sumi, false);
+                    sumi = __builtin_amdgcn_sudot4(false, w2, true, xb.q[2], sumi, false);
+                    sumi = __builtin_amdgcn_sudot4(false, w3, true, xb.q[3], sumi, false);
+                    sumi = __builtin_amdgcn_sudot4(false, w4, true, xb.q[4], sumi, false);
+                    sumi = __builtin_amdgcn_sudot4(false, w5, true, xb.q[5], sumi, false);
+                    sumi = __builtin_amdgcn_sudot4(false, w6, true, xb.q[6], sumi, false);
+                    sumi = __builtin_amdgcn_sudot4(false, w7, true, xb.q[7], sumi, false);
+                    acc[m] = fmaf(dw * xb.d, (float)(sumi - 8 * xb.s), acc[m]);
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int m = 0; m < NT; ++m) {
+            float v = s_warp_sum8(acc[m]);
+            if (lane8 == 0) Y[(size_t)m * n_out + row] = v;
+        }
+        return;
+    }
+
     if (gid >= o8) return;
 
     if (gid < o5) {
@@ -2104,41 +2254,53 @@ __global__ void wo_conv_res_q4_nt_snap_k(const uint8_t* __restrict__ W,
     int grp = threadIdx.x >> 3;
     int lane8 = threadIdx.x & 7;
     int row = blockIdx.x * 32 + grp;
-    if (row >= n_embd) return;
     int nblk = q_dim >> 5;
     size_t rbytes = q4_soa_row_bytes(nblk);
-    const uint8_t* wrow = W + (size_t)row * rbytes;
+    bool valid = (row < n_embd);
+    const uint8_t* wrow = valid ? (W + (size_t)row * rbytes) : W;
     const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
     const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
+    __shared__ q8_1_blk sm_x[NT][8];
     float acc[NT];
 #pragma unroll
     for (int m = 0; m < NT; ++m) acc[m] = 0.0f;
-    for (int b = lane8; b < nblk; b += 8) {
-        uint4 q4 = qrow[b];
-        float dw = __half2float(drow[b]);
-        int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu);
-        int32_t w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
-        int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu);
-        int32_t w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
-        int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu);
-        int32_t w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
-        int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu);
-        int32_t w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
-#pragma unroll
-        for (int m = 0; m < NT; ++m) {
-            const q8_1_blk xb = Xq[(size_t)m * nblk + b];
-            int32_t sumi = 0;
-            sumi = __builtin_amdgcn_sudot4(false, w0, true, xb.q[0], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w1, true, xb.q[1], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w2, true, xb.q[2], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w3, true, xb.q[3], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w4, true, xb.q[4], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w5, true, xb.q[5], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w6, true, xb.q[6], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w7, true, xb.q[7], sumi, false);
-            acc[m] = fmaf(dw * xb.d, (float)(sumi - 8 * xb.s), acc[m]);
+    for (int b0 = 0; b0 < nblk; b0 += 8) {
+        if (threadIdx.x < NT * 8) {
+            int tm = threadIdx.x >> 3;
+            int tb = threadIdx.x & 7;
+            if (b0 + tb < nblk) sm_x[tm][tb] = Xq[(size_t)tm * nblk + b0 + tb];
         }
+        __syncthreads();
+        int b = b0 + lane8;
+        if (valid && b < nblk) {
+            uint4 q4 = qrow[b];
+            float dw = __half2float(drow[b]);
+            int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu);
+            int32_t w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+            int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu);
+            int32_t w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+            int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu);
+            int32_t w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+            int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu);
+            int32_t w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
+#pragma unroll
+            for (int m = 0; m < NT; ++m) {
+                const q8_1_blk xb = sm_x[m][lane8];
+                int32_t sumi = 0;
+                sumi = __builtin_amdgcn_sudot4(false, w0, true, xb.q[0], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w1, true, xb.q[1], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w2, true, xb.q[2], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w3, true, xb.q[3], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w4, true, xb.q[4], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w5, true, xb.q[5], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w6, true, xb.q[6], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w7, true, xb.q[7], sumi, false);
+                acc[m] = fmaf(dw * xb.d, (float)(sumi - 8 * xb.s), acc[m]);
+            }
+        }
+        __syncthreads();
     }
+    if (!valid) return;
     float vals[NT];
 #pragma unroll
     for (int m = 0; m < NT; ++m) {
@@ -2247,6 +2409,12 @@ extern "C" int ink_moe_dn_q4_0_sudot4(hipStream_t s, const uint8_t* W, const voi
     return 0;
 }
 
+extern "C" int ink_moe_dn_q4_0_sudot4_nozero(hipStream_t s, const uint8_t* W, const void* act_q, const int* exp_counts, const int* exp_offsets, const int* tok_sorted, const int* slot_sorted, const float* wt_sorted, float* y_out, int n_embd, int n_ff, int n_used, int B) {
+    int gy = (B * n_used < 128) ? (B * n_used) : 128;
+    moe_dn_q4_0_sudot4_k<<<dim3((n_embd + 31) / 32, gy), dim3(128), 0, s>>>(W, (const q8_1_blk*)act_q, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, y_out, n_embd, n_ff, n_used);
+    return 0;
+}
+
 extern "C" __global__ void gather_dspark_feats_k(const float* __restrict__ bsc_feats,
                                                  float* __restrict__ dst,
                                                  int tok_idx, int max_batch, int n_embd) {
@@ -2278,7 +2446,7 @@ extern "C" __global__ void kv_conv_qkvr_store_batch_snap_k(float* __restrict__ Q
                                                            int dh, int d_rel, int max_ctx,
                                                            float qk_thresh, float rel_thresh,
                                                            float log_floor, float log_alpha) {
-    int h = blockIdx.x;
+    int bid = blockIdx.x;
     int lane = threadIdx.x;
     int pos0 = *d_pos0;
     int q_dim = n_head * dh;
@@ -2286,37 +2454,37 @@ extern "C" __global__ void kv_conv_qkvr_store_batch_snap_k(float* __restrict__ Q
     int r_dim = n_head * d_rel;
     int dyn_dim = n_head_kv * 4;
 
-    if (h < n_head) {
+    if (bid < n_head * B) {
+        int h = bid / B;
+        int t = bid % B;
         const float* qch = q_clip + (size_t)h * dh;
         const float* rch = rel_clip + (size_t)h * d_rel;
-        for (int t = 0; t < B; ++t) {
-            int pos = pos0 + t;
-            float tau = 1.0f;
-            if (!is_swa) {
-                float ratio = ((float)pos + 1.0f) / log_floor;
-                if (ratio < 1.0f) ratio = 1.0f;
-                tau = 1.0f + log_alpha * logf(ratio);
-            }
-            float* qh = Q + (size_t)t * q_dim + (size_t)h * dh;
-            float q0 = qh[lane] * qch[lane];
-            float q1 = qh[lane + 32] * qch[lane + 32];
-            float q2 = qh[lane + 64] * qch[lane + 64];
-            float q3 = qh[lane + 96] * qch[lane + 96];
-            float ss = s_warp_sum32(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-            float factor = fminf(1.0f, qk_thresh / (sqrtf(__shfl(ss, 0, 32)) + 1e-6f)) * tau;
-            qh[lane] = q0 * factor;
-            qh[lane + 32] = q1 * factor;
-            qh[lane + 64] = q2 * factor;
-            qh[lane + 96] = q3 * factor;
-
-            float* rh = R + (size_t)t * r_dim + (size_t)h * d_rel;
-            float rv = (lane < d_rel) ? (rh[lane] * rch[lane]) : 0.0f;
-            float rss = s_warp_sum32(rv * rv);
-            float rfactor = fminf(1.0f, rel_thresh / (sqrtf(__shfl(rss, 0, 32)) + 1e-6f)) * tau;
-            if (lane < d_rel) rh[lane] = rv * rfactor;
+        int pos = pos0 + t;
+        float tau = 1.0f;
+        if (!is_swa) {
+            float ratio = ((float)pos + 1.0f) / log_floor;
+            if (ratio < 1.0f) ratio = 1.0f;
+            tau = 1.0f + log_alpha * logf(ratio);
         }
-    } else if (h < n_head + n_head_kv) {
-        int kh_idx = h - n_head;
+        float* qh = Q + (size_t)t * q_dim + (size_t)h * dh;
+        float q0 = qh[lane] * qch[lane];
+        float q1 = qh[lane + 32] * qch[lane + 32];
+        float q2 = qh[lane + 64] * qch[lane + 64];
+        float q3 = qh[lane + 96] * qch[lane + 96];
+        float ss = s_warp_sum32(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+        float factor = fminf(1.0f, qk_thresh / (sqrtf(__shfl(ss, 0, 32)) + 1e-6f)) * tau;
+        qh[lane] = q0 * factor;
+        qh[lane + 32] = q1 * factor;
+        qh[lane + 64] = q2 * factor;
+        qh[lane + 96] = q3 * factor;
+
+        float* rh = R + (size_t)t * r_dim + (size_t)h * d_rel;
+        float rv = (lane < d_rel) ? (rh[lane] * rch[lane]) : 0.0f;
+        float rss = s_warp_sum32(rv * rv);
+        float rfactor = fminf(1.0f, rel_thresh / (sqrtf(__shfl(rss, 0, 32)) + 1e-6f)) * tau;
+        if (lane < d_rel) rh[lane] = rv * rfactor;
+    } else if (bid < n_head * B + n_head_kv) {
+        int kh_idx = bid - n_head * B;
         float sc = k_dyn ? rsqrtf(9.0f) : rsqrtf(5.0f);
         float kh0[4], kh1[4], kh2[4], vh0[4], vh1[4], vh2[4];
 #pragma unroll
@@ -2584,7 +2752,46 @@ extern "C" int ink_kv_conv_qkvr_store_batch_snap(hipStream_t s, float* Q, const 
         hist_update_3_k<<<dim3((kv_dim + 255) / 256), dim3(256), 0, s>>>(V_raw, v_hist, kv_dim, B);
         return 0;
     }
-    kv_conv_qkvr_store_batch_snap_k<<<dim3(n_head + n_head_kv), dim3(32), 0, s>>>(Q, K_raw, V_raw, R, k_conv_w, v_conv_w, k_dyn, v_dyn, k_hist, v_hist, k_snap, v_snap, q_clip, rel_clip, kc, vc, d_pos0, B, is_swa, n_head, n_head_kv, dh, d_rel, max_ctx, qk_thresh, rel_thresh, log_floor, log_alpha);
+    kv_conv_qkvr_store_batch_snap_k<<<dim3(n_head * B + n_head_kv), dim3(32), 0, s>>>(Q, K_raw, V_raw, R, k_conv_w, v_conv_w, k_dyn, v_dyn, k_hist, v_hist, k_snap, v_snap, q_clip, rel_clip, kc, vc, d_pos0, B, is_swa, n_head, n_head_kv, dh, d_rel, max_ctx, qk_thresh, rel_thresh, log_floor, log_alpha);
+    return 0;
+}
+
+extern "C" __global__ void shortconv_res_batch_snap_clear_k(float* __restrict__ raw,
+                                                            const float* __restrict__ conv_w,
+                                                            float* __restrict__ hist,
+                                                            float* __restrict__ snap,
+                                                            const float* __restrict__ add_src,
+                                                            float* __restrict__ block_dst,
+                                                            float* __restrict__ out,
+                                                            int n_embd, int B) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_embd) return;
+    float* hc = hist + (size_t)c * 3;
+    float h0 = hc[0], h1 = hc[1], h2 = hc[2];
+    const float* wc = conv_w + (size_t)c * 4;
+    float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+    for (int t = 0; t < B; ++t) {
+        size_t idx = (size_t)t * n_embd + c;
+        float x = raw[idx];
+        raw[idx] = 0.0f;
+        float conv_out = (x + w0 * h0 + w1 * h1 + w2 * h2 + w3 * x) * rsqrtf(5.0f);
+        h0 = h1; h1 = h2; h2 = x;
+        if (snap) {
+            float* sn = snap + ((size_t)t * n_embd + c) * 3;
+            sn[0] = h0; sn[1] = h1; sn[2] = h2;
+        }
+        if (block_dst) {
+            block_dst[idx] = add_src[idx];
+            out[idx] = conv_out;
+        } else {
+            out[idx] = add_src[idx] + conv_out;
+        }
+    }
+    hc[0] = h0; hc[1] = h1; hc[2] = h2;
+}
+
+extern "C" int ink_shortconv_res_batch_snap_clear(hipStream_t s, float* raw, const float* conv_w, float* hist, float* snap, const float* add_src, float* block_dst, float* out, int n_embd, int B) {
+    shortconv_res_batch_snap_clear_k<<<dim3((n_embd + 63) / 64), dim3(64), 0, s>>>(raw, conv_w, hist, snap, add_src, block_dst, out, n_embd, B);
     return 0;
 }
 
@@ -2594,7 +2801,7 @@ extern "C" int ink_shortconv_res_batch_snap(hipStream_t s, const float* raw, con
         hist_update_3_k<<<dim3((n_embd + 255) / 256), dim3(256), 0, s>>>(raw, hist, n_embd, B);
         return 0;
     }
-    shortconv_res_batch_snap_k<<<dim3((n_embd + 255) / 256), dim3(256), 0, s>>>(raw, conv_w, hist, snap, add_src, block_dst, out, n_embd, B);
+    shortconv_res_batch_snap_k<<<dim3((n_embd + 63) / 64), dim3(64), 0, s>>>(raw, conv_w, hist, snap, add_src, block_dst, out, n_embd, B);
     return 0;
 }
 
@@ -3583,12 +3790,53 @@ extern "C" __global__ void moe_gu_q4_0_sudot4_to_q8_k(const uint8_t* __restrict_
                 uint4 qu = qu_row[b];
                 float dg = __half2float(dg_row[b]);
                 float du = __half2float(du_row[b]);
+                int32_t g0 = (int32_t)(qg.x & 0x0F0F0F0Fu), g1 = (int32_t)(qg.y & 0x0F0F0F0Fu);
+                int32_t g2 = (int32_t)(qg.z & 0x0F0F0F0Fu), g3 = (int32_t)(qg.w & 0x0F0F0F0Fu);
+                int32_t g4 = (int32_t)((qg.x >> 4) & 0x0F0F0F0Fu), g5 = (int32_t)((qg.y >> 4) & 0x0F0F0F0Fu);
+                int32_t g6 = (int32_t)((qg.z >> 4) & 0x0F0F0F0Fu), g7 = (int32_t)((qg.w >> 4) & 0x0F0F0F0Fu);
+                int32_t u0 = (int32_t)(qu.x & 0x0F0F0F0Fu), u1 = (int32_t)(qu.y & 0x0F0F0F0Fu);
+                int32_t u2 = (int32_t)(qu.z & 0x0F0F0F0Fu), u3 = (int32_t)(qu.w & 0x0F0F0F0Fu);
+                int32_t u4 = (int32_t)((qu.x >> 4) & 0x0F0F0F0Fu), u5 = (int32_t)((qu.y >> 4) & 0x0F0F0F0Fu);
+                int32_t u6 = (int32_t)((qu.z >> 4) & 0x0F0F0F0Fu), u7 = (int32_t)((qu.w >> 4) & 0x0F0F0F0Fu);
                 const q8_1_blk xb0 = Xq[(size_t)tid0 * nblk + b];
                 const q8_1_blk xb1 = Xq[(size_t)tid1 * nblk + b];
-                ag0 += dot_q4_soa_q8_1_blk(qg, dg, xb0);
-                au0 += dot_q4_soa_q8_1_blk(qu, du, xb0);
-                ag1 += dot_q4_soa_q8_1_blk(qg, dg, xb1);
-                au1 += dot_q4_soa_q8_1_blk(qu, du, xb1);
+                int32_t sg0 = 0, su0 = 0, sg1 = 0, su1 = 0;
+                sg0 = __builtin_amdgcn_sudot4(false, g0, true, xb0.q[0], sg0, false);
+                sg0 = __builtin_amdgcn_sudot4(false, g1, true, xb0.q[1], sg0, false);
+                sg0 = __builtin_amdgcn_sudot4(false, g2, true, xb0.q[2], sg0, false);
+                sg0 = __builtin_amdgcn_sudot4(false, g3, true, xb0.q[3], sg0, false);
+                sg0 = __builtin_amdgcn_sudot4(false, g4, true, xb0.q[4], sg0, false);
+                sg0 = __builtin_amdgcn_sudot4(false, g5, true, xb0.q[5], sg0, false);
+                sg0 = __builtin_amdgcn_sudot4(false, g6, true, xb0.q[6], sg0, false);
+                sg0 = __builtin_amdgcn_sudot4(false, g7, true, xb0.q[7], sg0, false);
+                ag0 = fmaf(dg * xb0.d, (float)(sg0 - 8 * xb0.s), ag0);
+                su0 = __builtin_amdgcn_sudot4(false, u0, true, xb0.q[0], su0, false);
+                su0 = __builtin_amdgcn_sudot4(false, u1, true, xb0.q[1], su0, false);
+                su0 = __builtin_amdgcn_sudot4(false, u2, true, xb0.q[2], su0, false);
+                su0 = __builtin_amdgcn_sudot4(false, u3, true, xb0.q[3], su0, false);
+                su0 = __builtin_amdgcn_sudot4(false, u4, true, xb0.q[4], su0, false);
+                su0 = __builtin_amdgcn_sudot4(false, u5, true, xb0.q[5], su0, false);
+                su0 = __builtin_amdgcn_sudot4(false, u6, true, xb0.q[6], su0, false);
+                su0 = __builtin_amdgcn_sudot4(false, u7, true, xb0.q[7], su0, false);
+                au0 = fmaf(du * xb0.d, (float)(su0 - 8 * xb0.s), au0);
+                sg1 = __builtin_amdgcn_sudot4(false, g0, true, xb1.q[0], sg1, false);
+                sg1 = __builtin_amdgcn_sudot4(false, g1, true, xb1.q[1], sg1, false);
+                sg1 = __builtin_amdgcn_sudot4(false, g2, true, xb1.q[2], sg1, false);
+                sg1 = __builtin_amdgcn_sudot4(false, g3, true, xb1.q[3], sg1, false);
+                sg1 = __builtin_amdgcn_sudot4(false, g4, true, xb1.q[4], sg1, false);
+                sg1 = __builtin_amdgcn_sudot4(false, g5, true, xb1.q[5], sg1, false);
+                sg1 = __builtin_amdgcn_sudot4(false, g6, true, xb1.q[6], sg1, false);
+                sg1 = __builtin_amdgcn_sudot4(false, g7, true, xb1.q[7], sg1, false);
+                ag1 = fmaf(dg * xb1.d, (float)(sg1 - 8 * xb1.s), ag1);
+                su1 = __builtin_amdgcn_sudot4(false, u0, true, xb1.q[0], su1, false);
+                su1 = __builtin_amdgcn_sudot4(false, u1, true, xb1.q[1], su1, false);
+                su1 = __builtin_amdgcn_sudot4(false, u2, true, xb1.q[2], su1, false);
+                su1 = __builtin_amdgcn_sudot4(false, u3, true, xb1.q[3], su1, false);
+                su1 = __builtin_amdgcn_sudot4(false, u4, true, xb1.q[4], su1, false);
+                su1 = __builtin_amdgcn_sudot4(false, u5, true, xb1.q[5], su1, false);
+                su1 = __builtin_amdgcn_sudot4(false, u6, true, xb1.q[6], su1, false);
+                su1 = __builtin_amdgcn_sudot4(false, u7, true, xb1.q[7], su1, false);
+                au1 = fmaf(du * xb1.d, (float)(su1 - 8 * xb1.s), au1);
             }
         }
         float g0 = s_warp_sum8(ag0) * sc, u0 = s_warp_sum8(au0) * sc;
@@ -3629,12 +3877,39 @@ extern "C" __global__ void moe_gu_q4_0_sudot4_to_q8_k(const uint8_t* __restrict_
                 uint4 qu = qu_row[b];
                 float dg = __half2float(dg_row[b]);
                 float du = __half2float(du_row[b]);
-                const q8_1_blk xb0 = Xq[(size_t)t0i * nblk + b];
-                const q8_1_blk xb1 = Xq[(size_t)t1i * nblk + b];
-                const q8_1_blk xb2 = Xq[(size_t)t2i * nblk + b];
-                ag0 += dot_q4_soa_q8_1_blk(qg, dg, xb0); au0 += dot_q4_soa_q8_1_blk(qu, du, xb0);
-                ag1 += dot_q4_soa_q8_1_blk(qg, dg, xb1); au1 += dot_q4_soa_q8_1_blk(qu, du, xb1);
-                ag2 += dot_q4_soa_q8_1_blk(qg, dg, xb2); au2 += dot_q4_soa_q8_1_blk(qu, du, xb2);
+                int32_t g0 = (int32_t)(qg.x & 0x0F0F0F0Fu), g1 = (int32_t)(qg.y & 0x0F0F0F0Fu);
+                int32_t g2 = (int32_t)(qg.z & 0x0F0F0F0Fu), g3 = (int32_t)(qg.w & 0x0F0F0F0Fu);
+                int32_t g4 = (int32_t)((qg.x >> 4) & 0x0F0F0F0Fu), g5 = (int32_t)((qg.y >> 4) & 0x0F0F0F0Fu);
+                int32_t g6 = (int32_t)((qg.z >> 4) & 0x0F0F0F0Fu), g7 = (int32_t)((qg.w >> 4) & 0x0F0F0F0Fu);
+                int32_t u0 = (int32_t)(qu.x & 0x0F0F0F0Fu), u1 = (int32_t)(qu.y & 0x0F0F0F0Fu);
+                int32_t u2 = (int32_t)(qu.z & 0x0F0F0F0Fu), u3 = (int32_t)(qu.w & 0x0F0F0F0Fu);
+                int32_t u4 = (int32_t)((qu.x >> 4) & 0x0F0F0F0Fu), u5 = (int32_t)((qu.y >> 4) & 0x0F0F0F0Fu);
+                int32_t u6 = (int32_t)((qu.z >> 4) & 0x0F0F0F0Fu), u7 = (int32_t)((qu.w >> 4) & 0x0F0F0F0Fu);
+                const q8_1_blk xbs[3] = { Xq[(size_t)t0i * nblk + b], Xq[(size_t)t1i * nblk + b], Xq[(size_t)t2i * nblk + b] };
+                float* agp[3] = { &ag0, &ag1, &ag2 };
+                float* aup[3] = { &au0, &au1, &au2 };
+#pragma unroll
+                for (int m = 0; m < 3; ++m) {
+                    int32_t sg = 0, su = 0;
+                    sg = __builtin_amdgcn_sudot4(false, g0, true, xbs[m].q[0], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g1, true, xbs[m].q[1], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g2, true, xbs[m].q[2], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g3, true, xbs[m].q[3], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g4, true, xbs[m].q[4], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g5, true, xbs[m].q[5], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g6, true, xbs[m].q[6], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g7, true, xbs[m].q[7], sg, false);
+                    *agp[m] = fmaf(dg * xbs[m].d, (float)(sg - 8 * xbs[m].s), *agp[m]);
+                    su = __builtin_amdgcn_sudot4(false, u0, true, xbs[m].q[0], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u1, true, xbs[m].q[1], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u2, true, xbs[m].q[2], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u3, true, xbs[m].q[3], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u4, true, xbs[m].q[4], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u5, true, xbs[m].q[5], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u6, true, xbs[m].q[6], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u7, true, xbs[m].q[7], su, false);
+                    *aup[m] = fmaf(du * xbs[m].d, (float)(su - 8 * xbs[m].s), *aup[m]);
+                }
             }
         }
         float g0 = s_warp_sum8(ag0) * sc, u0 = s_warp_sum8(au0) * sc;
@@ -3670,14 +3945,42 @@ extern "C" __global__ void moe_gu_q4_0_sudot4_to_q8_k(const uint8_t* __restrict_
                 uint4 qu = qu_row[b];
                 float dg = __half2float(dg_row[b]);
                 float du = __half2float(du_row[b]);
-                const q8_1_blk xb0 = Xq[(size_t)t0i * nblk + b];
-                const q8_1_blk xb1 = Xq[(size_t)t1i * nblk + b];
-                const q8_1_blk xb2 = Xq[(size_t)t2i * nblk + b];
-                const q8_1_blk xb3 = Xq[(size_t)t3i * nblk + b];
-                ag0 += dot_q4_soa_q8_1_blk(qg, dg, xb0); au0 += dot_q4_soa_q8_1_blk(qu, du, xb0);
-                ag1 += dot_q4_soa_q8_1_blk(qg, dg, xb1); au1 += dot_q4_soa_q8_1_blk(qu, du, xb1);
-                ag2 += dot_q4_soa_q8_1_blk(qg, dg, xb2); au2 += dot_q4_soa_q8_1_blk(qu, du, xb2);
-                ag3 += dot_q4_soa_q8_1_blk(qg, dg, xb3); au3 += dot_q4_soa_q8_1_blk(qu, du, xb3);
+                int32_t g0 = (int32_t)(qg.x & 0x0F0F0F0Fu), g1 = (int32_t)(qg.y & 0x0F0F0F0Fu);
+                int32_t g2 = (int32_t)(qg.z & 0x0F0F0F0Fu), g3 = (int32_t)(qg.w & 0x0F0F0F0Fu);
+                int32_t g4 = (int32_t)((qg.x >> 4) & 0x0F0F0F0Fu), g5 = (int32_t)((qg.y >> 4) & 0x0F0F0F0Fu);
+                int32_t g6 = (int32_t)((qg.z >> 4) & 0x0F0F0F0Fu), g7 = (int32_t)((qg.w >> 4) & 0x0F0F0F0Fu);
+                int32_t u0 = (int32_t)(qu.x & 0x0F0F0F0Fu), u1 = (int32_t)(qu.y & 0x0F0F0F0Fu);
+                int32_t u2 = (int32_t)(qu.z & 0x0F0F0F0Fu), u3 = (int32_t)(qu.w & 0x0F0F0F0Fu);
+                int32_t u4 = (int32_t)((qu.x >> 4) & 0x0F0F0F0Fu), u5 = (int32_t)((qu.y >> 4) & 0x0F0F0F0Fu);
+                int32_t u6 = (int32_t)((qu.z >> 4) & 0x0F0F0F0Fu), u7 = (int32_t)((qu.w >> 4) & 0x0F0F0F0Fu);
+                const q8_1_blk xbs[4] = {
+                    Xq[(size_t)t0i * nblk + b], Xq[(size_t)t1i * nblk + b],
+                    Xq[(size_t)t2i * nblk + b], Xq[(size_t)t3i * nblk + b]
+                };
+                float* agp[4] = { &ag0, &ag1, &ag2, &ag3 };
+                float* aup[4] = { &au0, &au1, &au2, &au3 };
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    int32_t sg = 0, su = 0;
+                    sg = __builtin_amdgcn_sudot4(false, g0, true, xbs[m].q[0], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g1, true, xbs[m].q[1], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g2, true, xbs[m].q[2], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g3, true, xbs[m].q[3], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g4, true, xbs[m].q[4], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g5, true, xbs[m].q[5], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g6, true, xbs[m].q[6], sg, false);
+                    sg = __builtin_amdgcn_sudot4(false, g7, true, xbs[m].q[7], sg, false);
+                    *agp[m] = fmaf(dg * xbs[m].d, (float)(sg - 8 * xbs[m].s), *agp[m]);
+                    su = __builtin_amdgcn_sudot4(false, u0, true, xbs[m].q[0], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u1, true, xbs[m].q[1], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u2, true, xbs[m].q[2], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u3, true, xbs[m].q[3], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u4, true, xbs[m].q[4], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u5, true, xbs[m].q[5], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u6, true, xbs[m].q[6], su, false);
+                    su = __builtin_amdgcn_sudot4(false, u7, true, xbs[m].q[7], su, false);
+                    *aup[m] = fmaf(du * xbs[m].d, (float)(su - 8 * xbs[m].s), *aup[m]);
+                }
             }
         }
         float g0 = s_warp_sum8(ag0) * sc, u0 = s_warp_sum8(au0) * sc;
@@ -4069,7 +4372,7 @@ extern "C" __global__ void inkling_attn_batch_gated_q8_k(const float* __restrict
 
 extern "C" int ink_attn_b8_flash_q8(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const __half* kc, const __half* vc, const float* gate, const int* d_pos0, void* out_q8, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int swa_window, int is_swa, int max_ctx, int B);
 extern "C" int ink_attn_batch_gated_q8(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const __half* kc, const __half* vc, const float* gate, const int* d_pos0, void* out_q8, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int swa_window, int is_swa, int max_ctx, int B) {
-    if (B >= 4 && B <= 16 && dh == 128 && d_rel == 16) {
+    if (B >= 4 && B <= 48 && dh == 128 && d_rel == 16) {
         return ink_attn_b8_flash_q8(s, Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, out_q8, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B);
     }
     inkling_attn_batch_gated_q8_k<<<dim3(n_head, B), dim3(256), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, (q8_1_blk*)out_q8, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx);
@@ -4098,23 +4401,57 @@ __global__ void dflash2_gu_swiglu_q8_nt_k(const uint8_t* __restrict__ wg,
     const uint4* qur = reinterpret_cast<const uint4*>(wur);
     const __half* dur = reinterpret_cast<const __half*>(wur + (size_t)nblk * 16);
 
+    __shared__ q8_1_blk sm_x[NT][8];
     float ag[NT];
     float au[NT];
 #pragma unroll
     for (int m = 0; m < NT; ++m) { ag[m] = 0.0f; au[m] = 0.0f; }
-    if (row < n_ff) {
-        for (int b = lane8; b < nblk; b += 8) {
+    for (int b0 = 0; b0 < nblk; b0 += 8) {
+        if (threadIdx.x < NT * 8) {
+            int tm = threadIdx.x >> 3;
+            int tb = threadIdx.x & 7;
+            if (b0 + tb < nblk) sm_x[tm][tb] = Xq[(size_t)tm * nblk + b0 + tb];
+        }
+        __syncthreads();
+        int b = b0 + lane8;
+        if (row < n_ff && b < nblk) {
             uint4 qg = qgr[b];
             uint4 qu = qur[b];
             float dg = __half2float(dgr[b]);
             float du = __half2float(dur[b]);
+            int32_t g0 = (int32_t)(qg.x & 0x0F0F0F0Fu), g1 = (int32_t)(qg.y & 0x0F0F0F0Fu);
+            int32_t g2 = (int32_t)(qg.z & 0x0F0F0F0Fu), g3 = (int32_t)(qg.w & 0x0F0F0F0Fu);
+            int32_t g4 = (int32_t)((qg.x >> 4) & 0x0F0F0F0Fu), g5 = (int32_t)((qg.y >> 4) & 0x0F0F0F0Fu);
+            int32_t g6 = (int32_t)((qg.z >> 4) & 0x0F0F0F0Fu), g7 = (int32_t)((qg.w >> 4) & 0x0F0F0F0Fu);
+            int32_t u0 = (int32_t)(qu.x & 0x0F0F0F0Fu), u1 = (int32_t)(qu.y & 0x0F0F0F0Fu);
+            int32_t u2 = (int32_t)(qu.z & 0x0F0F0F0Fu), u3 = (int32_t)(qu.w & 0x0F0F0F0Fu);
+            int32_t u4 = (int32_t)((qu.x >> 4) & 0x0F0F0F0Fu), u5 = (int32_t)((qu.y >> 4) & 0x0F0F0F0Fu);
+            int32_t u6 = (int32_t)((qu.z >> 4) & 0x0F0F0F0Fu), u7 = (int32_t)((qu.w >> 4) & 0x0F0F0F0Fu);
 #pragma unroll
             for (int m = 0; m < NT; ++m) {
-                const q8_1_blk xb = Xq[(size_t)m * nblk + b];
-                ag[m] += dot_q4_soa_q8_1_blk(qg, dg, xb);
-                au[m] += dot_q4_soa_q8_1_blk(qu, du, xb);
+                const q8_1_blk xb = sm_x[m][lane8];
+                int32_t sg = 0, su = 0;
+                sg = __builtin_amdgcn_sudot4(false, g0, true, xb.q[0], sg, false);
+                sg = __builtin_amdgcn_sudot4(false, g1, true, xb.q[1], sg, false);
+                sg = __builtin_amdgcn_sudot4(false, g2, true, xb.q[2], sg, false);
+                sg = __builtin_amdgcn_sudot4(false, g3, true, xb.q[3], sg, false);
+                sg = __builtin_amdgcn_sudot4(false, g4, true, xb.q[4], sg, false);
+                sg = __builtin_amdgcn_sudot4(false, g5, true, xb.q[5], sg, false);
+                sg = __builtin_amdgcn_sudot4(false, g6, true, xb.q[6], sg, false);
+                sg = __builtin_amdgcn_sudot4(false, g7, true, xb.q[7], sg, false);
+                ag[m] = fmaf(dg * xb.d, (float)(sg - 8 * xb.s), ag[m]);
+                su = __builtin_amdgcn_sudot4(false, u0, true, xb.q[0], su, false);
+                su = __builtin_amdgcn_sudot4(false, u1, true, xb.q[1], su, false);
+                su = __builtin_amdgcn_sudot4(false, u2, true, xb.q[2], su, false);
+                su = __builtin_amdgcn_sudot4(false, u3, true, xb.q[3], su, false);
+                su = __builtin_amdgcn_sudot4(false, u4, true, xb.q[4], su, false);
+                su = __builtin_amdgcn_sudot4(false, u5, true, xb.q[5], su, false);
+                su = __builtin_amdgcn_sudot4(false, u6, true, xb.q[6], su, false);
+                su = __builtin_amdgcn_sudot4(false, u7, true, xb.q[7], su, false);
+                au[m] = fmaf(du * xb.d, (float)(su - 8 * xb.s), au[m]);
             }
         }
+        __syncthreads();
     }
     __shared__ float sm_v[NT][32];
     __shared__ int8_t sm_q[NT][32];
@@ -4144,6 +4481,99 @@ extern "C" int ink_dflash2_gu_swiglu_q8(hipStream_t s, const uint8_t* wg, const 
     }
     if (B == 4) {
         dflash2_gu_swiglu_q8_nt_k<4><<<dim3((n_ff + 31) / 32), dim3(256), 0, s>>>(wg, wu, (const q8_1_blk*)Xq, (q8_1_blk*)out_q8, n_ff, k);
+        return 0;
+    }
+    return 1;
+}
+
+template <int NT>
+__global__ void dflash2_proj_conv_add_q4_nt_k(const uint8_t* __restrict__ W,
+                                              const q8_1_blk* __restrict__ Xq,
+                                              const float* __restrict__ dynamic,
+                                              const float* __restrict__ base_kernel,
+                                              float* __restrict__ x_inout,
+                                              int n_embd, int k,
+                                              int group_size, int side) {
+    int grp = threadIdx.x >> 3;
+    int lane8 = threadIdx.x & 7;
+    int row = blockIdx.x * 32 + grp;
+    int nblk = k >> 5;
+    size_t rbytes = q4_soa_row_bytes(nblk);
+    int r_safe = min(row, n_embd - 1);
+    const uint8_t* wrow = W + (size_t)r_safe * rbytes;
+    const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
+    const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
+
+    __shared__ q8_1_blk sm_x[NT][8];
+    float acc[NT];
+#pragma unroll
+    for (int m = 0; m < NT; ++m) acc[m] = 0.0f;
+    for (int b0 = 0; b0 < nblk; b0 += 8) {
+        if (threadIdx.x < NT * 8) {
+            int tm = threadIdx.x >> 3;
+            int tb = threadIdx.x & 7;
+            if (b0 + tb < nblk) sm_x[tm][tb] = Xq[(size_t)tm * nblk + b0 + tb];
+        }
+        __syncthreads();
+        int b = b0 + lane8;
+        if (row < n_embd && b < nblk) {
+            uint4 q4 = qrow[b];
+            float dw = __half2float(drow[b]);
+            int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu), w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+            int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu), w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+            int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+            int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
+#pragma unroll
+            for (int m = 0; m < NT; ++m) {
+                const q8_1_blk xb = sm_x[m][lane8];
+                int32_t sumi = 0;
+                sumi = __builtin_amdgcn_sudot4(false, w0, true, xb.q[0], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w1, true, xb.q[1], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w2, true, xb.q[2], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w3, true, xb.q[3], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w4, true, xb.q[4], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w5, true, xb.q[5], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w6, true, xb.q[6], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w7, true, xb.q[7], sumi, false);
+                acc[m] = fmaf(dw * xb.d, (float)(sumi - 8 * xb.s), acc[m]);
+            }
+        }
+        __syncthreads();
+    }
+
+    float vals[NT];
+#pragma unroll
+    for (int m = 0; m < NT; ++m) vals[m] = s_warp_sum8(acc[m]);
+    if (lane8 == 0 && row < n_embd) {
+        int n_groups = n_embd / group_size;
+        int g = row / group_size;
+        const float* base_s = base_kernel + (size_t)(side * 2 * n_embd);
+        float b0 = base_s[row];
+        float b1 = base_s[n_embd + row];
+        float prev = 0.0f;
+#pragma unroll
+        for (int m = 0; m < NT; ++m) {
+            const float* dyn_t = dynamic + (size_t)m * (size_t)(4 * n_groups) + (size_t)(side * 2 * n_groups);
+            float w0 = b0 + dyn_t[g];
+            float w1 = b1 + dyn_t[n_groups + g];
+            float v = vals[m];
+            x_inout[(size_t)m * n_embd + row] += w0 * v + w1 * prev;
+            prev = v;
+        }
+    }
+}
+
+extern "C" int ink_dflash2_proj_conv_add_q4(hipStream_t s, const uint8_t* W, const void* Xq, const float* dynamic, const float* base_kernel, float* x_inout, int n_embd, int k, int group_size, int side, int B) {
+    if (B == 8) {
+        dflash2_proj_conv_add_q4_nt_k<8><<<dim3((n_embd + 31) / 32), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, dynamic, base_kernel, x_inout, n_embd, k, group_size, side);
+        return 0;
+    }
+    if (B == 6) {
+        dflash2_proj_conv_add_q4_nt_k<6><<<dim3((n_embd + 31) / 32), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, dynamic, base_kernel, x_inout, n_embd, k, group_size, side);
+        return 0;
+    }
+    if (B == 4) {
+        dflash2_proj_conv_add_q4_nt_k<4><<<dim3((n_embd + 31) / 32), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, dynamic, base_kernel, x_inout, n_embd, k, group_size, side);
         return 0;
     }
     return 1;

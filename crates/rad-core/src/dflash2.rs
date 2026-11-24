@@ -400,6 +400,13 @@ impl DFlash2Drafter {
         unsafe { rad_hip::hipStreamSynchronize(self.stream); }
     }
 
+    pub fn advance_ctx_len_seq(&mut self, seq: usize, new_ctx_len: i32) {
+        self.seq_ctx_len[seq] = new_ctx_len;
+        if seq == 0 {
+            self.ctx_len = new_ctx_len;
+        }
+    }
+
     pub fn inject_target_feats_batch_seq_async(&mut self, seq: usize, bsc_feats: *const f32, max_batch: usize, start_tok: usize, pos0: i32, n_tok: usize) -> Result<()> {
         if n_tok == 0 {
             return Ok(());
@@ -479,15 +486,16 @@ impl DFlash2Drafter {
         let gs = self.conv_group_size as i32;
 
         for l in &self.layers {
-            ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, l.input_norm.ptr as *const f32, self.x_norm.ptr as *mut f32, e, tot_b, self.eps);
             if l.attn_conv_proj.ty != WeightType::Bf16 {
-                ops::ink_quantize_q8_1(s, self.x_norm.ptr as *const f32, self.xq.ptr, e, tot_b);
+                ops::ink_dflash2_rmsnorm_q8(s, self.x.ptr as *const f32, l.input_norm.ptr as *const f32, self.x_norm.ptr as *mut f32, self.xq.ptr, e, tot_b, self.eps);
+            } else {
+                ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, l.input_norm.ptr as *const f32, self.x_norm.ptr as *mut f32, e, tot_b, self.eps);
             }
             self.gemm_w(s, &l.attn_conv_proj, self.x_norm.ptr as *const f32, self.xq.ptr, self.dyn_buf.ptr as *mut f32, dyn_dim, e, tot_b);
-            ops::ink_dflash2_conv(s, self.x_norm.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.attn_conv_base.ptr as *const f32, self.x_conv.ptr as *mut f32, e, ki, gs, 0, tot_b);
-
             if l.wq.ty == WeightType::Q4_0 {
-                ops::ink_quantize_q8_1(s, self.x_conv.ptr as *const f32, self.xq.ptr, e, tot_b);
+                ops::ink_dflash2_conv_q8(s, self.x_norm.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.attn_conv_base.ptr as *const f32, self.xq.ptr, e, ki, gs, 0, tot_b);
+            } else {
+                ops::ink_dflash2_conv(s, self.x_norm.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.attn_conv_base.ptr as *const f32, self.x_conv.ptr as *mut f32, e, ki, gs, 0, tot_b);
             }
             if l.wq.ty == WeightType::Q4_0 && (tot_b == 4 || tot_b == 6 || tot_b == 8) {
                 ops::ink_dflash2_qkv_q4(s, l.wq.buf.ptr as *const u8, l.wk.buf.ptr as *const u8, l.wv.buf.ptr as *const u8, self.xq.ptr, self.q.ptr as *mut f32, self.k.ptr as *mut f32, self.v.ptr as *mut f32, e, q_dim, kv_dim, tot_b);
@@ -512,7 +520,25 @@ impl DFlash2Drafter {
                     self.freq_base,
                 );
                 let kv_off = seq * self.n_head_kv * l.max_ctx * self.dh;
-                if l.wo.ty == WeightType::Q4_0 && self.dh == 128 && k_len <= 8 && self.n_head <= 32 {
+                if l.wo.ty == WeightType::Q4_0 && self.dh == 128 && k_len <= 8 && self.n_head == 4 * self.n_head_kv && self.n_head <= 32 {
+                    ops::ink_dspark_attn_wmma_q8(
+                        s,
+                        self.q.ptr as *const f32,
+                        self.k.ptr as *const f32,
+                        self.v.ptr as *const f32,
+                        (l.k_cache.ptr as *const u16).add(kv_off),
+                        (l.v_cache.ptr as *const u16).add(kv_off),
+                        self.d_ctx_len.ptr as *const i32,
+                        self.xq.ptr,
+                        ki,
+                        self.n_head as i32,
+                        self.n_head_kv as i32,
+                        self.dh as i32,
+                        self.swa_window as i32,
+                        1,
+                        l.max_ctx as i32,
+                    );
+                } else if l.wo.ty == WeightType::Q4_0 && self.dh == 128 && k_len <= 8 && self.n_head <= 32 {
                     ops::ink_dspark_attn_q8(
                         s,
                         self.q.ptr as *const f32,
@@ -591,22 +617,32 @@ impl DFlash2Drafter {
                 }
             }
 
-            self.gemm_w(s, &l.wo, self.attn_out.ptr as *const f32, self.xq.ptr, self.o_out.ptr as *mut f32, e, q_dim, tot_b);
-            ops::ink_dflash2_conv_add(s, self.o_out.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.attn_conv_base.ptr as *const f32, self.x.ptr as *mut f32, e, ki, gs, 1, tot_b);
+            if l.wo.ty == WeightType::Q4_0 && n_users == 1 && (tot_b == 4 || tot_b == 6 || tot_b == 8) {
+                ops::ink_dflash2_proj_conv_add_q4(s, l.wo.buf.ptr as *const u8, self.xq.ptr, self.dyn_buf.ptr as *const f32, l.attn_conv_base.ptr as *const f32, self.x.ptr as *mut f32, e, q_dim, gs, 1, tot_b);
+            } else {
+                self.gemm_w(s, &l.wo, self.attn_out.ptr as *const f32, self.xq.ptr, self.o_out.ptr as *mut f32, e, q_dim, tot_b);
+                ops::ink_dflash2_conv_add(s, self.o_out.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.attn_conv_base.ptr as *const f32, self.x.ptr as *mut f32, e, ki, gs, 1, tot_b);
+            }
 
-            ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, l.post_attn_norm.ptr as *const f32, self.x_norm.ptr as *mut f32, e, tot_b, self.eps);
             if l.mlp_conv_proj.ty != WeightType::Bf16 {
-                ops::ink_quantize_q8_1(s, self.x_norm.ptr as *const f32, self.xq.ptr, e, tot_b);
+                ops::ink_dflash2_rmsnorm_q8(s, self.x.ptr as *const f32, l.post_attn_norm.ptr as *const f32, self.x_norm.ptr as *mut f32, self.xq.ptr, e, tot_b, self.eps);
+            } else {
+                ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, l.post_attn_norm.ptr as *const f32, self.x_norm.ptr as *mut f32, e, tot_b, self.eps);
             }
             self.gemm_w(s, &l.mlp_conv_proj, self.x_norm.ptr as *const f32, self.xq.ptr, self.dyn_buf.ptr as *mut f32, dyn_dim, e, tot_b);
-            ops::ink_dflash2_conv(s, self.x_norm.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.mlp_conv_base.ptr as *const f32, self.x_conv.ptr as *mut f32, e, ki, gs, 0, tot_b);
-
             if l.gate_proj.ty == WeightType::Q4_0 {
-                ops::ink_quantize_q8_1(s, self.x_conv.ptr as *const f32, self.xq.ptr, e, tot_b);
+                ops::ink_dflash2_conv_q8(s, self.x_norm.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.mlp_conv_base.ptr as *const f32, self.xq.ptr, e, ki, gs, 0, tot_b);
+            } else {
+                ops::ink_dflash2_conv(s, self.x_norm.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.mlp_conv_base.ptr as *const f32, self.x_conv.ptr as *mut f32, e, ki, gs, 0, tot_b);
             }
             if l.gate_proj.ty == WeightType::Q4_0 && l.down_proj.ty == WeightType::Q4_0 && (tot_b == 4 || tot_b == 6 || tot_b == 8) {
                 ops::ink_dflash2_gu_swiglu_q8(s, l.gate_proj.buf.ptr as *const u8, l.up_proj.buf.ptr as *const u8, self.xq.ptr, self.gate.ptr, self.n_ff as i32, e, tot_b);
-                self.gemm_w(s, &l.down_proj, self.gate.ptr as *const f32, self.gate.ptr, self.ffn_out.ptr as *mut f32, e, self.n_ff as i32, tot_b);
+                if n_users == 1 {
+                    ops::ink_dflash2_proj_conv_add_q4(s, l.down_proj.buf.ptr as *const u8, self.gate.ptr, self.dyn_buf.ptr as *const f32, l.mlp_conv_base.ptr as *const f32, self.x.ptr as *mut f32, e, self.n_ff as i32, gs, 1, tot_b);
+                } else {
+                    self.gemm_w(s, &l.down_proj, self.gate.ptr as *const f32, self.gate.ptr, self.ffn_out.ptr as *mut f32, e, self.n_ff as i32, tot_b);
+                    ops::ink_dflash2_conv_add(s, self.ffn_out.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.mlp_conv_base.ptr as *const f32, self.x.ptr as *mut f32, e, ki, gs, 1, tot_b);
+                }
             } else {
                 self.gemm_w(s, &l.gate_proj, self.x_conv.ptr as *const f32, self.xq.ptr, self.gate.ptr as *mut f32, self.n_ff as i32, e, tot_b);
                 self.gemm_w(s, &l.up_proj, self.x_conv.ptr as *const f32, self.xq.ptr, self.up.ptr as *mut f32, self.n_ff as i32, e, tot_b);
@@ -616,8 +652,8 @@ impl DFlash2Drafter {
                     ops::ink_dspark_swiglu(s, self.gate.ptr as *const f32, self.up.ptr as *const f32, self.gate.ptr as *mut f32, tot_b * self.n_ff as i32);
                 }
                 self.gemm_w(s, &l.down_proj, self.gate.ptr as *const f32, self.xq.ptr, self.ffn_out.ptr as *mut f32, e, self.n_ff as i32, tot_b);
+                ops::ink_dflash2_conv_add(s, self.ffn_out.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.mlp_conv_base.ptr as *const f32, self.x.ptr as *mut f32, e, ki, gs, 1, tot_b);
             }
-            ops::ink_dflash2_conv_add(s, self.ffn_out.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.mlp_conv_base.ptr as *const f32, self.x.ptr as *mut f32, e, ki, gs, 1, tot_b);
         }
 
         ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, self.output_norm.ptr as *const f32, self.hidden.ptr as *mut f32, e, tot_b, self.eps);

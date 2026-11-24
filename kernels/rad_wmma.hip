@@ -2061,7 +2061,7 @@ extern "C" __global__ void attn_b8_flash_q8_k(const float* __restrict__ Q,
     }
 }
 
-__device__ float g_b8_split_buf[32 * 16 * 16 * 130];
+__device__ float g_b8_split_buf[32 * 32 * 48 * 130];
 
 extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ Q,
                                                       const float* __restrict__ R,
@@ -2077,6 +2077,8 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
                                                       int is_swa, int max_ctx, int B, int n_splits) {
     int kv_h = blockIdx.x;
     int sp = blockIdx.y;
+    int qb = blockIdx.z;
+    int q_off = qb * 16;
     int wid = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int col = lane & 15;
@@ -2088,11 +2090,13 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
     int q_dim = n_head * dh;
     int r_dim = n_head * d_rel;
 
-    bool vq = (col < B);
-    int pos_q = pos0 + col;
+    int q_idx = q_off + col;
+    bool vq = (q_idx < B);
+    int pos_q = pos0 + q_idx;
+    int n_q_tile = min(16, B - q_off);
     int t_start_q = is_swa ? max(0, pos_q - swa_window + 1) : 0;
-    int t_min = is_swa ? max(0, pos0 - swa_window + 1) : 0;
-    int t_max = pos0 + B;
+    int t_min = is_swa ? max(0, (pos0 + q_off) - swa_window + 1) : 0;
+    int t_max = pos0 + q_off + n_q_tile;
 
     int total_tiles = (t_max - t_min + 15) / 16;
     int tiles_per_sp = (total_tiles + n_splits - 1) / n_splits;
@@ -2101,7 +2105,7 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
 
     if (tile_s >= tile_e) {
         if (tg == 0 && half == 0 && vq) {
-            float* dst = split_buf + (((size_t)h * n_splits + sp) * 16 + col) * 130;
+            float* dst = split_buf + (((size_t)h * n_splits + sp) * 48 + q_idx) * 130;
             dst[0] = -1e30f;
             dst[1] = 0.0f;
         }
@@ -2116,16 +2120,16 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
     float4 r_reg3 = make_float4(0.f, 0.f, 0.f, 0.f);
     float sink_q = 0.0f;
     if (vq) {
-        const float* qh = Q + (size_t)col * q_dim + (size_t)h * dh;
+        const float* qh = Q + (size_t)q_idx * q_dim + (size_t)h * dh;
 #pragma unroll
         for (int db = 0; db < 8; ++db) {
             int dbase = db * 16 + half * 8;
 #pragma unroll
             for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)(qh[dbase + j] * q_scale);
         }
-        const float4* rh4 = reinterpret_cast<const float4*>(R + (size_t)col * r_dim + (size_t)h * d_rel);
+        const float4* rh4 = reinterpret_cast<const float4*>(R + (size_t)q_idx * r_dim + (size_t)h * d_rel);
         r_reg0 = rh4[0]; r_reg1 = rh4[1]; r_reg2 = rh4[2]; r_reg3 = rh4[3];
-        sink_q = sinks[(size_t)col * n_head + h];
+        sink_q = sinks[(size_t)q_idx * n_head + h];
     } else {
 #pragma unroll
         for (int db = 0; db < 8; ++db) {
@@ -2188,26 +2192,41 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
 
             float local_max = -1e30f;
             float sc_arr[8];
+            bool tile_all_far = ((pos0 + q_off) - (tile + n_kv - 1) >= rel_extent) && (tile + n_kv - 1 <= pos0 + q_off) && (!is_swa || tile >= (pos0 + q_off + n_q_tile - 1 - swa_window + 1));
+            if (tile_all_far) {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                int tk = half * 8 + i;
-                int t = tile + tk;
-                if (vq && tk < n_kv && t >= t_start_q && t <= pos_q) {
-                    float sc = s_v[i] - sink_q;
-                    int dist = pos_q - t;
-                    if (dist < rel_extent) {
-                        const float4* rbp4 = reinterpret_cast<const float4*>(rel_bias + (size_t)dist * d_rel);
-                        float4 b0 = rbp4[0], b1 = rbp4[1], b2 = rbp4[2], b3 = rbp4[3];
-                        float rp = fmaf(b0.x, r_reg0.x, fmaf(b0.y, r_reg0.y, fmaf(b0.z, r_reg0.z, b0.w * r_reg0.w)));
-                        rp = fmaf(b1.x, r_reg1.x, fmaf(b1.y, r_reg1.y, fmaf(b1.z, r_reg1.z, fmaf(b1.w, r_reg1.w, rp))));
-                        rp = fmaf(b2.x, r_reg2.x, fmaf(b2.y, r_reg2.y, fmaf(b2.z, r_reg2.z, fmaf(b2.w, r_reg2.w, rp))));
-                        rp = fmaf(b3.x, r_reg3.x, fmaf(b3.y, r_reg3.y, fmaf(b3.z, r_reg3.z, fmaf(b3.w, r_reg3.w, rp))));
-                        sc += rp;
+                for (int i = 0; i < 8; ++i) {
+                    int tk = half * 8 + i;
+                    if (vq && tk < n_kv) {
+                        float sc = s_v[i] - sink_q;
+                        sc_arr[i] = sc;
+                        local_max = fmaxf(local_max, sc);
+                    } else {
+                        sc_arr[i] = -1e30f;
                     }
-                    sc_arr[i] = sc;
-                    local_max = fmaxf(local_max, sc);
-                } else {
-                    sc_arr[i] = -1e30f;
+                }
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    int tk = half * 8 + i;
+                    int t = tile + tk;
+                    if (vq && tk < n_kv && t >= t_start_q && t <= pos_q) {
+                        float sc = s_v[i] - sink_q;
+                        int dist = pos_q - t;
+                        if (dist < rel_extent) {
+                            const float4* rbp4 = reinterpret_cast<const float4*>(rel_bias + (size_t)dist * d_rel);
+                            float4 b0 = rbp4[0], b1 = rbp4[1], b2 = rbp4[2], b3 = rbp4[3];
+                            float rp = fmaf(b0.x, r_reg0.x, fmaf(b0.y, r_reg0.y, fmaf(b0.z, r_reg0.z, b0.w * r_reg0.w)));
+                            rp = fmaf(b1.x, r_reg1.x, fmaf(b1.y, r_reg1.y, fmaf(b1.z, r_reg1.z, fmaf(b1.w, r_reg1.w, rp))));
+                            rp = fmaf(b2.x, r_reg2.x, fmaf(b2.y, r_reg2.y, fmaf(b2.z, r_reg2.z, fmaf(b2.w, r_reg2.w, rp))));
+                            rp = fmaf(b3.x, r_reg3.x, fmaf(b3.y, r_reg3.y, fmaf(b3.z, r_reg3.z, fmaf(b3.w, r_reg3.w, rp))));
+                            sc += rp;
+                        }
+                        sc_arr[i] = sc;
+                        local_max = fmaxf(local_max, sc);
+                    } else {
+                        sc_arr[i] = -1e30f;
+                    }
                 }
             }
             float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
@@ -2258,14 +2277,14 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
         }
         __syncthreads();
         int h_out = kv_h * 3 + gg;
-        for (int bt = wid; bt < B; bt += 6) {
+        for (int bt = wid; bt < n_q_tile; bt += 6) {
             float m0 = sm_m[0][gg][bt];
             float m1 = sm_m[1][gg][bt];
             float gm = fmaxf(m0, m1);
             float sc0 = (m0 > -1e20f) ? expf(m0 - gm) : 0.0f;
             float sc1 = (m1 > -1e20f) ? expf(m1 - gm) : 0.0f;
             float gl = sm_l[0][gg][bt] * sc0 + sm_l[1][gg][bt] * sc1;
-            float* dst = split_buf + (((size_t)h_out * n_splits + sp) * 16 + bt) * 130;
+            float* dst = split_buf + (((size_t)h_out * n_splits + sp) * 48 + (q_off + bt)) * 130;
             if (lane == 0) { dst[0] = gm; dst[1] = gl; }
 #pragma unroll
             for (int blk = 0; blk < 4; ++blk) {
@@ -2490,13 +2509,13 @@ extern "C" __global__ void attn_b8_flash_reduce_q8_k(const float* __restrict__ s
 
     float gm = -1e30f;
     for (int sp = 0; sp < n_splits; ++sp) {
-        const float* p = split_buf + (((size_t)h * n_splits + sp) * 16 + bt) * 130;
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * 48 + bt) * 130;
         gm = fmaxf(gm, p[0]);
     }
     float gl = 0.0f;
     float go = 0.0f;
     for (int sp = 0; sp < n_splits; ++sp) {
-        const float* p = split_buf + (((size_t)h * n_splits + sp) * 16 + bt) * 130;
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * 48 + bt) * 130;
         if (p[0] > -1e20f) {
             float sc = expf(p[0] - gm);
             gl += p[1] * sc;
@@ -2514,8 +2533,8 @@ extern "C" int ink_attn_b8_flash_q8(hipStream_t s, const float* Q, const float* 
         float* sbuf = nullptr;
         (void)hipGetSymbolAddress((void**)&sbuf, HIP_SYMBOL(g_b8_split_buf));
         if (n_head == 3 * n_head_kv) {
-            int n_splits = (!is_swa && max_ctx > 2048) ? 16 : 8;
-            attn_b8_gqa3_flash_split_k<<<dim3(n_head_kv, n_splits), dim3(192), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, d_pos0, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B, n_splits);
+            int n_splits = (!is_swa && max_ctx > 2048) ? 32 : 8;
+            attn_b8_gqa3_flash_split_k<<<dim3(n_head_kv, n_splits, (B + 15) / 16), dim3(192), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, d_pos0, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B, n_splits);
             attn_b8_flash_reduce_q8_k<<<dim3(n_head, B), dim3(128), 0, s>>>(sbuf, gate, (w_q8_1_blk*)out_q8, n_head, n_splits);
             return 0;
         }
@@ -2545,5 +2564,226 @@ extern "C" int ink_loop_ctrl_down_wmma(hipStream_t s, const float* cur0, const f
 
 extern "C" int ink_loop_ctrl_up_wmma(hipStream_t s, const float* cur0, const float* cur1, const float* cur2, const float* msgs, const float* h_buf, const float* wg0, const float* wg1, const float* wg2, const float* wf0, const float* wf1, const float* wf2, float* out0, float* out1, float* out2, int n_embd, int rank, int max_B, int B, int n_ctrl) {
     loop_ctrl_up_wmma_k<<<dim3((n_embd + 63) / 64, n_ctrl, (B + 31) / 32), dim3(128), 0, s>>>(cur0, cur1, cur2, msgs, h_buf, wg0, wg1, wg2, wf0, wf1, wf2, out0, out1, out2, n_embd, rank, max_B, B);
+    return 0;
+}
+
+__device__ float g_df2_wmma_split_buf[32 * 16 * 8 * 130];
+
+extern "C" __global__ void dspark_attn_wmma_gqa4_split_k(const float* __restrict__ Q,
+                                                         const float* __restrict__ K_blk,
+                                                         const float* __restrict__ V_blk,
+                                                         const __half* __restrict__ kc,
+                                                         const __half* __restrict__ vc,
+                                                         const int* __restrict__ d_ctx_len,
+                                                         float* __restrict__ split_buf,
+                                                         int K_len, int n_head, int n_head_kv,
+                                                         int dh, int swa_window, int is_swa,
+                                                         int max_ctx, int n_splits) {
+    int kv_h = blockIdx.x;
+    int sp = blockIdx.y;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    int col = lane & 15;
+    int half = lane >> 4;
+    int h = kv_h * 4 + wid;
+    int ctx_len = *d_ctx_len;
+    int t_start = is_swa ? max(0, ctx_len - swa_window) : 0;
+    int ctx_cnt = ctx_len - t_start;
+    int total_kv = ctx_cnt + K_len;
+
+    int total_tiles = (total_kv + 15) / 16;
+    int tiles_per_sp = (total_tiles + n_splits - 1) / n_splits;
+    int tile_s = sp * tiles_per_sp * 16;
+    int tile_e = min(total_kv, tile_s + tiles_per_sp * 16);
+
+    bool vq = (col < K_len);
+    if (tile_s >= tile_e) {
+        if (half == 0 && vq) {
+            float* dst = split_buf + (((size_t)h * n_splits + sp) * 8 + col) * 130;
+            dst[0] = -1e30f;
+            dst[1] = 0.0f;
+        }
+        return;
+    }
+
+    float q_scale = rsqrtf((float)dh);
+    wmma_h8_v q_reg[8];
+    if (vq) {
+        const float* qh = Q + ((size_t)col * n_head + h) * dh;
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+            int dbase = db * 16 + half * 8;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)(qh[dbase + j] * q_scale);
+        }
+    } else {
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)0.0f;
+        }
+    }
+
+    float m_q = -1e30f;
+    float l_q = 0.0f;
+    wmma_f8_v o_acc[8];
+#pragma unroll
+    for (int db = 0; db < 8; ++db) o_acc[db] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const _Float16* kc_h = reinterpret_cast<const _Float16*>(kc) + (size_t)kv_h * max_ctx * dh;
+    const _Float16* vc_h = reinterpret_cast<const _Float16*>(vc) + (size_t)kv_h * max_ctx * dh;
+
+    __shared__ union {
+        struct {
+            _Float16 k[16][136];
+            _Float16 vt[128][24];
+        } kv;
+        float o[4][8][128];
+    } sm_u;
+
+    for (int tile = tile_s; tile < tile_e; tile += 16) {
+        int n_kv = min(16, tile_e - tile);
+        for (int idx = tid; idx < 256; idx += 128) {
+            int tk = idx >> 4;
+            int d8 = (idx & 15) * 8;
+            if (tk < n_kv) {
+                int kidx = tile + tk;
+                if (kidx < ctx_cnt) {
+                    int t = t_start + kidx;
+                    int kv_slot = is_swa ? (t % max_ctx) : t;
+                    const _Float16* kp = kc_h + (size_t)kv_slot * dh + d8;
+                    const _Float16* vp = vc_h + (size_t)kv_slot * dh + d8;
+                    *reinterpret_cast<uint4*>(&sm_u.kv.k[tk][d8]) = *reinterpret_cast<const uint4*>(kp);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) sm_u.kv.vt[d8 + j][tk] = vp[j];
+                } else {
+                    int bi = kidx - ctx_cnt;
+                    const float* kp = K_blk + ((size_t)bi * n_head_kv + kv_h) * dh + d8;
+                    const float* vp = V_blk + ((size_t)bi * n_head_kv + kv_h) * dh + d8;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        sm_u.kv.k[tk][d8 + j] = (_Float16)kp[j];
+                        sm_u.kv.vt[d8 + j][tk] = (_Float16)vp[j];
+                    }
+                }
+            } else {
+                *reinterpret_cast<uint4*>(&sm_u.kv.k[tk][d8]) = make_uint4(0, 0, 0, 0);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) sm_u.kv.vt[d8 + j][tk] = (_Float16)0.0f;
+            }
+        }
+        __syncthreads();
+
+        wmma_f8_v s_v = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+            wmma_h8_v kv_v;
+            int dbase = db * 16 + half * 8;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) kv_v[j] = sm_u.kv.k[col][dbase + j];
+            s_v = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(kv_v, q_reg[db], s_v);
+        }
+
+        float local_max = -1e30f;
+        float sc_arr[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int tk = half * 8 + i;
+            if (vq && tk < n_kv) {
+                sc_arr[i] = s_v[i];
+                local_max = fmaxf(local_max, s_v[i]);
+            } else {
+                sc_arr[i] = -1e30f;
+            }
+        }
+        float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+        float m_new = fmaxf(m_q, tile_max);
+        float alpha = (m_q > -1e20f) ? expf(m_q - m_new) : 0.0f;
+
+        wmma_h8_v p_reg;
+        float local_sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float p = (sc_arr[i] > -1e20f) ? expf(sc_arr[i] - m_new) : 0.0f;
+            p_reg[i] = (_Float16)p;
+            local_sum += p;
+        }
+        l_q = l_q * alpha + local_sum + __shfl_xor(local_sum, 16, 32);
+        m_q = m_new;
+
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+            wmma_h8_v vt_v;
+            int d_row = db * 16 + col;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) vt_v[j] = sm_u.kv.vt[d_row][half * 8 + j];
+            o_acc[db] *= alpha;
+            o_acc[db] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vt_v, p_reg, o_acc[db]);
+        }
+        __syncthreads();
+    }
+
+    if (vq) {
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                sm_u.o[wid][col][db * 16 + half * 8 + i] = o_acc[db][i];
+            }
+        }
+        float* dst = split_buf + (((size_t)h * n_splits + sp) * 8 + col) * 130;
+        if (half == 0) {
+            dst[0] = m_q;
+            dst[1] = l_q;
+        }
+    }
+    __builtin_amdgcn_wave_barrier();
+    for (int bt = 0; bt < K_len; ++bt) {
+        float* dst = split_buf + (((size_t)h * n_splits + sp) * 8 + bt) * 130;
+#pragma unroll
+        for (int blk = 0; blk < 4; ++blk) {
+            int d = blk * 32 + lane;
+            dst[2 + d] = sm_u.o[wid][bt][d];
+        }
+    }
+}
+
+extern "C" __global__ void dspark_attn_wmma_reduce_q8_k(const float* __restrict__ split_buf,
+                                                        w_q8_1_blk* __restrict__ out_q8,
+                                                        int n_head, int n_splits) {
+    int h = blockIdx.x;
+    int bt = blockIdx.y;
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int d = wid * 32 + lane;
+
+    float gm = -1e30f;
+    for (int sp = 0; sp < n_splits; ++sp) {
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * 8 + bt) * 130;
+        gm = fmaxf(gm, p[0]);
+    }
+    float gl = 0.0f;
+    float go = 0.0f;
+    for (int sp = 0; sp < n_splits; ++sp) {
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * 8 + bt) * 130;
+        if (p[0] > -1e20f) {
+            float sc = expf(p[0] - gm);
+            gl += p[1] * sc;
+            go += p[2 + d] * sc;
+        }
+    }
+    float v = (gl > 0.0f) ? (go / gl) : 0.0f;
+    __shared__ int8_t smq[4][32];
+    size_t qbase = ((size_t)bt * n_head + h) * 4;
+    w_q8_store(v, lane, out_q8 + qbase + wid, smq[wid]);
+}
+
+extern "C" int ink_dspark_attn_wmma_q8(hipStream_t s, const float* Q, const float* K_blk, const float* V_blk, const __half* kc, const __half* vc, const int* d_ctx_len, void* out_q8, int K_len, int n_head, int n_head_kv, int dh, int swa_window, int is_swa, int max_ctx) {
+    int n_splits = 16;
+    float* sbuf = nullptr;
+    (void)hipGetSymbolAddress((void**)&sbuf, HIP_SYMBOL(g_df2_wmma_split_buf));
+    dspark_attn_wmma_gqa4_split_k<<<dim3(n_head_kv, n_splits), dim3(128), 0, s>>>(Q, K_blk, V_blk, kc, vc, d_ctx_len, sbuf, K_len, n_head, n_head_kv, dh, swa_window, is_swa, max_ctx, n_splits);
+    dspark_attn_wmma_reduce_q8_k<<<dim3(n_head, K_len), dim3(128), 0, s>>>(sbuf, (w_q8_1_blk*)out_q8, n_head, n_splits);
     return 0;
 }
