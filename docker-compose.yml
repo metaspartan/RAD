@@ -1,0 +1,29 @@
+services:
+  rad:
+    build:
+      context: .
+      args:
+        RAD_ARCH: gfx1201
+    image: ghcr.io/metaspartan/rad:latest
+    container_name: rad-serve
+    ports:
+      - "8088:8088"
+    devices:
+      - "/dev/kfd:/dev/kfd"
+      - "/dev/dri:/dev/dri"
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    shm_size: "16g"
+    volumes:
+      - "${RAD_MODELS_DIR:-./models}:/models:ro"
+    environment:
+      - HIP_VISIBLE_DEVICES=0
+      - RAD_MODEL=/models/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf
+      - RAD_CTX=32768
+      - RAD_MAX_SEQS=8
+      - RAD_PORT=8088
+    restart: unless-stopped

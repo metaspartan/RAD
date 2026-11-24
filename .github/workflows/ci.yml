@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace crates
+        run: |
+          cargo check -p rad-gguf -p rad-hip
+          cargo test -p rad-gguf
+
+  rocm-build:
+    runs-on: ubuntu-latest
+    container:
+      image: rocm/dev-ubuntu-24.04:6.4.1-complete
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          apt-get update && apt-get install -y curl pkg-config libssl-dev
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Build HIP kernels
+        run: RAD_ARCH=gfx1201 bash kernels/build.sh
+      - name: Build RAD release binary
+        run: cargo build --release --bin rad
+      - name: Smoke test CLI help
+        run: ./target/release/rad --help

@@ -1,0 +1,26 @@
+app-id: io.github.metaspartan.RAD
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: rad
+finish-args:
+  - --share=network
+  - --device=dri
+  - --device=all
+  - --filesystem=host:ro
+modules:
+  - name: rad
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+    build-commands:
+      - RAD_ARCH=gfx1201 bash kernels/build.sh
+      - cargo build --release --bin rad
+      - install -Dm755 target/release/rad /app/bin/rad
+      - install -Dm755 kernels/librad_ops.so /app/lib/librad_ops.so
+    sources:
+      - type: git
+        url: https://github.com/metaspartan/RAD.git
+        branch: main

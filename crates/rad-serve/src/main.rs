@@ -1570,8 +1570,16 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
 
     if let Some(ref mut d) = drafter {
         let k_len = d.spec_k();
-        let prompts = [
+        let mut long_code_ctx = String::from("Here is an existing Rust networking library:\n```rust\n");
+        for i in 0..38 {
+            long_code_ctx.push_str(&format!(
+                "pub struct BufferPool{i} {{ cap: usize, used: usize }}\nimpl BufferPool{i} {{ pub fn new(cap: usize) -> Self {{ Self {{ cap, used: 0 }} }} pub fn remaining(&self) -> usize {{ self.cap - self.used }} }}\n"
+            ));
+        }
+        long_code_ctx.push_str("```\nNow write a complete Python implementation of quicksort and mergesort with a benchmark comparing them on random arrays.");
+        let prompts: [(&str, &str); 4] = [
             ("Code", "Show me a Python implementation of quicksort and mergesort with a benchmark comparing them on random arrays."),
+            ("Code (2K ctx)", &long_code_ctx),
             ("Math", "Derive the closed-form formula for the sum of squares 1^2 + 2^2 + ... + n^2 step by step and verify for n=5."),
             ("Prose", "Explain how modern GPU memory hierarchies work, from registers to L1/L2 caches and HBM, and why memory bandwidth limits LLM decoding."),
         ];

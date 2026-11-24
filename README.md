@@ -127,11 +127,43 @@ cargo build --release
 
 ### 4. Run Built-In Benchmarks (`rad bench`)
 
+Includes Cold Load, TTFT, No-Spec & DFlash 2 Long Prefill, Single-User Code, Large-Context Code (2K ctx), Math, Prose, and Multi-User `B=4/8/16`:
+
 ```bash
 ./target/release/rad bench -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf --ctx 4096 --max-seqs 16
 
 python3 scripts/test_serve.py
 ```
+
+### 5. Install & Deploy (Docker, `.deb`, Homebrew, Flatpak)
+
+- **Docker with AMD ROCm GPU Passthrough:**
+  ```bash
+  RAD_MODELS_DIR=/path/to/models docker compose up -d
+  ```
+  Or directly:
+  ```bash
+  docker run --rm -p 8088:8088 \
+    --device=/dev/kfd --device=/dev/dri \
+    --group-add video --group-add render \
+    --security-opt seccomp=unconfined --ipc=host \
+    -v /path/to/models:/models:ro \
+    ghcr.io/metaspartan/rad:latest serve -m /models/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf --port 8088
+  ```
+- **Debian / Ubuntu (`.deb`):**
+  Download `rad_<version>_amd64.deb` from GitHub Releases (built automatically by `.github/workflows/release.yml` on `v*` tags) or build locally:
+  ```bash
+  bash packaging/deb/build_deb.sh 0.1.0
+  sudo dpkg -i dist/rad_0.1.0_amd64.deb
+  ```
+- **Homebrew (Linuxbrew):**
+  ```bash
+  brew install --build-from-source packaging/homebrew/rad.rb
+  ```
+- **Flatpak:**
+  ```bash
+  flatpak-builder --user --install --force-clean build-dir packaging/flatpak/io.github.metaspartan.RAD.yml
+  ```
 
 ---
 
