@@ -1192,7 +1192,181 @@ extern "C" int ink_rmsnorm_batch(hipStream_t s, const float* X, const float* w, 
     rmsnorm_batch_k<<<dim3(B), dim3(256), 0, s>>>(X, w, Y, n, eps);
     return 0;
 }
+template<int NQ>
+__global__ void mix_batch_f4_k(const float* __restrict__ blocks,
+                               int n_blocks, int max_B,
+                               const float* __restrict__ cur,
+                               const float* __restrict__ query,
+                               const float* __restrict__ w0,
+                               const float* __restrict__ w1,
+                               const float* __restrict__ w2,
+                               float* __restrict__ out,
+                               int n_embd, float eps) {
+    int t = blockIdx.x;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    int e4 = n_embd >> 2;
+    int n_states = n_blocks + 1;
+    const float4* cur4 = reinterpret_cast<const float4*>(cur + (size_t)t * n_embd);
+
+    __shared__ float red_ss[16][8];
+    __shared__ float red_dot[NQ][16][8];
+    __shared__ float scores[NQ][16];
+    __shared__ float red_out[NQ][8];
+    __shared__ float inv_out[NQ];
+
+    for (int s = 0; s < n_states; ++s) {
+        const float4* sv4 = (s < n_blocks)
+            ? reinterpret_cast<const float4*>(blocks + ((size_t)s * max_B + t) * n_embd)
+            : cur4;
+        float ss = 0.0f;
+        float dot[NQ];
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) dot[q] = 0.0f;
+        for (int j = tid; j < e4; j += 256) {
+            float4 v = sv4[j];
+            ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                float4 qv = reinterpret_cast<const float4*>(query + (size_t)q * n_embd)[j];
+                dot[q] = fmaf(v.x, qv.x, fmaf(v.y, qv.y, fmaf(v.z, qv.z, fmaf(v.w, qv.w, dot[q]))));
+            }
+        }
+        ss = b_warp_sum32(ss);
+        if (lane == 0) red_ss[s][wid] = ss;
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) {
+            float dq = b_warp_sum32(dot[q]);
+            if (lane == 0) red_dot[q][s][wid] = dq;
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float inv_sqrt_d = rsqrtf((float)n_embd);
+        float invs[16];
+        for (int s = 0; s < n_states; ++s) {
+            float tot_ss = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) tot_ss += red_ss[s][w];
+            invs[s] = rsqrtf(tot_ss / (float)n_embd + 1e-6f);
+        }
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) {
+            float mx = -1e30f;
+            for (int s = 0; s < n_states; ++s) {
+                float tot_d = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 8; ++w) tot_d += red_dot[q][s][w];
+                float sc = tot_d * invs[s] * inv_sqrt_d;
+                scores[q][s] = sc;
+                mx = fmaxf(mx, sc);
+            }
+            float sum = 0.0f;
+            for (int s = 0; s < n_states; ++s) {
+                float e = expf(scores[q][s] - mx);
+                scores[q][s] = e;
+                sum += e;
+            }
+            float inv_sum = 1.0f / sum;
+            for (int s = 0; s < n_states; ++s) {
+                scores[q][s] *= inv_sum * invs[s];
+            }
+        }
+    }
+    __syncthreads();
+
+    float4 acc[NQ][3];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+#pragma unroll
+        for (int p = 0; p < 3; ++p) acc[q][p] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    for (int s = 0; s < n_states; ++s) {
+        const float4* sv4 = (s < n_blocks)
+            ? reinterpret_cast<const float4*>(blocks + ((size_t)s * max_B + t) * n_embd)
+            : cur4;
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            int j = tid + p * 256;
+            if (j < e4) {
+                float4 v = sv4[j];
+#pragma unroll
+                for (int q = 0; q < NQ; ++q) {
+                    float sc = scores[q][s];
+                    acc[q][p].x = fmaf(sc, v.x, acc[q][p].x);
+                    acc[q][p].y = fmaf(sc, v.y, acc[q][p].y);
+                    acc[q][p].z = fmaf(sc, v.z, acc[q][p].z);
+                    acc[q][p].w = fmaf(sc, v.w, acc[q][p].w);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+        float oss = 0.0f;
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            if (tid + p * 256 < e4) {
+                float4 a = acc[q][p];
+                oss = fmaf(a.x, a.x, fmaf(a.y, a.y, fmaf(a.z, a.z, fmaf(a.w, a.w, oss))));
+            }
+        }
+        oss = b_warp_sum32(oss);
+        if (lane == 0) red_out[q][wid] = oss;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) {
+            float tot = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) tot += red_out[q][w];
+            inv_out[q] = rsqrtf(tot / (float)n_embd + eps);
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+        const float* nw = (q == 0) ? w0 : ((q == 1) ? w1 : w2);
+        float4* ov4 = reinterpret_cast<float4*>(out + ((size_t)q * max_B + t) * n_embd);
+        if (nw) {
+            const float4* nw4 = reinterpret_cast<const float4*>(nw);
+            float io = inv_out[q];
+#pragma unroll
+            for (int p = 0; p < 3; ++p) {
+                int j = tid + p * 256;
+                if (j < e4) {
+                    float4 a = acc[q][p];
+                    float4 w = nw4[j];
+                    ov4[j] = make_float4(a.x * io * w.x, a.y * io * w.y, a.z * io * w.z, a.w * io * w.w);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int p = 0; p < 3; ++p) {
+                int j = tid + p * 256;
+                if (j < e4) ov4[j] = acc[q][p];
+            }
+        }
+    }
+}
+
 extern "C" int ink_mix_batch(hipStream_t s, const float* blocks, int n_blocks, int max_B, const float* cur, const float* query, const float* w0, const float* w1, const float* w2, float* out, int n_embd, int n_queries, int B, float eps) {
+    if ((n_embd & 3) == 0 && n_embd <= 3072 && n_blocks < 16) {
+        if (n_queries == 3) {
+            mix_batch_f4_k<3><<<dim3(B), dim3(256), 0, s>>>(blocks, n_blocks, max_B, cur, query, w0, w1, w2, out, n_embd, eps);
+            return 0;
+        }
+        if (n_queries == 1) {
+            mix_batch_f4_k<1><<<dim3(B), dim3(256), 0, s>>>(blocks, n_blocks, max_B, cur, query, w0, w1, w2, out, n_embd, eps);
+            return 0;
+        }
+    }
     mix_batch_k<<<dim3(n_queries, B), dim3(256), 0, s>>>(blocks, n_blocks, max_B, cur, query, w0, w1, w2, out, n_embd, n_queries, eps);
     return 0;
 }

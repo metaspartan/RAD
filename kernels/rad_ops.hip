@@ -1875,9 +1875,10 @@ extern "C" __global__ void rmsnorm_multi_inplace_k(float* __restrict__ out0,
     }
 }
 
+extern "C" int ink_mix_batch(hipStream_t s, const float* blocks, int n_blocks, int max_B, const float* cur, const float* query, const float* w0, const float* w1, const float* w2, float* out, int n_embd, int n_queries, int B, float eps);
+
 extern "C" int ink_mix_rmsnorm(hipStream_t s, const float* blocks, int n_blocks, const float* cur, const float* query, const float* w0, const float* w1, const float* w2, float* out, int n_embd, int n_queries, float eps) {
-    mix_rmsnorm_k<<<dim3(n_queries), dim3(256), 0, s>>>(blocks, n_blocks, cur, query, w0, w1, w2, out, n_embd, eps);
-    return 0;
+    return ink_mix_batch(s, blocks, n_blocks, 1, cur, query, w0, w1, w2, out, n_embd, n_queries, 1, eps);
 }
 
 extern "C" int ink_loop_ctrl_3_norm(hipStream_t s, const float* cur0, const float* cur1, const float* cur2, const float* msgs, const float* wd0, const float* wd1, const float* wd2, const float* wg0, const float* wg1, const float* wg2, const float* wf0, const float* wf1, const float* wf2, const float* nw0, const float* nw1, const float* nw2, float* h_buf, float* out0, float* out1, float* out2, int n_embd, int rank, float eps) {
