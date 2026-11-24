@@ -1811,7 +1811,7 @@ extern "C" int ink_qkvrg_gemm_q4_wmma(hipStream_t s, const uint8_t* wq, const ui
         qkvrg_gemm_q4_wmma_k<<<dim3((qkv_rows + 63) / 64, (B + 31) / 32), dim3(128), 0, s>>>(wq, wk, wv, wr, wg, (const w_q8_1_blk*)Xq0, (const w_q8_1_blk*)Xq1, (const w_q8_1_blk*)Xq2, Q, K, V, R, G, k, q_dim, kv_dim, r_dim, B);
     }
     int sd_rows = n_head + 2 * dyn_dim;
-    if (B >= 16 && (k & 31) == 0 && n_head <= 32 && dyn_dim <= 16) {
+    if (B >= 8 && (k & 31) == 0 && n_head <= 32 && dyn_dim <= 16) {
         int n_parts = (dyn_dim > 0) ? 4 : ((n_head > 16) ? 2 : 1);
         sink_dyn_bf16_wmma_k<<<dim3(n_parts, (B + 63) / 64), dim3(128), 0, s>>>(wsink, wkdyn, wvdyn, X0, X1, X2, S, Kdyn, Vdyn, k, n_head, dyn_dim, B);
     } else {

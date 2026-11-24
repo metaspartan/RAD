@@ -713,6 +713,139 @@ extern "C" __global__ void loop_ctrl_up_norm_b_k(const float* __restrict__ cur0,
     }
 }
 
+extern "C" __global__ void batch_hist_update_3_k(const float* __restrict__ raw,
+                                                 float* __restrict__ hist,
+                                                 int dim, int B) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= dim) return;
+    float* hc = hist + (size_t)c * 3;
+    float h0 = hc[0], h1 = hc[1], h2 = hc[2];
+    if (B >= 3) {
+        hc[0] = raw[(size_t)(B - 3) * dim + c];
+        hc[1] = raw[(size_t)(B - 2) * dim + c];
+        hc[2] = raw[(size_t)(B - 1) * dim + c];
+    } else if (B == 2) {
+        hc[0] = h2;
+        hc[1] = raw[c];
+        hc[2] = raw[(size_t)dim + c];
+    } else if (B == 1) {
+        hc[0] = h1;
+        hc[1] = h2;
+        hc[2] = raw[c];
+    }
+}
+
+extern "C" __global__ void kv_conv_qkvr_store_pf_b_k(float* __restrict__ Q,
+                                                        const float* __restrict__ K_raw,
+                                                        const float* __restrict__ V_raw,
+                                                        float* __restrict__ R,
+                                                        const float* __restrict__ k_conv_w,
+                                                        const float* __restrict__ v_conv_w,
+                                                        const float* __restrict__ k_dyn,
+                                                        const float* __restrict__ v_dyn,
+                                                        const float* __restrict__ k_hist,
+                                                        const float* __restrict__ v_hist,
+                                                        const float* __restrict__ q_clip,
+                                                        const float* __restrict__ rel_clip,
+                                                        __half* __restrict__ k_cache,
+                                                        __half* __restrict__ v_cache,
+                                                        const int* __restrict__ d_pos0,
+                                                        int is_swa, int n_head, int n_head_kv,
+                                                        int dh, int d_rel, int max_ctx,
+                                                        float qk_thresh, float rel_thresh,
+                                                        float log_floor, float log_alpha) {
+    int h = blockIdx.x;
+    int t = blockIdx.y;
+    int lane = threadIdx.x;
+    int pos0 = *d_pos0;
+    int pos = pos0 + t;
+    int q_dim = n_head * dh;
+    int kv_dim = n_head_kv * dh;
+    int r_dim = n_head * d_rel;
+    int dyn_dim = n_head_kv * 4;
+
+    if (h < n_head) {
+        float tau = 1.0f;
+        if (!is_swa) {
+            float ratio = ((float)pos + 1.0f) / log_floor;
+            if (ratio < 1.0f) ratio = 1.0f;
+            tau = 1.0f + log_alpha * logf(ratio);
+        }
+        const float* qch = q_clip + (size_t)h * dh;
+        const float* rch = rel_clip + (size_t)h * d_rel;
+        float* qh = Q + (size_t)t * q_dim + (size_t)h * dh;
+        float q0 = qh[lane] * qch[lane];
+        float q1 = qh[lane + 32] * qch[lane + 32];
+        float q2 = qh[lane + 64] * qch[lane + 64];
+        float q3 = qh[lane + 96] * qch[lane + 96];
+        float ss = b_warp_sum32(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+        float factor = fminf(1.0f, qk_thresh / (sqrtf(__shfl(ss, 0, 32)) + 1e-6f)) * tau;
+        qh[lane] = q0 * factor;
+        qh[lane + 32] = q1 * factor;
+        qh[lane + 64] = q2 * factor;
+        qh[lane + 96] = q3 * factor;
+
+        float* rh = R + (size_t)t * r_dim + (size_t)h * d_rel;
+        float rv = (lane < d_rel) ? (rh[lane] * rch[lane]) : 0.0f;
+        float rss = b_warp_sum32(rv * rv);
+        float rfactor = fminf(1.0f, rel_thresh / (sqrtf(__shfl(rss, 0, 32)) + 1e-6f)) * tau;
+        if (lane < d_rel) rh[lane] = rv * rfactor;
+    } else if (h < n_head + n_head_kv) {
+        int kh_idx = h - n_head;
+        float sc = k_dyn ? rsqrtf(9.0f) : rsqrtf(5.0f);
+        float kd0 = 0.f, kd1 = 0.f, kd2 = 0.f, kd3 = 0.f;
+        float vd0 = 0.f, vd1 = 0.f, vd2 = 0.f, vd3 = 0.f;
+        if (k_dyn) {
+            const float* dk = k_dyn + (size_t)t * dyn_dim + (size_t)kh_idx * 4;
+            const float* dv = v_dyn + (size_t)t * dyn_dim + (size_t)kh_idx * 4;
+            kd0 = dk[0]; kd1 = dk[1]; kd2 = dk[2]; kd3 = dk[3];
+            vd0 = dv[0]; vd1 = dv[1]; vd2 = dv[2]; vd3 = dv[3];
+        }
+        float kv_v[4], vv_v[4];
+        float kss = 0.0f, vss = 0.0f;
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            int c = kh_idx * dh + lane + p * 32;
+            float kx = K_raw[(size_t)t * kv_dim + c];
+            float kh2 = (t >= 1) ? K_raw[(size_t)(t - 1) * kv_dim + c] : k_hist[c * 3 + 2];
+            float kh1 = (t >= 2) ? K_raw[(size_t)(t - 2) * kv_dim + c] : k_hist[c * 3 + 1 + t];
+            float kh0 = (t >= 3) ? K_raw[(size_t)(t - 3) * kv_dim + c] : k_hist[c * 3 + t];
+            const float* kwc = k_conv_w + (size_t)c * 4;
+            float kacc = kwc[0] * kh0 + kwc[1] * kh1 + kwc[2] * kh2 + kwc[3] * kx;
+            if (k_dyn) kacc += kd0 * kx + kd1 * kh2 + kd2 * kh1 + kd3 * kh0;
+            float kout = (kx + kacc) * sc;
+            kv_v[p] = kout;
+            kss += kout * kout;
+
+            float vx = V_raw[(size_t)t * kv_dim + c];
+            float vh2 = (t >= 1) ? V_raw[(size_t)(t - 1) * kv_dim + c] : v_hist[c * 3 + 2];
+            float vh1 = (t >= 2) ? V_raw[(size_t)(t - 2) * kv_dim + c] : v_hist[c * 3 + 1 + t];
+            float vh0 = (t >= 3) ? V_raw[(size_t)(t - 3) * kv_dim + c] : v_hist[c * 3 + t];
+            const float* vwc = v_conv_w + (size_t)c * 4;
+            float vacc = vwc[0] * vh0 + vwc[1] * vh1 + vwc[2] * vh2 + vwc[3] * vx;
+            if (v_dyn) vacc += vd0 * vx + vd1 * vh2 + vd2 * vh1 + vd3 * vh0;
+            float vout = (vx + vacc) * sc;
+            vv_v[p] = vout;
+            vss += vout * vout;
+        }
+        kss = b_warp_sum32(kss);
+        vss = b_warp_sum32(vss);
+        float kfac = fminf(1.0f, qk_thresh / (sqrtf(__shfl(kss, 0, 32)) + 1e-6f));
+        float vinv = rsqrtf(__shfl(vss, 0, 32) / (float)dh + 1e-6f);
+        int slot = is_swa ? (pos % max_ctx) : pos;
+        __half* kdst = k_cache + ((size_t)kh_idx * max_ctx + slot) * dh;
+        __half* vdst = v_cache + ((size_t)kh_idx * max_ctx + slot) * dh;
+        kdst[lane] = __float2half(kv_v[0] * kfac);
+        kdst[lane + 32] = __float2half(kv_v[1] * kfac);
+        kdst[lane + 64] = __float2half(kv_v[2] * kfac);
+        kdst[lane + 96] = __float2half(kv_v[3] * kfac);
+        vdst[lane] = __float2half(vv_v[0] * vinv);
+        vdst[lane + 32] = __float2half(vv_v[1] * vinv);
+        vdst[lane + 64] = __float2half(vv_v[2] * vinv);
+        vdst[lane + 96] = __float2half(vv_v[3] * vinv);
+    }
+}
+
 extern "C" __global__ void kv_conv_qkvr_store_batch_k(float* __restrict__ Q,
                                                       const float* __restrict__ K_raw,
                                                       const float* __restrict__ V_raw,
@@ -941,6 +1074,31 @@ extern "C" __global__ void inkling_attn_batch_gated_k(const float* __restrict__ 
         oh[d1] = (go1 * inv_l) / (1.0f + expf(-gh[d1]));
         oh[d2] = (go2 * inv_l) / (1.0f + expf(-gh[d2]));
         oh[d3] = (go3 * inv_l) / (1.0f + expf(-gh[d3]));
+    }
+}
+
+extern "C" __global__ void shortconv_res_pf_b_k(const float* __restrict__ raw,
+                                                   const float* __restrict__ conv_w,
+                                                   const float* __restrict__ hist,
+                                                   const float* __restrict__ add_src,
+                                                   float* __restrict__ block_dst,
+                                                   float* __restrict__ out,
+                                                   int n_embd) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    if (c >= n_embd) return;
+    size_t idx = (size_t)t * n_embd + c;
+    float x = raw[idx];
+    float h2 = (t >= 1) ? raw[(size_t)(t - 1) * n_embd + c] : hist[(size_t)c * 3 + 2];
+    float h1 = (t >= 2) ? raw[(size_t)(t - 2) * n_embd + c] : hist[(size_t)c * 3 + 1 + t];
+    float h0 = (t >= 3) ? raw[(size_t)(t - 3) * n_embd + c] : hist[(size_t)c * 3 + t];
+    const float* wc = conv_w + (size_t)c * 4;
+    float conv_out = (x + wc[0] * h0 + wc[1] * h1 + wc[2] * h2 + wc[3] * x) * rsqrtf(5.0f);
+    if (block_dst) {
+        block_dst[idx] = add_src[idx];
+        out[idx] = conv_out;
+    } else {
+        out[idx] = add_src[idx] + conv_out;
     }
 }
 
@@ -1219,6 +1377,63 @@ extern "C" __global__ void moe_dn_q8_0_batch_k(const uint8_t* __restrict__ W,
         total = fmaf(v, w, total);
     }
     if (lane == 0) y_out[(size_t)bt * n_embd + row] = total;
+}
+
+__device__ float g_b_softcap_max_v[64 * 32];
+__device__ int g_b_softcap_max_i[64 * 32];
+
+extern "C" __global__ void softcap_argmax_batch_p1_k(float* __restrict__ logits,
+                                                     float cap, int vocab_padded, int n_unpadded) {
+    int sp = blockIdx.x;
+    int bt = blockIdx.y;
+    int tid = threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    float* lg = logits + (size_t)bt * vocab_padded;
+    float bv = -1e30f;
+    int bi = 0;
+    for (int i = sp * blockDim.x + tid; i < n_unpadded; i += stride) {
+        float v = lg[i];
+        if (cap > 0.0f) {
+            v = cap * tanhf(v / cap);
+            lg[i] = v;
+        }
+        if (v > bv) { bv = v; bi = i; }
+    }
+    __shared__ float rv[8];
+    __shared__ int ri[8];
+    int lane = tid & 31;
+    int wid = tid >> 5;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down(bv, off, 32);
+        int oi = __shfl_down(bi, off, 32);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if (lane == 0) { rv[wid] = bv; ri[wid] = bi; }
+    __syncthreads();
+    if (tid == 0) {
+        float m = rv[0];
+        int mi = ri[0];
+        for (int i = 1; i < 8; ++i) {
+            if (rv[i] > m || (rv[i] == m && ri[i] < mi)) { m = rv[i]; mi = ri[i]; }
+        }
+        g_b_softcap_max_v[bt * 32 + sp] = m;
+        g_b_softcap_max_i[bt * 32 + sp] = mi;
+    }
+}
+
+extern "C" __global__ void softcap_argmax_batch_p2_k(int* __restrict__ out_toks) {
+    int bt = blockIdx.x;
+    int lane = threadIdx.x;
+    float v = g_b_softcap_max_v[bt * 32 + lane];
+    int idx = g_b_softcap_max_i[bt * 32 + lane];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down(v, off, 32);
+        int oi = __shfl_down(idx, off, 32);
+        if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
+    }
+    if (lane == 0) out_toks[bt] = idx;
 }
 
 extern "C" __global__ void softcap_argmax_batch_k(float* __restrict__ logits,
@@ -1836,6 +2051,13 @@ extern "C" int ink_loop_ctrl_1_norm_batch(hipStream_t s, const float* cur, const
     return 0;
 }
 extern "C" int ink_kv_conv_qkvr_store_batch(hipStream_t s, float* Q, const float* K_raw, const float* V_raw, float* R, const float* k_conv_w, const float* v_conv_w, const float* k_dyn, const float* v_dyn, float* k_hist, float* v_hist, const float* q_clip, const float* rel_clip, __half* k_cache, __half* v_cache, const int* d_pos0, int B, int is_swa, int n_head, int n_head_kv, int dh, int d_rel, int max_ctx, float qk_thresh, float rel_thresh, float log_floor, float log_alpha) {
+    if (B > 16) {
+        kv_conv_qkvr_store_pf_b_k<<<dim3(n_head + n_head_kv, B), dim3(32), 0, s>>>(Q, K_raw, V_raw, R, k_conv_w, v_conv_w, k_dyn, v_dyn, k_hist, v_hist, q_clip, rel_clip, k_cache, v_cache, d_pos0, is_swa, n_head, n_head_kv, dh, d_rel, max_ctx, qk_thresh, rel_thresh, log_floor, log_alpha);
+        int kv_dim = n_head_kv * dh;
+        batch_hist_update_3_k<<<dim3((kv_dim + 255) / 256), dim3(256), 0, s>>>(K_raw, k_hist, kv_dim, B);
+        batch_hist_update_3_k<<<dim3((kv_dim + 255) / 256), dim3(256), 0, s>>>(V_raw, v_hist, kv_dim, B);
+        return 0;
+    }
     kv_conv_qkvr_store_batch_k<<<dim3(n_head + n_head_kv), dim3(32), 0, s>>>(Q, K_raw, V_raw, R, k_conv_w, v_conv_w, k_dyn, v_dyn, k_hist, v_hist, q_clip, rel_clip, k_cache, v_cache, d_pos0, B, is_swa, n_head, n_head_kv, dh, d_rel, max_ctx, qk_thresh, rel_thresh, log_floor, log_alpha);
     return 0;
 }
@@ -1844,6 +2066,11 @@ extern "C" int ink_attn_batch_gated(hipStream_t s, const float* Q, const float* 
     return 0;
 }
 extern "C" int ink_shortconv_res_batch(hipStream_t s, const float* raw, const float* conv_w, float* hist, const float* add_src, float* block_dst, float* out, int n_embd, int B) {
+    if (B > 16) {
+        shortconv_res_pf_b_k<<<dim3((n_embd + 255) / 256, B), dim3(256), 0, s>>>(raw, conv_w, hist, add_src, block_dst, out, n_embd);
+        batch_hist_update_3_k<<<dim3((n_embd + 255) / 256), dim3(256), 0, s>>>(raw, hist, n_embd, B);
+        return 0;
+    }
     shortconv_res_batch_k<<<dim3((n_embd + 255) / 256), dim3(256), 0, s>>>(raw, conv_w, hist, add_src, block_dst, out, n_embd, B);
     return 0;
 }
@@ -2050,6 +2277,11 @@ extern "C" int ink_moe_dn_q8_0_batch(hipStream_t s, const uint8_t* W, const floa
     return 0;
 }
 extern "C" int ink_softcap_argmax_batch(hipStream_t s, float* logits, float cap, int vocab_padded, int n_unpadded, int* out_toks, int B) {
+    if (B <= 64) {
+        softcap_argmax_batch_p1_k<<<dim3(32, B), dim3(256), 0, s>>>(logits, cap, vocab_padded, n_unpadded);
+        softcap_argmax_batch_p2_k<<<dim3(B), dim3(32), 0, s>>>(out_toks);
+        return 0;
+    }
     softcap_argmax_batch_k<<<dim3(B), dim3(256), 0, s>>>(logits, cap, vocab_padded, n_unpadded, out_toks);
     return 0;
 }

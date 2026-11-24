@@ -890,6 +890,81 @@ extern "C" __global__ void copy_f32_k(const float* __restrict__ src,
     if (i < n) dst[i] = src[i];
 }
 
+__device__ float g_softcap_max_v[64];
+__device__ int g_softcap_max_i[64];
+
+extern "C" __global__ void softcap_argmax_p1_k(float* __restrict__ logits,
+                                               float cap, int n_unpadded) {
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    float bv = -1e30f;
+    int bi = 0;
+    for (int i = bid * blockDim.x + tid; i < n_unpadded; i += stride) {
+        float v = logits[i];
+        if (cap > 0.0f) {
+            v = cap * tanhf(v / cap);
+            logits[i] = v;
+        }
+        if (v > bv) {
+            bv = v;
+            bi = i;
+        }
+    }
+    __shared__ float rv[8];
+    __shared__ int ri[8];
+    int lane = tid & 31;
+    int wid = tid >> 5;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down(bv, off, 32);
+        int oi = __shfl_down(bi, off, 32);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    if (lane == 0) {
+        rv[wid] = bv;
+        ri[wid] = bi;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float m = rv[0];
+        int mi = ri[0];
+        for (int i = 1; i < 8; ++i) {
+            if (rv[i] > m || (rv[i] == m && ri[i] < mi)) {
+                m = rv[i];
+                mi = ri[i];
+            }
+        }
+        g_softcap_max_v[bid] = m;
+        g_softcap_max_i[bid] = mi;
+    }
+}
+
+extern "C" __global__ void softcap_argmax_p2_k(int* __restrict__ out_tok) {
+    int tid = threadIdx.x;
+    float v = g_softcap_max_v[tid];
+    int idx = g_softcap_max_i[tid];
+    float v2 = g_softcap_max_v[tid + 32];
+    int idx2 = g_softcap_max_i[tid + 32];
+    if (v2 > v || (v2 == v && idx2 < idx)) {
+        v = v2;
+        idx = idx2;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down(v, off, 32);
+        int oi = __shfl_down(idx, off, 32);
+        if (ov > v || (ov == v && oi < idx)) {
+            v = ov;
+            idx = oi;
+        }
+    }
+    if (tid == 0) *out_tok = idx;
+}
+
 extern "C" __global__ void softcap_argmax_k(float* __restrict__ logits,
                                             float cap, int n_unpadded,
                                             int* __restrict__ out_tok) {
@@ -1043,7 +1118,8 @@ extern "C" int ink_copy_f32(hipStream_t s, const float* src, float* dst, int n) 
 }
 
 extern "C" int ink_softcap_argmax(hipStream_t s, float* logits, float cap, int n_unpadded, int* out_tok) {
-    softcap_argmax_k<<<dim3(1), dim3(256), 0, s>>>(logits, cap, n_unpadded, out_tok);
+    softcap_argmax_p1_k<<<dim3(64), dim3(256), 0, s>>>(logits, cap, n_unpadded);
+    softcap_argmax_p2_k<<<dim3(1), dim3(32), 0, s>>>(out_tok);
     return 0;
 }
 
