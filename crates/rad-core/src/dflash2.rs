@@ -31,6 +31,25 @@ fn load_st_f32(st: &SafetensorsFile, name: &str) -> Result<DevBuf> {
     Ok(dst)
 }
 
+fn load_st_linear_q8(st: &SafetensorsFile, name: &str) -> Result<DevWeight> {
+    let (t, bytes) = st.tensor_bytes(name)?;
+    if t.shape.len() != 2 {
+        return Err(anyhow!("expected 2D tensor for {name}, got {:?}", t.shape));
+    }
+    let n = t.shape[0];
+    let k = t.shape[1];
+    let nblk = k / 32;
+    let mut src = DevBuf::new(bytes.len()).map_err(he)?;
+    src.copy_from(bytes, None).map_err(he)?;
+    let dst = DevBuf::new(n * nblk * 34).map_err(he)?;
+    unsafe {
+        ops::ink_bf16_to_q8_0(std::ptr::null_mut(), src.ptr as *const u16, dst.ptr as *mut u8, n, nblk as i32);
+        rad_hip::hipStreamSynchronize(std::ptr::null_mut());
+    }
+    drop(src);
+    Ok(DevWeight { buf: dst, ty: WeightType::Q8_0, n: n as i32, k: k as i32 })
+}
+
 fn load_st_linear(st: &SafetensorsFile, name: &str, to_q4: bool) -> Result<DevWeight> {
     let (t, bytes) = st.tensor_bytes(name)?;
     if t.shape.len() != 2 {
@@ -193,7 +212,7 @@ impl DFlash2Drafter {
                 max_ctx: l_ctx,
                 input_norm: load_st_f32(&st, &p("input_layernorm.weight"))?,
                 attn_conv_base: load_st_f32(&st, &p("attention_conv.base_kernel"))?,
-                attn_conv_proj: load_st_linear(&st, &p("attention_conv.kernel_projection.weight"), false)?,
+                attn_conv_proj: load_st_linear_q8(&st, &p("attention_conv.kernel_projection.weight"))?,
                 wq: load_st_linear(&st, &p("self_attn.q_proj.weight"), q4_draft)?,
                 wk: load_st_linear(&st, &p("self_attn.k_proj.weight"), q4_draft)?,
                 wv: load_st_linear(&st, &p("self_attn.v_proj.weight"), q4_draft)?,
@@ -202,7 +221,7 @@ impl DFlash2Drafter {
                 k_norm: load_st_f32(&st, &p("self_attn.k_norm.weight"))?,
                 post_attn_norm: load_st_f32(&st, &p("post_attention_layernorm.weight"))?,
                 mlp_conv_base: load_st_f32(&st, &p("mlp_conv.base_kernel"))?,
-                mlp_conv_proj: load_st_linear(&st, &p("mlp_conv.kernel_projection.weight"), false)?,
+                mlp_conv_proj: load_st_linear_q8(&st, &p("mlp_conv.kernel_projection.weight"))?,
                 gate_proj: load_st_linear(&st, &p("mlp.gate_proj.weight"), q4_draft)?,
                 up_proj: load_st_linear(&st, &p("mlp.up_proj.weight"), q4_draft)?,
                 down_proj: load_st_linear(&st, &p("mlp.down_proj.weight"), q4_draft)?,
@@ -248,7 +267,7 @@ impl DFlash2Drafter {
             fc: load_st_linear(&st, "fc.weight", q4_draft)?,
             hidden_norm: load_st_f32(&st, "hidden_norm.weight")?,
             output_norm: load_st_f32(&st, "norm.weight")?,
-            sel_hidden_proj: load_st_linear(&st, "candidate_selector.hidden_projection.weight", false)?,
+            sel_hidden_proj: load_st_linear_q8(&st, "candidate_selector.hidden_projection.weight")?,
             sel_pred_cb: load_st_bf16_raw(&st, "candidate_selector.predecessor_codebook")?,
             sel_succ_cb: load_st_bf16_raw(&st, "candidate_selector.successor_codebook")?,
             layers,
@@ -456,7 +475,7 @@ impl DFlash2Drafter {
 
         for l in &self.layers {
             ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, l.input_norm.ptr as *const f32, self.x_norm.ptr as *mut f32, e, tot_b, self.eps);
-            if l.attn_conv_proj.ty == WeightType::Q4_0 {
+            if l.attn_conv_proj.ty != WeightType::Bf16 {
                 ops::ink_quantize_q8_1(s, self.x_norm.ptr as *const f32, self.xq.ptr, e, tot_b);
             }
             self.gemm_w(s, &l.attn_conv_proj, self.x_norm.ptr as *const f32, self.xq.ptr, self.dyn_buf.ptr as *mut f32, dyn_dim, e, tot_b);
@@ -545,7 +564,7 @@ impl DFlash2Drafter {
             ops::ink_vec_add(s, self.x.ptr as *const f32, self.x_conv.ptr as *const f32, self.x.ptr as *mut f32, tot_b * e);
 
             ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, l.post_attn_norm.ptr as *const f32, self.x_norm.ptr as *mut f32, e, tot_b, self.eps);
-            if l.mlp_conv_proj.ty == WeightType::Q4_0 {
+            if l.mlp_conv_proj.ty != WeightType::Bf16 {
                 ops::ink_quantize_q8_1(s, self.x_norm.ptr as *const f32, self.xq.ptr, e, tot_b);
             }
             self.gemm_w(s, &l.mlp_conv_proj, self.x_norm.ptr as *const f32, self.xq.ptr, self.dyn_buf.ptr as *mut f32, dyn_dim, e, tot_b);
@@ -641,25 +660,18 @@ impl DFlash2Drafter {
             target.tok_embd_ptr(),
             target.tok_norm_ptr(),
             self.d_draft_toks.ptr as *const i32,
+            self.anchors_emb.ptr as *mut f32,
+            e,
+        );
+        ops::ink_dspark_init_multi(
+            s,
+            self.anchors_emb.ptr as *const f32,
+            self.mask_embd.ptr as *const f32,
             self.x.ptr as *mut f32,
             e,
+            1,
+            k_len as i32,
         );
-        ops::ink_embed_q8_0_norm(
-            s,
-            target.tok_embd_ptr(),
-            target.tok_norm_ptr(),
-            self.d_mask_tok.ptr as *const i32,
-            self.mask_embd.ptr as *mut f32,
-            e,
-        );
-        for slot in 1..k_len {
-            ops::ink_copy_f32(
-                s,
-                self.mask_embd.ptr as *const f32,
-                (self.x.ptr as *mut f32).add(slot * self.n_embd),
-                e,
-            );
-        }
         self.enqueue_backbone(s, 1, k_len, Some(seq));
         self.enqueue_head_and_selector(s, target, 1, k_len);
     }
@@ -678,14 +690,6 @@ impl DFlash2Drafter {
             e,
             nu,
         );
-        ops::ink_embed_q8_0_norm(
-            s,
-            target.tok_embd_ptr(),
-            target.tok_norm_ptr(),
-            self.d_mask_tok.ptr as *const i32,
-            self.mask_embd.ptr as *mut f32,
-            e,
-        );
         ops::ink_dspark_init_multi(
             s,
             self.anchors_emb.ptr as *const f32,
@@ -699,7 +703,22 @@ impl DFlash2Drafter {
         self.enqueue_head_and_selector(s, target, n_users, k_len);
     }
 
+    fn init_mask_embd(&self, target: &InklingEngine) {
+        unsafe {
+            ops::ink_embed_q8_0_norm(
+                self.stream,
+                target.tok_embd_ptr(),
+                target.tok_norm_ptr(),
+                self.d_mask_tok.ptr as *const i32,
+                self.mask_embd.ptr as *mut f32,
+                self.n_embd as i32,
+            );
+            rad_hip::hipStreamSynchronize(self.stream);
+        }
+    }
+
     pub fn capture_draft_graph(&mut self, target: &InklingEngine, k_len: usize) -> Result<()> {
+        self.init_mask_embd(target);
         let k_len = k_len.min(self.block_size);
         let g = unsafe { CapturedGraph::capture(|s| self.enqueue_draft_seq(s, target, 0, k_len)) }.map_err(he)?;
         self.draft_graph = Some((k_len, g));
@@ -771,6 +790,7 @@ impl DFlash2Drafter {
         let ctx_bytes = unsafe { std::slice::from_raw_parts(ctx_lens.as_ptr() as *const u8, n_users * 4) };
         let key = (n_users, k_len);
         if !self.multi_draft_graphs.contains_key(&key) {
+            self.init_mask_embd(target);
             let g = unsafe { CapturedGraph::capture(|s| self.enqueue_draft_multi(s, target, n_users, k_len)) }.map_err(he)?;
             self.multi_draft_graphs.insert(key, g);
         }

@@ -217,6 +217,39 @@ extern "C" __global__ void dflash2_select_path_k(const int* __restrict__ cand_id
     }
 }
 
+extern "C" __global__ void bf16_to_q8_0_k(const uint16_t* __restrict__ src,
+                                          uint8_t* __restrict__ dst,
+                                          size_t n_rows, int nblk) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = n_rows * (size_t)nblk;
+    if (idx >= total) return;
+    const uint16_t* sp = src + idx * 32;
+    uint8_t* dp = dst + idx * 34;
+    float vals[32];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        float v = df2_bf16_f32(sp[j]);
+        vals[j] = v;
+        amax = fmaxf(amax, fabsf(v));
+    }
+    float d = amax / 127.0f;
+    float inv = (d > 0.0f) ? (1.0f / d) : 0.0f;
+    __half dh = __float2half(d);
+    memcpy(dp, &dh, 2);
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        int q = max(-127, min(127, __float2int_rn(vals[j] * inv)));
+        dp[2 + j] = (uint8_t)(int8_t)q;
+    }
+}
+
+extern "C" int ink_bf16_to_q8_0(hipStream_t s, const uint16_t* src, uint8_t* dst, size_t n_rows, int nblk) {
+    size_t total = n_rows * (size_t)nblk;
+    bf16_to_q8_0_k<<<dim3((unsigned int)((total + 255) / 256)), dim3(256), 0, s>>>(src, dst, n_rows, nblk);
+    return 0;
+}
+
 extern "C" int ink_bf16_to_q4_0(hipStream_t s, const uint16_t* src, uint8_t* dst, size_t n_rows, int nblk) {
     size_t total = n_rows * (size_t)nblk;
     bf16_to_q4_0_k<<<dim3((unsigned int)((total + 255) / 256)), dim3(256), 0, s>>>(src, dst, n_rows, nblk);

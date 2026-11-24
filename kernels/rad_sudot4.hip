@@ -1390,6 +1390,32 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
         }
         return;
     }
+    if (cnt == 4) {
+        int t0i = tok_sorted[off0], s0i = slot_sorted[off0];
+        int t1i = tok_sorted[off0 + 1], s1i = slot_sorted[off0 + 1];
+        int t2i = tok_sorted[off0 + 2], s2i = slot_sorted[off0 + 2];
+        int t3i = tok_sorted[off0 + 3], s3i = slot_sorted[off0 + 3];
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (int b = lane4; b < nblk; b += 4) {
+            uint4 q4 = qrow[b];
+            float dw = __half2float(drow[b]);
+            a0 += dot_q4_soa_q8_1_blk(q4, dw, act_q[((size_t)t0i * n_used + s0i) * nblk + b]);
+            a1 += dot_q4_soa_q8_1_blk(q4, dw, act_q[((size_t)t1i * n_used + s1i) * nblk + b]);
+            a2 += dot_q4_soa_q8_1_blk(q4, dw, act_q[((size_t)t2i * n_used + s2i) * nblk + b]);
+            a3 += dot_q4_soa_q8_1_blk(q4, dw, act_q[((size_t)t3i * n_used + s3i) * nblk + b]);
+        }
+        float v0 = s_warp_sum4(a0) * wt_sorted[off0];
+        float v1 = s_warp_sum4(a1) * wt_sorted[off0 + 1];
+        float v2 = s_warp_sum4(a2) * wt_sorted[off0 + 2];
+        float v3 = s_warp_sum4(a3) * wt_sorted[off0 + 3];
+        if (lane4 == 0) {
+            atomicAdd(&y_out[(size_t)t0i * n_embd + row], v0);
+            atomicAdd(&y_out[(size_t)t1i * n_embd + row], v1);
+            atomicAdd(&y_out[(size_t)t2i * n_embd + row], v2);
+            atomicAdd(&y_out[(size_t)t3i * n_embd + row], v3);
+        }
+        return;
+    }
 
     for (int t0 = 0; t0 < cnt; t0 += 4) {
         int nt = min(4, cnt - t0);
@@ -2625,6 +2651,91 @@ extern "C" __global__ void moe_gu_q4_0_sudot4_to_q8_k(const uint8_t* __restrict_
         } else if (wid == 1) {
             size_t qidx = ((size_t)tid1 * n_used + sid1) * qblk_per_slot + blockIdx.x;
             store_q8_1_from_warp(sm_v[1][lane], lane, act_q + qidx, sm_q[1]);
+        }
+        return;
+    }
+    if (cnt == 3) {
+        int t0i = tok_sorted[off0], s0i = slot_sorted[off0];
+        int t1i = tok_sorted[off0 + 1], s1i = slot_sorted[off0 + 1];
+        int t2i = tok_sorted[off0 + 2], s2i = slot_sorted[off0 + 2];
+        float ag0 = 0.0f, au0 = 0.0f, ag1 = 0.0f, au1 = 0.0f, ag2 = 0.0f, au2 = 0.0f;
+        if (row < n_ff) {
+            for (int b = lane8; b < nblk; b += 8) {
+                uint4 qg = qg_row[b];
+                uint4 qu = qu_row[b];
+                float dg = __half2float(dg_row[b]);
+                float du = __half2float(du_row[b]);
+                const q8_1_blk xb0 = Xq[(size_t)t0i * nblk + b];
+                const q8_1_blk xb1 = Xq[(size_t)t1i * nblk + b];
+                const q8_1_blk xb2 = Xq[(size_t)t2i * nblk + b];
+                ag0 += dot_q4_soa_q8_1_blk(qg, dg, xb0); au0 += dot_q4_soa_q8_1_blk(qu, du, xb0);
+                ag1 += dot_q4_soa_q8_1_blk(qg, dg, xb1); au1 += dot_q4_soa_q8_1_blk(qu, du, xb1);
+                ag2 += dot_q4_soa_q8_1_blk(qg, dg, xb2); au2 += dot_q4_soa_q8_1_blk(qu, du, xb2);
+            }
+        }
+        float g0 = s_warp_sum8(ag0) * sc, u0 = s_warp_sum8(au0) * sc;
+        float g1 = s_warp_sum8(ag1) * sc, u1 = s_warp_sum8(au1) * sc;
+        float g2 = s_warp_sum8(ag2) * sc, u2 = s_warp_sum8(au2) * sc;
+        if (lane8 == 0) {
+            if (row < n_ff) {
+                sm_v[0][grp] = (beta * tanhf(g0 / beta) / (1.0f + expf(-g0))) * ((lb > 0.0f) ? (lb * tanhf(u0 / lb)) : u0);
+                sm_v[1][grp] = (beta * tanhf(g1 / beta) / (1.0f + expf(-g1))) * ((lb > 0.0f) ? (lb * tanhf(u1 / lb)) : u1);
+                sm_v[2][grp] = (beta * tanhf(g2 / beta) / (1.0f + expf(-g2))) * ((lb > 0.0f) ? (lb * tanhf(u2 / lb)) : u2);
+            } else {
+                sm_v[0][grp] = 0.0f; sm_v[1][grp] = 0.0f; sm_v[2][grp] = 0.0f;
+            }
+        }
+        __syncthreads();
+        if (wid < 3) {
+            int ti = (wid == 0) ? t0i : ((wid == 1) ? t1i : t2i);
+            int si = (wid == 0) ? s0i : ((wid == 1) ? s1i : s2i);
+            size_t qidx = ((size_t)ti * n_used + si) * qblk_per_slot + blockIdx.x;
+            store_q8_1_from_warp(sm_v[wid][lane], lane, act_q + qidx, sm_q[wid]);
+        }
+        return;
+    }
+    if (cnt == 4) {
+        int t0i = tok_sorted[off0], s0i = slot_sorted[off0];
+        int t1i = tok_sorted[off0 + 1], s1i = slot_sorted[off0 + 1];
+        int t2i = tok_sorted[off0 + 2], s2i = slot_sorted[off0 + 2];
+        int t3i = tok_sorted[off0 + 3], s3i = slot_sorted[off0 + 3];
+        float ag0 = 0.0f, au0 = 0.0f, ag1 = 0.0f, au1 = 0.0f, ag2 = 0.0f, au2 = 0.0f, ag3 = 0.0f, au3 = 0.0f;
+        if (row < n_ff) {
+            for (int b = lane8; b < nblk; b += 8) {
+                uint4 qg = qg_row[b];
+                uint4 qu = qu_row[b];
+                float dg = __half2float(dg_row[b]);
+                float du = __half2float(du_row[b]);
+                const q8_1_blk xb0 = Xq[(size_t)t0i * nblk + b];
+                const q8_1_blk xb1 = Xq[(size_t)t1i * nblk + b];
+                const q8_1_blk xb2 = Xq[(size_t)t2i * nblk + b];
+                const q8_1_blk xb3 = Xq[(size_t)t3i * nblk + b];
+                ag0 += dot_q4_soa_q8_1_blk(qg, dg, xb0); au0 += dot_q4_soa_q8_1_blk(qu, du, xb0);
+                ag1 += dot_q4_soa_q8_1_blk(qg, dg, xb1); au1 += dot_q4_soa_q8_1_blk(qu, du, xb1);
+                ag2 += dot_q4_soa_q8_1_blk(qg, dg, xb2); au2 += dot_q4_soa_q8_1_blk(qu, du, xb2);
+                ag3 += dot_q4_soa_q8_1_blk(qg, dg, xb3); au3 += dot_q4_soa_q8_1_blk(qu, du, xb3);
+            }
+        }
+        float g0 = s_warp_sum8(ag0) * sc, u0 = s_warp_sum8(au0) * sc;
+        float g1 = s_warp_sum8(ag1) * sc, u1 = s_warp_sum8(au1) * sc;
+        float g2 = s_warp_sum8(ag2) * sc, u2 = s_warp_sum8(au2) * sc;
+        float g3 = s_warp_sum8(ag3) * sc, u3 = s_warp_sum8(au3) * sc;
+        if (lane8 == 0) {
+            if (row < n_ff) {
+                sm_v[0][grp] = (beta * tanhf(g0 / beta) / (1.0f + expf(-g0))) * ((lb > 0.0f) ? (lb * tanhf(u0 / lb)) : u0);
+                sm_v[1][grp] = (beta * tanhf(g1 / beta) / (1.0f + expf(-g1))) * ((lb > 0.0f) ? (lb * tanhf(u1 / lb)) : u1);
+                sm_v[2][grp] = (beta * tanhf(g2 / beta) / (1.0f + expf(-g2))) * ((lb > 0.0f) ? (lb * tanhf(u2 / lb)) : u2);
+                sm_v[3][grp] = (beta * tanhf(g3 / beta) / (1.0f + expf(-g3))) * ((lb > 0.0f) ? (lb * tanhf(u3 / lb)) : u3);
+            } else {
+                sm_v[0][grp] = 0.0f; sm_v[1][grp] = 0.0f; sm_v[2][grp] = 0.0f; sm_v[3][grp] = 0.0f;
+            }
+        }
+        __syncthreads();
+        if (wid < 4) {
+            int ti = (wid == 0) ? t0i : ((wid == 1) ? t1i : ((wid == 2) ? t2i : t3i));
+            int si = (wid == 0) ? s0i : ((wid == 1) ? s1i : ((wid == 2) ? s2i : s3i));
+            size_t qidx = ((size_t)ti * n_used + si) * qblk_per_slot + blockIdx.x;
+            store_q8_1_from_warp(sm_v[wid][lane], lane, act_q + qidx, sm_q[wid]);
         }
         return;
     }
