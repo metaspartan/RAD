@@ -192,25 +192,29 @@ extern "C" __global__ void dspark_attn_k(const float* __restrict__ Q,
     float m = -1e30f;
     float l = 0.0f;
     float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
-    int d0 = lane, d1 = lane + 32, d2 = lane + 64, d3 = lane + 96;
+    int p0 = lane * 2;
+    int p1 = lane * 2 + 64;
+    float q0a = qs[p0], q0b = qs[p0 + 1], q1a = qs[p1], q1b = qs[p1 + 1];
 
     for (int idx = wid; idx < total_kv; idx += nw) {
         float dot, v0, v1, v2, v3;
         if (idx < (ctx_len - t_start)) {
             int t = t_start + idx;
             int slot = is_swa ? (t % max_ctx) : t;
-            const __half* kt = kc_h + (size_t)slot * dh;
-            dot = qs[d0] * __half2float(kt[d0]) + qs[d1] * __half2float(kt[d1])
-                + qs[d2] * __half2float(kt[d2]) + qs[d3] * __half2float(kt[d3]);
-            const __half* vt = vc_h + (size_t)slot * dh;
-            v0 = __half2float(vt[d0]); v1 = __half2float(vt[d1]);
-            v2 = __half2float(vt[d2]); v3 = __half2float(vt[d3]);
+            const __half2* kt2 = reinterpret_cast<const __half2*>(kc_h + (size_t)slot * dh);
+            float2 k0 = __half22float2(kt2[lane]);
+            float2 k1 = __half22float2(kt2[lane + 32]);
+            dot = q0a * k0.x + q0b * k0.y + q1a * k1.x + q1b * k1.y;
+            const __half2* vt2 = reinterpret_cast<const __half2*>(vc_h + (size_t)slot * dh);
+            float2 vf0 = __half22float2(vt2[lane]);
+            float2 vf1 = __half22float2(vt2[lane + 32]);
+            v0 = vf0.x; v1 = vf0.y; v2 = vf1.x; v3 = vf1.y;
         } else {
             int bi = idx - (ctx_len - t_start);
             const float* kt = K_blk + ((size_t)bi * n_head_kv + kv_h) * dh;
-            dot = qs[d0] * kt[d0] + qs[d1] * kt[d1] + qs[d2] * kt[d2] + qs[d3] * kt[d3];
+            dot = q0a * kt[p0] + q0b * kt[p0 + 1] + q1a * kt[p1] + q1b * kt[p1 + 1];
             const float* vt = V_blk + ((size_t)bi * n_head_kv + kv_h) * dh;
-            v0 = vt[d0]; v1 = vt[d1]; v2 = vt[d2]; v3 = vt[d3];
+            v0 = vt[p0]; v1 = vt[p0 + 1]; v2 = vt[p1]; v3 = vt[p1 + 1];
         }
         dot = ds_warp_sum32(dot);
         float score = __shfl(dot, 0, 32);
@@ -219,17 +223,17 @@ extern "C" __global__ void dspark_attn_k(const float* __restrict__ Q,
         float p = expf(score - m_new);
         l = l * alpha + p;
         m = m_new;
-        o0 = o0 * alpha + p * v0;
-        o1 = o1 * alpha + p * v1;
-        o2 = o2 * alpha + p * v2;
-        o3 = o3 * alpha + p * v3;
+        o0 = fmaf(p, v0, o0 * alpha);
+        o1 = fmaf(p, v1, o1 * alpha);
+        o2 = fmaf(p, v2, o2 * alpha);
+        o3 = fmaf(p, v3, o3 * alpha);
     }
 
     __shared__ float sm_m[8];
     __shared__ float sm_l[8];
     __shared__ float sm_o[8][128];
     if (lane == 0) { sm_m[wid] = m; sm_l[wid] = l; }
-    sm_o[wid][d0] = o0; sm_o[wid][d1] = o1; sm_o[wid][d2] = o2; sm_o[wid][d3] = o3;
+    sm_o[wid][p0] = o0; sm_o[wid][p0 + 1] = o1; sm_o[wid][p1] = o2; sm_o[wid][p1 + 1] = o3;
     __syncthreads();
 
     if (wid == 0) {
@@ -237,6 +241,7 @@ extern "C" __global__ void dspark_attn_k(const float* __restrict__ Q,
         for (int w = 1; w < nw; ++w) gm = fmaxf(gm, sm_m[w]);
         float gl = 0.0f;
         float go0 = 0.0f, go1 = 0.0f, go2 = 0.0f, go3 = 0.0f;
+        int d0 = lane, d1 = lane + 32, d2 = lane + 64, d3 = lane + 96;
         for (int w = 0; w < nw; ++w) {
             float sc = expf(sm_m[w] - gm);
             gl += sm_l[w] * sc;

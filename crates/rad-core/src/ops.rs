@@ -100,4 +100,5 @@ extern "C" {
     pub fn ink_dspark_markov_update_multi(s: HipStream, joint: *const f32, bias: *const f32, states: *mut f32, markov_out: *mut f32, rank: i32, n_users: i32) -> i32;
     pub fn ink_dspark_add_bias_multi(s: HipStream, hidden: *const f32, delta: *const f32, bias: *const f32, out: *mut f32, n_embd: i32, n_users: i32, k_len: i32, slot: i32) -> i32;
     pub fn ink_dspark_scatter_toks(s: HipStream, src_toks: *const i32, dst_toks: *mut i32, n_users: i32, k_len: i32, slot: i32) -> i32;
+    pub fn ink_attn_batch_gated_q8(s: HipStream, q: *const f32, r: *const f32, sinks: *const f32, rel_bias: *const f32, kc: *const u16, vc: *const u16, gate: *const f32, d_pos0: *const i32, out_q8: *mut core::ffi::c_void, n_head: i32, n_head_kv: i32, dh: i32, d_rel: i32, rel_extent: i32, swa_window: i32, is_swa: i32, max_ctx: i32, b: i32) -> i32;
 }

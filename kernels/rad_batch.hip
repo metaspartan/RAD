@@ -1099,7 +1099,7 @@ extern "C" int ink_gemm_bf16(hipStream_t s, const uint16_t* W, const float* X, f
 }
 extern "C" int ink_gemm_f32_wmma(hipStream_t s, const float* W, const float* X, float* Y, int n, int k, int B);
 extern "C" int ink_gemm_f32(hipStream_t s, const float* W, const float* X, float* Y, int n, int k, int B) {
-    if (B >= 16) return ink_gemm_f32_wmma(s, W, X, Y, n, k, B);
+    if (B >= 4) return ink_gemm_f32_wmma(s, W, X, Y, n, k, B);
     gemm_f32_k<<<dim3((n + 3) / 4, (B + 7) / 8), dim3(128), 0, s>>>(W, X, Y, n, k, B);
     return 0;
 }

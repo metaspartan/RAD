@@ -51,8 +51,8 @@
   <text x="695" y="233" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">137.1 tok/s (+9.7%)</text>
 
   <text x="56" y="268" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#f8fafc" font-weight="600">RAD R9700 — B=1 + DSpark K=6 (Code)</text>
-  <rect x="320" y="253" width="371" height="22" rx="5" fill="url(#greenGrad)"/>
-  <text x="700" y="269" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">138.9 tok/s (+11.1%)</text>
+  <rect x="320" y="253" width="396" height="22" rx="5" fill="url(#greenGrad)"/>
+  <text x="725" y="269" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">148.2 tok/s (+18.5%)</text>
 
   <rect x="36" y="304" width="888" height="320" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
   <text x="56" y="332" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="15" font-weight="700" fill="#e2e8f0">Multi-User Batched Decode &amp; Prefill Throughput on Single R9700 (Aggregate tok/s)</text>

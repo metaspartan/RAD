@@ -40,8 +40,9 @@ Measured end-to-end on **Inkling-2-Mini** (`Inkling-2-Mini-UD-Q4_K_XL-v2.gguf` +
 | **Short Prompt TTFT (`27 tok`)** | **51.2 ms** | Split-K WMMA router + `Q4_0_SOA` |
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **32.5 ms** | Prefix-cache affinity hit |
 | **Single-User Decode (`B=1`, no-spec)** | **93.9 tok/s** | `hipGraph`-captured 48-visit loop + `half2` KV attention |
-| **Single-User Decode (DSpark `K=4..6`, code)** | **137.1 – 138.9 tok/s** | **+11.1% vs. Unsloth RTX PRO 6000 Blackwell (125 tok/s)** |
-| **Multi-User Decode (`B=4`, Batched DSpark `K=4`)** | **309.6 agg tok/s** | **`77.4 tok/s/user`** (`draft=3.62 ms`, `verify=35.41 ms`) |
+| **Single-User Decode (DSpark `K=6`, code)** | **148.2 tok/s** | **+18.5% vs. Unsloth RTX PRO 6000 Blackwell (125 tok/s)** (`verify=23.7 ms`) |
+| **Single-User Decode (DSpark `K=8`, code)** | **140.5 tok/s** | `emit=4.92`, `verify=28.2 ms` |
+| **Multi-User Decode (`B=4`, Batched DSpark `K=4`)** | **318.8 agg tok/s** | **`79.7 tok/s/user`** (`draft=3.62 ms`, `verify=34.67 ms`) |
 | **Multi-User Decode (`B=8`, no-spec)** | **238.2 agg tok/s** | `29.8 tok/s/user` (`hipGraph` + fused `moe_gu_sudot4_to_q8`) |
 | **Multi-User Decode (`B=8`, Batched DSpark `K=4`)** | **458.6 agg tok/s** | **`57.3 tok/s/user`** (**+92%** over `B=8` no-spec, `draft=5.20 ms`) |
 | **Multi-User Decode (`B=16`, no-spec)** | **448.5 agg tok/s** | `28.0 tok/s/user` |
@@ -143,6 +144,7 @@ python3 scripts/test_serve.py
 
 ## Roadmap
 
+- **DFlash 2 (`incoai/Inkling-2-Mini-DFlash2`) Drafter:** Native 5-layer parallel block-diffusion drafter + top-16 candidate path selector (same `[5, 23, 41, 48]` target layers, 1 parallel `lm_head` pass, +32%–43% acceptance length).
 - **Vision (`mmproj`) GPU Encoder:** Full HIP ViT/SigLIP image-patch encoder for `mmproj-F16.gguf` (CLI `--mmproj` auto-detection is already wired in).
 - **Hardware backends:** CDNA (`gfx942` / MI300X), RDNA3 (`gfx1100`), NVIDIA CUDA, and Apple Metal backends behind a unified device trait.
 - **Model families:** Standard GQA/MLA transformers, Qwen3-MoE, Llama, DeepSeek, and hybrid SSM/attention architectures.

@@ -1290,13 +1290,14 @@ impl InklingEngine {
                 if sl.is_swa { 1 } else { 0 },
                 sl.max_ctx as i32, bi,
             );
+            ops::ink_quantize_q8_1(s, attn_out, self.bsc.xq.ptr, q_dim, bi);
         } else {
-            ops::ink_attn_batch_gated(
+            ops::ink_attn_batch_gated_q8(
                 s, q, r, sinks,
                 l.attn_rel_bias.ptr as *const f32,
                 sl.k_cache.ptr as *const u16,
                 sl.v_cache.ptr as *const u16,
-                gate_out, d_pos0, attn_out,
+                gate_out, d_pos0, self.bsc.xq.ptr,
                 self.cfg.n_head as i32,
                 self.cfg.n_head_kv as i32,
                 self.cfg.dh as i32,
@@ -1309,7 +1310,6 @@ impl InklingEngine {
         }
 
         let o_raw = self.bsc.o_raw.ptr as *mut f32;
-        ops::ink_quantize_q8_1(s, attn_out, self.bsc.xq.ptr, q_dim, bi);
         match l.wo.ty {
             WeightType::Q4_0 if b >= 12 => ops::ink_gemm_q4_0_wmma(s, l.wo.buf.ptr as *const u8, self.bsc.xq.ptr, o_raw, e, q_dim, bi),
             WeightType::Q4_0 => ops::ink_gemm_q4_0_sudot4(s, l.wo.buf.ptr as *const u8, self.bsc.xq.ptr, o_raw, e, q_dim, bi),

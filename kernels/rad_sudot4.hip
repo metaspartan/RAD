@@ -2315,3 +2315,126 @@ extern "C" int ink_shortconv_res_multi_snap(hipStream_t s, const float* raw, con
     shortconv_res_multi_snap_k<<<dim3((n_embd + 255) / 256, n_users), dim3(256), 0, s>>>(raw, conv_w, hist_pool, snap_pool, add_src, block_dst, out, d_seq_ids, n_embd, K);
     return 0;
 }
+
+extern "C" __global__ void inkling_attn_batch_gated_q8_k(const float* __restrict__ Q,
+                                                         const float* __restrict__ R,
+                                                         const float* __restrict__ sinks,
+                                                         const float* __restrict__ rel_bias,
+                                                         const __half* __restrict__ k_cache,
+                                                         const __half* __restrict__ v_cache,
+                                                         const float* __restrict__ gate,
+                                                         const int* __restrict__ d_pos0,
+                                                         q8_1_blk* __restrict__ out_q8,
+                                                         int n_head, int n_head_kv,
+                                                         int dh, int d_rel,
+                                                         int rel_extent, int swa_window,
+                                                         int is_swa, int max_ctx) {
+    int h = blockIdx.x;
+    int bt = blockIdx.y;
+    int pos = (*d_pos0) + bt;
+    int kv_h = h / (n_head / n_head_kv);
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int nw = blockDim.x >> 5;
+    int q_dim = n_head * dh;
+    int r_dim = n_head * d_rel;
+
+    __shared__ float qs[128];
+    __shared__ float rs[16];
+    float q_scale = rsqrtf((float)dh);
+    for (int d = threadIdx.x; d < dh; d += blockDim.x) {
+        qs[d] = Q[(size_t)bt * q_dim + (size_t)h * dh + d] * q_scale;
+    }
+    if (threadIdx.x < d_rel) {
+        rs[threadIdx.x] = R[(size_t)bt * r_dim + (size_t)h * d_rel + threadIdx.x];
+    }
+    __syncthreads();
+
+    int t_start = is_swa ? max(0, pos - swa_window + 1) : 0;
+    int t_end = pos + 1;
+    float sink_h = sinks[(size_t)bt * n_head + h];
+
+    const __half* kc_h = k_cache + (size_t)kv_h * max_ctx * dh;
+    const __half* vc_h = v_cache + (size_t)kv_h * max_ctx * dh;
+
+    float m = (wid == 0) ? 0.0f : -1e30f;
+    float l = (wid == 0) ? 1.0f : 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+    int p0 = lane * 2;
+    int p1 = lane * 2 + 64;
+    float q0a = qs[p0], q0b = qs[p0 + 1], q1a = qs[p1], q1b = qs[p1 + 1];
+
+    for (int t = t_start + wid; t < t_end; t += nw) {
+        int kv_slot = is_swa ? (t % max_ctx) : t;
+        const __half2* kt2 = reinterpret_cast<const __half2*>(kc_h + (size_t)kv_slot * dh);
+        float2 k0 = __half22float2(kt2[lane]);
+        float2 k1 = __half22float2(kt2[lane + 32]);
+        float dot = q0a * k0.x + q0b * k0.y + q1a * k1.x + q1b * k1.y;
+        dot = s_warp_sum32(dot);
+        float score = __shfl(dot, 0, 32);
+
+        int dist = pos - t;
+        float rbias = 0.0f;
+        if (dist < rel_extent) {
+            const float* rb = rel_bias + (size_t)dist * d_rel;
+            float rp = (lane < d_rel) ? (rb[lane] * rs[lane]) : 0.0f;
+            rp = s_warp_sum32(rp);
+            rbias = __shfl(rp, 0, 32);
+        }
+        score += rbias - sink_h;
+
+        float m_new = fmaxf(m, score);
+        float alpha = expf(m - m_new);
+        float p = expf(score - m_new);
+        l = l * alpha + p;
+        m = m_new;
+
+        const __half2* vt2 = reinterpret_cast<const __half2*>(vc_h + (size_t)kv_slot * dh);
+        float2 v0 = __half22float2(vt2[lane]);
+        float2 v1 = __half22float2(vt2[lane + 32]);
+        o0 = fmaf(p, v0.x, o0 * alpha);
+        o1 = fmaf(p, v0.y, o1 * alpha);
+        o2 = fmaf(p, v1.x, o2 * alpha);
+        o3 = fmaf(p, v1.y, o3 * alpha);
+    }
+
+    __shared__ float sm_m[8];
+    __shared__ float sm_l[8];
+    __shared__ float sm_o[8][128];
+    if (lane == 0) { sm_m[wid] = m; sm_l[wid] = l; }
+    sm_o[wid][p0] = o0; sm_o[wid][p0 + 1] = o1; sm_o[wid][p1] = o2; sm_o[wid][p1 + 1] = o3;
+    __syncthreads();
+
+    if (wid == 0) {
+        float gm = sm_m[0];
+        for (int w = 1; w < nw; ++w) gm = fmaxf(gm, sm_m[w]);
+        float gl = 0.0f;
+        float go0 = 0.0f, go1 = 0.0f, go2 = 0.0f, go3 = 0.0f;
+        int d0 = lane, d1 = lane + 32, d2 = lane + 64, d3 = lane + 96;
+        for (int w = 0; w < nw; ++w) {
+            float sc = expf(sm_m[w] - gm);
+            gl += sm_l[w] * sc;
+            go0 += sm_o[w][d0] * sc;
+            go1 += sm_o[w][d1] * sc;
+            go2 += sm_o[w][d2] * sc;
+            go3 += sm_o[w][d3] * sc;
+        }
+        float inv_l = 1.0f / gl;
+        const float* gh = gate + (size_t)bt * q_dim + (size_t)h * dh;
+        float v0 = (go0 * inv_l) / (1.0f + expf(-gh[d0]));
+        float v1 = (go1 * inv_l) / (1.0f + expf(-gh[d1]));
+        float v2 = (go2 * inv_l) / (1.0f + expf(-gh[d2]));
+        float v3 = (go3 * inv_l) / (1.0f + expf(-gh[d3]));
+        __shared__ int8_t smq[32];
+        size_t qbase = ((size_t)bt * n_head + h) * 4;
+        store_q8_1_from_warp(v0, lane, out_q8 + qbase + 0, smq);
+        store_q8_1_from_warp(v1, lane, out_q8 + qbase + 1, smq);
+        store_q8_1_from_warp(v2, lane, out_q8 + qbase + 2, smq);
+        store_q8_1_from_warp(v3, lane, out_q8 + qbase + 3, smq);
+    }
+}
+
+extern "C" int ink_attn_batch_gated_q8(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const __half* kc, const __half* vc, const float* gate, const int* d_pos0, void* out_q8, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int swa_window, int is_swa, int max_ctx, int B) {
+    inkling_attn_batch_gated_q8_k<<<dim3(n_head, B), dim3(256), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, (q8_1_blk*)out_q8, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx);
+    return 0;
+}
