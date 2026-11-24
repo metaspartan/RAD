@@ -828,7 +828,9 @@ extern "C" __global__ void moe_gu_q4_0_wmma_k(const uint8_t* __restrict__ W,
     int n0 = wn * 32;
     int n1 = n0 + 16;
 
-    for (int t0 = 0; t0 < cnt; t0 += 64) {
+    int z_id = blockIdx.z;
+    int z_n = gridDim.z;
+    for (int t0 = z_id * 64; t0 < cnt; t0 += z_n * 64) {
         int nt = min(64, cnt - t0);
         int idx_l0 = off0 + t0 + min(r_loc, nt - 1);
         int idx_l1 = off0 + t0 + min(r_loc + 32, nt - 1);
@@ -1012,7 +1014,9 @@ extern "C" __global__ void moe_dn_q4_0_wmma_k(const uint8_t* __restrict__ W,
     int n0 = wn * 32;
     int n1 = n0 + 16;
 
-    for (int t0 = 0; t0 < cnt; t0 += 64) {
+    int z_id = blockIdx.z;
+    int z_n = gridDim.z;
+    for (int t0 = z_id * 64; t0 < cnt; t0 += z_n * 64) {
         int nt = min(64, cnt - t0);
         int idx_l0 = off0 + t0 + min(r_loc, nt - 1);
         int idx_l1 = off0 + t0 + min(r_loc + 32, nt - 1);
@@ -1599,13 +1603,15 @@ extern "C" int ink_qkvrg_gemm_q4_wmma(hipStream_t s, const uint8_t* wq, const ui
 
 extern "C" int ink_moe_gu_q4_0_wmma(hipStream_t s, const uint8_t* W, const float* scales, const void* Xq, const int* exp_counts, const int* exp_offsets, const int* tok_sorted, const int* slot_sorted, float* act_out, int n_ff, int k, int n_used, float beta, float lb, int B) {
     int gy = (B * n_used < 128) ? (B * n_used) : 128;
-    moe_gu_q4_0_wmma_k<<<dim3((n_ff + 31) / 32, gy), dim3(128), 0, s>>>(W, scales, (const w_q8_1_blk*)Xq, exp_counts, exp_offsets, tok_sorted, slot_sorted, act_out, n_ff, k, n_used, beta, lb);
+    int gz = (B >= 512) ? 2 : 1;
+    moe_gu_q4_0_wmma_k<<<dim3((n_ff + 31) / 32, gy, gz), dim3(128), 0, s>>>(W, scales, (const w_q8_1_blk*)Xq, exp_counts, exp_offsets, tok_sorted, slot_sorted, act_out, n_ff, k, n_used, beta, lb);
     return 0;
 }
 
 extern "C" int ink_moe_dn_q4_0_wmma(hipStream_t s, const uint8_t* W, const void* act_q, const int* exp_counts, const int* exp_offsets, const int* tok_sorted, const int* slot_sorted, const float* wt_sorted, float* moe_slots, float* y_out, int n_embd, int n_ff, int n_used, int B) {
     int gy = (B * n_used < 128) ? (B * n_used) : 128;
-    moe_dn_q4_0_wmma_k<<<dim3((n_embd + 63) / 64, gy), dim3(128), 0, s>>>(W, (const w_q8_1_blk*)act_q, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, moe_slots, n_embd, n_ff, n_used);
+    int gz = (B >= 512) ? 2 : 1;
+    moe_dn_q4_0_wmma_k<<<dim3((n_embd + 63) / 64, gy, gz), dim3(128), 0, s>>>(W, (const w_q8_1_blk*)act_q, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, moe_slots, n_embd, n_ff, n_used);
     reduce_moe_slots_k<<<dim3((n_embd + 255) / 256, B), dim3(256), 0, s>>>(moe_slots, y_out, n_embd, n_used);
     return 0;
 }
@@ -1728,7 +1734,7 @@ extern "C" __global__ void attn_b8_flash_q8_k(const float* __restrict__ Q,
                 for (int j = 0; j < 8; ++j) sm_u.kv.vt[wid][d8 + j][tk] = (_Float16)0.0f;
             }
         }
-        __syncwarp();
+        __builtin_amdgcn_wave_barrier();
 
         wmma_f8_v s_v = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -1788,7 +1794,7 @@ extern "C" __global__ void attn_b8_flash_q8_k(const float* __restrict__ Q,
             o_acc[db] *= alpha;
             o_acc[db] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vt_v, p_reg, o_acc[db]);
         }
-        __syncwarp();
+        __builtin_amdgcn_wave_barrier();
     }
     __syncthreads();
 
@@ -1829,7 +1835,250 @@ extern "C" __global__ void attn_b8_flash_q8_k(const float* __restrict__ Q,
     }
 }
 
+__device__ float g_b8_split_buf[32 * 4 * 16 * 130];
+
+extern "C" __global__ void attn_b8_flash_split_k(const float* __restrict__ Q,
+                                                 const float* __restrict__ R,
+                                                 const float* __restrict__ sinks,
+                                                 const float* __restrict__ rel_bias,
+                                                 const __half* __restrict__ k_cache,
+                                                 const __half* __restrict__ v_cache,
+                                                 const int* __restrict__ d_pos0,
+                                                 float* __restrict__ split_buf,
+                                                 int n_head, int n_head_kv,
+                                                 int dh, int d_rel,
+                                                 int rel_extent, int swa_window,
+                                                 int is_swa, int max_ctx, int B, int n_splits) {
+    int h = blockIdx.x;
+    int sp = blockIdx.y;
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int col = lane & 15;
+    int half = lane >> 4;
+    int kv_h = h / (n_head / n_head_kv);
+    int pos0 = *d_pos0;
+    int q_dim = n_head * dh;
+    int r_dim = n_head * d_rel;
+
+    bool vq = (col < B);
+    int pos_q = pos0 + col;
+    int t_start_q = is_swa ? max(0, pos_q - swa_window + 1) : 0;
+    int t_min = is_swa ? max(0, pos0 - swa_window + 1) : 0;
+    int t_max = pos0 + B;
+
+    int total_tiles = (t_max - t_min + 15) / 16;
+    int tiles_per_sp = (total_tiles + n_splits - 1) / n_splits;
+    int tile_s = t_min + sp * tiles_per_sp * 16;
+    int tile_e = min(t_max, tile_s + tiles_per_sp * 16);
+
+    if (tile_s >= tile_e) {
+        if (wid == 0 && half == 0 && vq) {
+            float* dst = split_buf + (((size_t)h * n_splits + sp) * 16 + col) * 130;
+            dst[0] = -1e30f;
+            dst[1] = 0.0f;
+        }
+        return;
+    }
+
+    float q_scale = rsqrtf((float)dh);
+    wmma_h8_v q_reg[8];
+    float4 r_reg0 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 r_reg1 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 r_reg2 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 r_reg3 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float sink_q = 0.0f;
+    if (vq) {
+        const float* qh = Q + (size_t)col * q_dim + (size_t)h * dh;
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+            int dbase = db * 16 + half * 8;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)(qh[dbase + j] * q_scale);
+        }
+        const float4* rh4 = reinterpret_cast<const float4*>(R + (size_t)col * r_dim + (size_t)h * d_rel);
+        r_reg0 = rh4[0]; r_reg1 = rh4[1]; r_reg2 = rh4[2]; r_reg3 = rh4[3];
+        sink_q = sinks[(size_t)col * n_head + h];
+    } else {
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)0.0f;
+        }
+    }
+
+    float m_q = (sp == 0 && wid == 0) ? 0.0f : -1e30f;
+    float l_q = (sp == 0 && wid == 0) ? 1.0f : 0.0f;
+    wmma_f8_v o_acc[8];
+#pragma unroll
+    for (int db = 0; db < 8; ++db) o_acc[db] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const _Float16* kc_h = reinterpret_cast<const _Float16*>(k_cache) + (size_t)kv_h * max_ctx * dh;
+    const _Float16* vc_h = reinterpret_cast<const _Float16*>(v_cache) + (size_t)kv_h * max_ctx * dh;
+
+    __shared__ union {
+        struct {
+            _Float16 k[4][16][136];
+            _Float16 vt[4][128][24];
+        } kv;
+        float o[4][16][128];
+    } sm_u;
+
+    for (int tile = tile_s + wid * 16; tile < tile_e; tile += 64) {
+        int n_kv = min(16, tile_e - tile);
+        for (int tk = half; tk < 16; tk += 2) {
+            int d8 = col * 8;
+            if (tk < n_kv) {
+                int kv_slot = is_swa ? ((tile + tk) % max_ctx) : (tile + tk);
+                const _Float16* kp = kc_h + (size_t)kv_slot * dh + d8;
+                const _Float16* vp = vc_h + (size_t)kv_slot * dh + d8;
+                *reinterpret_cast<uint4*>(&sm_u.kv.k[wid][tk][d8]) = *reinterpret_cast<const uint4*>(kp);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) sm_u.kv.vt[wid][d8 + j][tk] = vp[j];
+            } else {
+                *reinterpret_cast<uint4*>(&sm_u.kv.k[wid][tk][d8]) = make_uint4(0, 0, 0, 0);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) sm_u.kv.vt[wid][d8 + j][tk] = (_Float16)0.0f;
+            }
+        }
+        __builtin_amdgcn_wave_barrier();
+
+        wmma_f8_v s_v = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+            wmma_h8_v kv_v;
+            int dbase = db * 16 + half * 8;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) kv_v[j] = sm_u.kv.k[wid][col][dbase + j];
+            s_v = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(kv_v, q_reg[db], s_v);
+        }
+
+        float local_max = -1e30f;
+        float sc_arr[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int tk = half * 8 + i;
+            int t = tile + tk;
+            if (vq && tk < n_kv && t >= t_start_q && t <= pos_q) {
+                float sc = s_v[i] - sink_q;
+                int dist = pos_q - t;
+                if (dist < rel_extent) {
+                    const float4* rbp4 = reinterpret_cast<const float4*>(rel_bias + (size_t)dist * d_rel);
+                    float4 b0 = rbp4[0], b1 = rbp4[1], b2 = rbp4[2], b3 = rbp4[3];
+                    float rp = fmaf(b0.x, r_reg0.x, fmaf(b0.y, r_reg0.y, fmaf(b0.z, r_reg0.z, b0.w * r_reg0.w)));
+                    rp = fmaf(b1.x, r_reg1.x, fmaf(b1.y, r_reg1.y, fmaf(b1.z, r_reg1.z, fmaf(b1.w, r_reg1.w, rp))));
+                    rp = fmaf(b2.x, r_reg2.x, fmaf(b2.y, r_reg2.y, fmaf(b2.z, r_reg2.z, fmaf(b2.w, r_reg2.w, rp))));
+                    rp = fmaf(b3.x, r_reg3.x, fmaf(b3.y, r_reg3.y, fmaf(b3.z, r_reg3.z, fmaf(b3.w, r_reg3.w, rp))));
+                    sc += rp;
+                }
+                sc_arr[i] = sc;
+                local_max = fmaxf(local_max, sc);
+            } else {
+                sc_arr[i] = -1e30f;
+            }
+        }
+        float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+        float m_new = fmaxf(m_q, tile_max);
+        float alpha = (m_q > -1e20f) ? expf(m_q - m_new) : 0.0f;
+
+        wmma_h8_v p_reg;
+        float local_sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float p = (sc_arr[i] > -1e20f) ? expf(sc_arr[i] - m_new) : 0.0f;
+            p_reg[i] = (_Float16)p;
+            local_sum += p;
+        }
+        l_q = l_q * alpha + local_sum + __shfl_xor(local_sum, 16, 32);
+        m_q = m_new;
+
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+            wmma_h8_v vt_v;
+            int d_row = db * 16 + col;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) vt_v[j] = sm_u.kv.vt[wid][d_row][half * 8 + j];
+            o_acc[db] *= alpha;
+            o_acc[db] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vt_v, p_reg, o_acc[db]);
+        }
+        __builtin_amdgcn_wave_barrier();
+    }
+    __syncthreads();
+
+    __shared__ float sm_m[4][16];
+    __shared__ float sm_l[4][16];
+    if (half == 0 && vq) {
+        sm_m[wid][col] = m_q;
+        sm_l[wid][col] = l_q;
+    }
+    if (vq) {
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                sm_u.o[wid][col][db * 16 + half * 8 + i] = o_acc[db][i];
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int bt = wid; bt < B; bt += 4) {
+        float gm = fmaxf(fmaxf(sm_m[0][bt], sm_m[1][bt]), fmaxf(sm_m[2][bt], sm_m[3][bt]));
+        float sc0 = (sm_m[0][bt] > -1e20f) ? expf(sm_m[0][bt] - gm) : 0.0f;
+        float sc1 = (sm_m[1][bt] > -1e20f) ? expf(sm_m[1][bt] - gm) : 0.0f;
+        float sc2 = (sm_m[2][bt] > -1e20f) ? expf(sm_m[2][bt] - gm) : 0.0f;
+        float sc3 = (sm_m[3][bt] > -1e20f) ? expf(sm_m[3][bt] - gm) : 0.0f;
+        float gl = sm_l[0][bt] * sc0 + sm_l[1][bt] * sc1 + sm_l[2][bt] * sc2 + sm_l[3][bt] * sc3;
+        float* dst = split_buf + (((size_t)h * n_splits + sp) * 16 + bt) * 130;
+        if (lane == 0) { dst[0] = gm; dst[1] = gl; }
+#pragma unroll
+        for (int blk = 0; blk < 4; ++blk) {
+            int d = blk * 32 + lane;
+            dst[2 + d] = sm_u.o[0][bt][d] * sc0 + sm_u.o[1][bt][d] * sc1 + sm_u.o[2][bt][d] * sc2 + sm_u.o[3][bt][d] * sc3;
+        }
+    }
+}
+
+extern "C" __global__ void attn_b8_flash_reduce_q8_k(const float* __restrict__ split_buf,
+                                                     const float* __restrict__ gate,
+                                                     w_q8_1_blk* __restrict__ out_q8,
+                                                     int n_head, int n_splits) {
+    int h = blockIdx.x;
+    int bt = blockIdx.y;
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int d = wid * 32 + lane;
+    int q_dim = n_head * 128;
+
+    float gm = -1e30f;
+    for (int sp = 0; sp < n_splits; ++sp) {
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * 16 + bt) * 130;
+        gm = fmaxf(gm, p[0]);
+    }
+    float gl = 0.0f;
+    float go = 0.0f;
+    for (int sp = 0; sp < n_splits; ++sp) {
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * 16 + bt) * 130;
+        if (p[0] > -1e20f) {
+            float sc = expf(p[0] - gm);
+            gl += p[1] * sc;
+            go += p[2 + d] * sc;
+        }
+    }
+    float v = (go / gl) / (1.0f + expf(-gate[(size_t)bt * q_dim + (size_t)h * 128 + d]));
+    __shared__ int8_t smq[4][32];
+    size_t qbase = ((size_t)bt * n_head + h) * 4;
+    w_q8_store(v, lane, out_q8 + qbase + wid, smq[wid]);
+}
+
 extern "C" int ink_attn_b8_flash_q8(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const __half* kc, const __half* vc, const float* gate, const int* d_pos0, void* out_q8, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int swa_window, int is_swa, int max_ctx, int B) {
+    if (n_head <= 32) {
+        int n_splits = 4;
+        float* sbuf = nullptr;
+        (void)hipGetSymbolAddress((void**)&sbuf, HIP_SYMBOL(g_b8_split_buf));
+        attn_b8_flash_split_k<<<dim3(n_head, n_splits), dim3(128), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, d_pos0, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B, n_splits);
+        attn_b8_flash_reduce_q8_k<<<dim3(n_head, B), dim3(128), 0, s>>>(sbuf, gate, (w_q8_1_blk*)out_q8, n_head, n_splits);
+        return 0;
+    }
     attn_b8_flash_q8_k<<<dim3(n_head), dim3(128), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, (w_q8_1_blk*)out_q8, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B);
     return 0;
 }
