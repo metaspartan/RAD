@@ -58,11 +58,16 @@ struct AppState {
     job_tx: mpsc::UnboundedSender<GenJob>,
     tokenizer: Arc<Tokenizer>,
     api_key: String,
+    spec_enabled: bool,
+    mmproj_path: Option<String>,
 }
 
 #[derive(Serialize)]
 struct Health {
     status: &'static str,
+    engine: &'static str,
+    speculative_decoding: bool,
+    mmproj_detected: bool,
 }
 
 #[derive(Deserialize)]
@@ -498,8 +503,13 @@ async fn collect_job(
     Ok((out_ids, prompt_n, cached_n, pp_ms, dec_ms, finish_reason))
 }
 
-async fn health() -> Json<Health> {
-    Json(Health { status: "ok" })
+async fn health(State(st): State<Arc<AppState>>) -> Json<Health> {
+    Json(Health {
+        status: "ok",
+        engine: "rad",
+        speculative_decoding: st.spec_enabled,
+        mmproj_detected: st.mmproj_path.is_some(),
+    })
 }
 
 async fn models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -510,8 +520,16 @@ async fn models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
     Json(json!({
         "object": "list",
         "data": [
-            {"id": "inkling-2-mini", "object": "model", "created": now, "owned_by": "rad"},
-            {"id": "ornith-1.5-35b-a3b", "object": "model", "created": now, "owned_by": "rad"}
+            {
+                "id": "inkling-2-mini",
+                "object": "model",
+                "created": now,
+                "owned_by": "rad",
+                "capabilities": {
+                    "speculative_decoding": st.spec_enabled,
+                    "mmproj_detected": st.mmproj_path.is_some()
+                }
+            }
         ]
     }))
     .into_response()
@@ -943,55 +961,318 @@ async fn handle_ws(mut socket: WebSocket, st: Arc<AppState>) {
     }
 }
 
+struct CliOpts {
+    cmd: String,
+    prompt: Option<String>,
+    model: String,
+    tokenizer: Option<String>,
+    dspark: Option<String>,
+    mmproj: Option<String>,
+    api_key: String,
+    ctx: usize,
+    max_seqs: usize,
+    max_tokens: usize,
+    port: u16,
+    use_spec: bool,
+    thinking: bool,
+}
+
+fn print_usage() {
+    println!("RAD - High-performance Rust + ROCm/HIP LLM inference engine");
+    println!();
+    println!("USAGE:");
+    println!("  rad serve [OPTIONS]            Start OpenAI HTTP/SSE/WebSocket server");
+    println!("  rad run <PROMPT> [OPTIONS]     Run one-shot local generation");
+    println!("  rad info [OPTIONS]             Print engine configuration and detected files");
+    println!();
+    println!("OPTIONS:");
+    println!("  -m, --model <PATH>             Target GGUF model path (env: RAD_MODEL)");
+    println!("  -t, --tokenizer <PATH>         HuggingFace tokenizer.json (auto-detected if next to model)");
+    println!("  -d, --dspark <PATH>            DSpark draft GGUF (auto-detected if next to model)");
+    println!("      --mmproj <PATH>            Vision mmproj GGUF (auto-detected if next to model)");
+    println!("  -p, --port <PORT>              Server port [default: 8088] (env: RAD_PORT)");
+    println!("      --ctx <TOKENS>             Context length per sequence [default: 8192] (env: RAD_CTX)");
+    println!("      --max-seqs <N>             Max concurrent sequences [default: 32] (env: RAD_MAX_SEQS)");
+    println!("  -n, --max-tokens <N>           Max tokens for `rad run` [default: 256]");
+    println!("      --api-key <KEY>            Optional Bearer API key (env: RAD_API_KEY)");
+    println!("      --no-spec                  Disable DSpark speculative decoding");
+    println!("      --thinking                 Enable thinking tokens for `rad run`");
+    println!("  -h, --help                     Show this help message");
+}
+
+fn resolve_sibling(model_path: &str, candidates: &[&str]) -> Option<String> {
+    let parent = Path::new(model_path).parent()?;
+    for c in candidates {
+        let p = parent.join(c);
+        if p.exists() {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn parse_cli() -> anyhow::Result<CliOpts> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut cmd = "serve".to_string();
+    let mut idx = 0usize;
+    if let Some(first) = args.first() {
+        match first.as_str() {
+            "serve" | "run" | "info" => {
+                cmd = first.clone();
+                idx = 1;
+            }
+            "-h" | "--help" | "help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+    let mut prompt: Option<String> = None;
+    let mut model = std::env::var("RAD_MODEL")
+        .unwrap_or_else(|_| "./models/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf".into());
+    let mut tokenizer = std::env::var("RAD_TOKENIZER").ok();
+    let mut dspark = std::env::var("RAD_DSPARK").ok();
+    let mut mmproj = std::env::var("RAD_MMPROJ").ok();
+    let mut api_key = std::env::var("RAD_API_KEY").unwrap_or_default();
+    let mut ctx: usize = std::env::var("RAD_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(8192);
+    let mut max_seqs: usize = std::env::var("RAD_MAX_SEQS").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+    let mut max_tokens: usize = 256;
+    let mut port: u16 = std::env::var("RAD_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8088);
+    let mut use_spec = std::env::var("RAD_SPEC").map(|v| v != "0").unwrap_or(true);
+    let mut thinking = false;
+
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "-m" | "--model" => {
+                idx += 1;
+                model = args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --model value"))?;
+            }
+            "-t" | "--tokenizer" => {
+                idx += 1;
+                tokenizer = Some(args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --tokenizer value"))?);
+            }
+            "-d" | "--dspark" => {
+                idx += 1;
+                dspark = Some(args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --dspark value"))?);
+            }
+            "--mmproj" => {
+                idx += 1;
+                mmproj = Some(args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --mmproj value"))?);
+            }
+            "-p" | "--port" => {
+                idx += 1;
+                port = args.get(idx).ok_or_else(|| anyhow::anyhow!("missing --port value"))?.parse()?;
+            }
+            "--ctx" => {
+                idx += 1;
+                ctx = args.get(idx).ok_or_else(|| anyhow::anyhow!("missing --ctx value"))?.parse()?;
+            }
+            "--max-seqs" => {
+                idx += 1;
+                max_seqs = args.get(idx).ok_or_else(|| anyhow::anyhow!("missing --max-seqs value"))?.parse()?;
+            }
+            "-n" | "--max-tokens" => {
+                idx += 1;
+                max_tokens = args.get(idx).ok_or_else(|| anyhow::anyhow!("missing --max-tokens value"))?.parse()?;
+            }
+            "--api-key" => {
+                idx += 1;
+                api_key = args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --api-key value"))?;
+            }
+            "--no-spec" => {
+                use_spec = false;
+            }
+            "--thinking" => {
+                thinking = true;
+            }
+            other if !other.starts_with('-') && cmd == "run" && prompt.is_none() => {
+                prompt = Some(other.to_string());
+            }
+            other => {
+                anyhow::bail!("unknown argument: {other} (run `rad --help`)");
+            }
+        }
+        idx += 1;
+    }
+
+    if tokenizer.is_none() {
+        tokenizer = resolve_sibling(&model, &["tokenizer.json", "../inkling2-src/tokenizer.json"]);
+    }
+    if dspark.is_none() {
+        dspark = resolve_sibling(&model, &["dspark-Inkling-2-Mini-Q8_0.gguf", "dspark.gguf"]);
+    }
+    if mmproj.is_none() {
+        mmproj = resolve_sibling(&model, &["mmproj-F16.gguf", "mmproj.gguf"]);
+    }
+
+    Ok(CliOpts {
+        cmd,
+        prompt,
+        model,
+        tokenizer,
+        dspark,
+        mmproj,
+        api_key,
+        ctx,
+        max_seqs,
+        max_tokens,
+        port,
+        use_spec,
+        thinking,
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let model_path = std::env::var("RAD_MODEL")
-        .unwrap_or_else(|_| "./models/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf".into());
-    let tok_path = std::env::var("RAD_TOKENIZER")
-        .unwrap_or_else(|_| "./models/tokenizer.json".into());
-    let api_key = std::env::var("RAD_API_KEY").unwrap_or_default();
-    let max_ctx: usize = std::env::var("RAD_CTX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8192);
-    let max_seqs: usize = std::env::var("RAD_MAX_SEQS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
-    let port: u16 = std::env::var("RAD_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8088);
+    let opts = parse_cli()?;
+    let tok_path = opts.tokenizer.clone().unwrap_or_else(|| "./models/tokenizer.json".into());
+
+    if opts.cmd == "info" {
+        println!("RAD v{}", env!("CARGO_PKG_VERSION"));
+        println!("  model:     {} (exists={})", opts.model, Path::new(&opts.model).exists());
+        println!("  tokenizer: {} (exists={})", tok_path, Path::new(&tok_path).exists());
+        println!("  dspark:    {:?}", opts.dspark);
+        println!("  mmproj:    {:?}", opts.mmproj);
+        println!("  ctx:       {}", opts.ctx);
+        println!("  max_seqs:  {}", opts.max_seqs);
+        println!("  port:      {}", opts.port);
+        println!("  endpoints: /health, /v1/models, /v1/chat/completions, /v1/completions, /v1/responses (HTTP/SSE/WS)");
+        return Ok(());
+    }
+
+    if opts.cmd == "run" {
+        let user_prompt = opts.prompt.ok_or_else(|| anyhow::anyhow!("rad run requires a <PROMPT>"))?;
+        let t0 = Instant::now();
+        let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        let mut engine = InklingEngine::load(Path::new(&opts.model), opts.ctx)?;
+        engine.capture_decode_graph()?;
+        let mut drafter = if opts.use_spec {
+            if let Some(ref dp) = opts.dspark {
+                if Path::new(dp).exists() {
+                    engine.capture_verify_graph(4)?;
+                    let mut d = DsparkDrafter::load(Path::new(dp), opts.ctx)?;
+                    d.capture_draft_graph(&engine, 4)?;
+                    Some(d)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        eprintln!("rad loaded in {:.2}s (spec={})", t0.elapsed().as_secs_f64(), drafter.is_some());
+        let formatted = format_prompt(
+            &[ChatMessage { role: "user".into(), content: serde_json::Value::String(user_prompt) }],
+            opts.thinking,
+        );
+        let ids: Vec<i32> = tokenizer.encode(formatted, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+        let tp = Instant::now();
+        let (mut cur_tok, _) = engine.prefill_seq_dspark(0, &ids, drafter.as_mut())?;
+        let pp_ms = tp.elapsed().as_secs_f64() * 1000.0;
+        let td = Instant::now();
+        let mut emitted: Vec<u32> = Vec::new();
+        let mut prev_len = 0usize;
+        if let Some(ref mut dr) = drafter {
+            let k_len = 4usize;
+            while emitted.len() < opts.max_tokens {
+                if cur_tok == 200006 || cur_tok == 200008 { break; }
+                let draft = dr.draft(cur_tok, &engine, k_len)?;
+                let pos_before = engine.pos;
+                let preds = engine.verify_batch(&draft)?;
+                let mut n_acc = 1usize;
+                for j in 0..(k_len - 1) {
+                    if preds[j] == draft[j + 1] { n_acc += 1; } else { break; }
+                }
+                let mut stop = false;
+                for j in 0..n_acc {
+                    let t = draft[j];
+                    if t == 200006 || t == 200008 { stop = true; break; }
+                    emitted.push(t as u32);
+                    let fptr = engine.gather_batch_dspark_feats(j);
+                    dr.inject_target_feats(fptr, pos_before + j as i32)?;
+                    if emitted.len() >= opts.max_tokens { stop = true; break; }
+                }
+                let txt = tokenizer.decode(&emitted, true).unwrap_or_default();
+                if txt.len() > prev_len {
+                    print!("{}", &txt[prev_len..]);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    prev_len = txt.len();
+                }
+                engine.rewind_verify_to(n_acc, k_len)?;
+                cur_tok = preds[n_acc - 1];
+                if stop { break; }
+            }
+        } else {
+            while emitted.len() < opts.max_tokens {
+                if cur_tok == 200006 || cur_tok == 200008 { break; }
+                emitted.push(cur_tok as u32);
+                let txt = tokenizer.decode(&emitted, true).unwrap_or_default();
+                if txt.len() > prev_len {
+                    print!("{}", &txt[prev_len..]);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    prev_len = txt.len();
+                }
+                cur_tok = engine.step(cur_tok)?;
+            }
+        }
+        let dec_s = td.elapsed().as_secs_f64();
+        println!();
+        eprintln!(
+            "stats: prompt={} tok ({:.1}ms, {:.1} tok/s) | gen={} tok ({:.2}s, {:.1} tok/s)",
+            ids.len(), pp_ms, ids.len() as f64 / (pp_ms / 1000.0).max(1e-6),
+            emitted.len(), dec_s, emitted.len() as f64 / dec_s.max(1e-6)
+        );
+        return Ok(());
+    }
 
     let t0 = Instant::now();
     let tokenizer = Arc::new(Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?);
-    let mut engine = InklingEngine::load_multi(Path::new(&model_path), max_ctx, max_seqs)?;
+    let mut engine = InklingEngine::load_multi(Path::new(&opts.model), opts.ctx, opts.max_seqs)?;
     engine.capture_decode_graph()?;
-    let use_spec = std::env::var("RAD_SPEC").map(|v| v != "0").unwrap_or(true);
-    let drafter = if use_spec {
-        let dpath = std::env::var("RAD_DSPARK")
-            .unwrap_or_else(|_| "./models/dspark-Inkling-2-Mini-Q8_0.gguf".into());
-        if Path::new(&dpath).exists() {
-            engine.capture_verify_graph(4)?;
-            let mut d = DsparkDrafter::load(Path::new(&dpath), max_ctx)?;
-            d.capture_draft_graph(&engine, 4)?;
-            Some(d)
+    let drafter = if opts.use_spec {
+        if let Some(ref dpath) = opts.dspark {
+            if Path::new(dpath).exists() {
+                engine.capture_verify_graph(4)?;
+                let mut d = DsparkDrafter::load_multi(Path::new(dpath), opts.ctx, opts.max_seqs.min(8))?;
+                d.capture_draft_graph(&engine, 4)?;
+                Some(d)
+            } else {
+                None
+            }
         } else {
             None
         }
     } else {
         None
     };
+    let spec_enabled = drafter.is_some();
     eprintln!(
-        "rad-serve ready in {:.2}s (ctx={max_ctx}, max_seqs={max_seqs}, spec={}, port={port})",
+        "rad serve ready in {:.2}s (ctx={}, max_seqs={}, spec={}, mmproj={}, port={})",
         t0.elapsed().as_secs_f64(),
-        drafter.is_some()
+        opts.ctx,
+        opts.max_seqs,
+        spec_enabled,
+        opts.mmproj.is_some(),
+        opts.port
     );
 
     let (job_tx, job_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || run_scheduler(engine, drafter, job_rx));
 
-    let state = Arc::new(AppState { job_tx, tokenizer, api_key });
+    let state = Arc::new(AppState {
+        job_tx,
+        tokenizer,
+        api_key: opts.api_key,
+        spec_enabled,
+        mmproj_path: opts.mmproj,
+    });
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -1000,7 +1281,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/responses", post(responses_http).get(responses_ws))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", opts.port)).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }

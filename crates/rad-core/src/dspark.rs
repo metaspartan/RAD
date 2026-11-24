@@ -83,9 +83,14 @@ pub struct DsparkDrafter {
     d_draft_toks: DevBuf,
     d_pos: DevBuf,
     d_ctx_len: DevBuf,
+    d_seq_ids: DevBuf,
+    d_anchors: DevBuf,
+    d_slot_out: DevBuf,
+    anchors_emb: DevBuf,
     stream: HipStream,
     draft_graph: Option<(usize, CapturedGraph)>,
     seq_draft_graphs: std::collections::HashMap<(usize, usize), CapturedGraph>,
+    multi_draft_graphs: std::collections::HashMap<(usize, usize), CapturedGraph>,
 }
 
 unsafe impl Send for DsparkDrafter {}
@@ -193,31 +198,36 @@ impl DsparkDrafter {
             ctx_k: DevBuf::new(kv_dim * 4).map_err(he)?,
             ctx_v: DevBuf::new(kv_dim * 4).map_err(he)?,
             ctx_m: DevBuf::new(max_seqs * n_embd * 4).map_err(he)?,
-            x: DevBuf::new(kmax * n_embd * 4).map_err(he)?,
-            x_norm: DevBuf::new(kmax * n_embd * 4).map_err(he)?,
-            xq: DevBuf::new(kmax * (max_k_dim / 32) * 40).map_err(he)?,
-            q: DevBuf::new(kmax * q_dim * 4).map_err(he)?,
-            k: DevBuf::new(kmax * kv_dim * 4).map_err(he)?,
-            v: DevBuf::new(kmax * kv_dim * 4).map_err(he)?,
-            attn_out: DevBuf::new(kmax * q_dim * 4).map_err(he)?,
-            o_out: DevBuf::new(kmax * n_embd * 4).map_err(he)?,
-            gate: DevBuf::new(kmax * n_ff * 4).map_err(he)?,
-            up: DevBuf::new(kmax * n_ff * 4).map_err(he)?,
-            ffn_out: DevBuf::new(kmax * n_embd * 4).map_err(he)?,
-            hidden: DevBuf::new(kmax * n_embd * 4).map_err(he)?,
-            state: DevBuf::new(rank * 4).map_err(he)?,
-            markov_inp: DevBuf::new((2 * rank + 2 * n_embd) * 4).map_err(he)?,
-            joint: DevBuf::new(3 * rank * 4).map_err(he)?,
-            markov_out: DevBuf::new(rank * 4).map_err(he)?,
-            delta_h: DevBuf::new(n_embd * 4).map_err(he)?,
-            final_h: DevBuf::new(n_embd * 4).map_err(he)?,
-            logits: DevBuf::new(201024 * 4).map_err(he)?,
-            d_draft_toks: DevBuf::new(kmax * 4).map_err(he)?,
-            d_pos: DevBuf::new(4).map_err(he)?,
-            d_ctx_len: DevBuf::new(4).map_err(he)?,
+            x: DevBuf::new(max_seqs * kmax * n_embd * 4).map_err(he)?,
+            x_norm: DevBuf::new(max_seqs * kmax * n_embd * 4).map_err(he)?,
+            xq: DevBuf::new(max_seqs * kmax * (max_k_dim / 32) * 40).map_err(he)?,
+            q: DevBuf::new(max_seqs * kmax * q_dim * 4).map_err(he)?,
+            k: DevBuf::new(max_seqs * kmax * kv_dim * 4).map_err(he)?,
+            v: DevBuf::new(max_seqs * kmax * kv_dim * 4).map_err(he)?,
+            attn_out: DevBuf::new(max_seqs * kmax * q_dim * 4).map_err(he)?,
+            o_out: DevBuf::new(max_seqs * kmax * n_embd * 4).map_err(he)?,
+            gate: DevBuf::new(max_seqs * kmax * n_ff * 4).map_err(he)?,
+            up: DevBuf::new(max_seqs * kmax * n_ff * 4).map_err(he)?,
+            ffn_out: DevBuf::new(max_seqs * kmax * n_embd * 4).map_err(he)?,
+            hidden: DevBuf::new(max_seqs * kmax * n_embd * 4).map_err(he)?,
+            state: DevBuf::new(max_seqs * rank * 4).map_err(he)?,
+            markov_inp: DevBuf::new(max_seqs * (2 * rank + 2 * n_embd) * 4).map_err(he)?,
+            joint: DevBuf::new(max_seqs * 3 * rank * 4).map_err(he)?,
+            markov_out: DevBuf::new(max_seqs * rank * 4).map_err(he)?,
+            delta_h: DevBuf::new(max_seqs * n_embd * 4).map_err(he)?,
+            final_h: DevBuf::new(max_seqs * n_embd * 4).map_err(he)?,
+            logits: DevBuf::new(max_seqs * 201024 * 4).map_err(he)?,
+            d_draft_toks: DevBuf::new(max_seqs * kmax * 4).map_err(he)?,
+            d_pos: DevBuf::new(max_seqs * 4).map_err(he)?,
+            d_ctx_len: DevBuf::new(max_seqs * 4).map_err(he)?,
+            d_seq_ids: DevBuf::new(max_seqs * 4).map_err(he)?,
+            d_anchors: DevBuf::new(max_seqs * 4).map_err(he)?,
+            d_slot_out: DevBuf::new(max_seqs * 4).map_err(he)?,
+            anchors_emb: DevBuf::new(max_seqs * n_embd * 4).map_err(he)?,
             stream,
             draft_graph: None,
             seq_draft_graphs: std::collections::HashMap::new(),
+            multi_draft_graphs: std::collections::HashMap::new(),
         })
     }
 
@@ -325,6 +335,9 @@ impl DsparkDrafter {
 
     unsafe fn gemm_w(&self, s: HipStream, w: &DevWeight, xq: *const core::ffi::c_void, y: *mut f32, n: i32, k: i32, b: i32) {
         match w.ty {
+            WeightType::Q4_0 if b >= 12 => {
+                ops::ink_gemm_q4_0_wmma(s, w.buf.ptr as *const u8, xq, y, n, k, b);
+            }
             WeightType::Q4_0 => {
                 ops::ink_gemm_q4_0_sudot4(s, w.buf.ptr as *const u8, xq, y, n, k, b);
             }
@@ -332,6 +345,200 @@ impl DsparkDrafter {
                 ops::ink_gemm_q8_0_sudot4(s, w.buf.ptr as *const u8, xq, y, n, k, b);
             }
         }
+    }
+
+    unsafe fn enqueue_draft_multi(&self, s: HipStream, target: &InklingEngine, n_users: usize, k_len: usize) {
+        let e = self.n_embd as i32;
+        let q_dim = (self.n_head * self.dh) as i32;
+        let kv_dim = (self.n_head_kv * self.dh) as i32;
+        let nu = n_users as i32;
+        let ki = k_len as i32;
+        let tot_b = (n_users * k_len) as i32;
+        let d_toks = self.d_draft_toks.ptr as *mut i32;
+
+        ops::ink_dspark_scatter_toks(s, self.d_anchors.ptr as *const i32, d_toks, nu, ki, 0);
+        ops::ink_embed_q8_0_norm_batch(
+            s,
+            target.tok_embd_ptr(),
+            target.tok_norm_ptr(),
+            self.d_anchors.ptr as *const i32,
+            self.anchors_emb.ptr as *mut f32,
+            e,
+            nu,
+        );
+        ops::ink_dspark_init_multi(
+            s,
+            self.anchors_emb.ptr as *const f32,
+            self.mask_embd.ptr as *const f32,
+            self.x.ptr as *mut f32,
+            e,
+            nu,
+            ki,
+        );
+
+        for l in &self.layers {
+            ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, l.attn_norm.ptr as *const f32, self.x_norm.ptr as *mut f32, e, tot_b, self.eps);
+            ops::ink_quantize_q8_1(s, self.x_norm.ptr as *const f32, self.xq.ptr, e, tot_b);
+            self.gemm_w(s, &l.wq, self.xq.ptr, self.q.ptr as *mut f32, q_dim, e, tot_b);
+            self.gemm_w(s, &l.wk, self.xq.ptr, self.k.ptr as *mut f32, kv_dim, e, tot_b);
+            self.gemm_w(s, &l.wv, self.xq.ptr, self.v.ptr as *mut f32, kv_dim, e, tot_b);
+            ops::ink_dspark_rope_norm_qk_multi(
+                s,
+                self.q.ptr as *mut f32,
+                self.k.ptr as *mut f32,
+                l.q_norm.ptr as *const f32,
+                l.k_norm.ptr as *const f32,
+                self.d_pos.ptr as *const i32,
+                nu,
+                ki,
+                self.n_head as i32,
+                self.n_head_kv as i32,
+                self.dh as i32,
+                self.freq_base,
+            );
+            ops::ink_dspark_attn_multi(
+                s,
+                self.q.ptr as *const f32,
+                self.k.ptr as *const f32,
+                self.v.ptr as *const f32,
+                l.k_cache.ptr as *const u16,
+                l.v_cache.ptr as *const u16,
+                self.d_seq_ids.ptr as *const i32,
+                self.d_ctx_len.ptr as *const i32,
+                self.attn_out.ptr as *mut f32,
+                nu,
+                ki,
+                self.n_head as i32,
+                self.n_head_kv as i32,
+                self.dh as i32,
+                self.swa_window as i32,
+                if l.is_swa { 1 } else { 0 },
+                l.max_ctx as i32,
+            );
+            ops::ink_quantize_q8_1(s, self.attn_out.ptr as *const f32, self.xq.ptr, q_dim, tot_b);
+            self.gemm_w(s, &l.wo, self.xq.ptr, self.o_out.ptr as *mut f32, e, q_dim, tot_b);
+            ops::ink_vec_add(s, self.x.ptr as *const f32, self.o_out.ptr as *const f32, self.x.ptr as *mut f32, tot_b * e);
+
+            ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, l.ffn_norm.ptr as *const f32, self.x_norm.ptr as *mut f32, e, tot_b, self.eps);
+            ops::ink_quantize_q8_1(s, self.x_norm.ptr as *const f32, self.xq.ptr, e, tot_b);
+            self.gemm_w(s, &l.ffn_gate, self.xq.ptr, self.gate.ptr as *mut f32, self.n_ff as i32, e, tot_b);
+            self.gemm_w(s, &l.ffn_up, self.xq.ptr, self.up.ptr as *mut f32, self.n_ff as i32, e, tot_b);
+            ops::ink_dspark_swiglu(s, self.gate.ptr as *const f32, self.up.ptr as *const f32, self.gate.ptr as *mut f32, tot_b * self.n_ff as i32);
+            ops::ink_quantize_q8_1(s, self.gate.ptr as *const f32, self.xq.ptr, self.n_ff as i32, tot_b);
+            self.gemm_w(s, &l.ffn_down, self.xq.ptr, self.ffn_out.ptr as *mut f32, e, self.n_ff as i32, tot_b);
+            ops::ink_vec_add(s, self.x.ptr as *const f32, self.ffn_out.ptr as *const f32, self.x.ptr as *mut f32, tot_b * e);
+        }
+
+        ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, self.output_norm.ptr as *const f32, self.hidden.ptr as *mut f32, e, tot_b, self.eps);
+        ops::ink_zero_f32(s, self.state.ptr as *mut f32, nu * self.rank as i32);
+
+        for slot in 1..k_len {
+            let si = slot as i32;
+            ops::ink_dspark_markov_inp_multi(
+                s,
+                self.state.ptr as *const f32,
+                self.markov_w1.ptr as *const u16,
+                d_toks as *const i32,
+                self.hidden.ptr as *const f32,
+                self.ctx_m.ptr as *const f32,
+                self.d_seq_ids.ptr as *const i32,
+                self.markov_inp.ptr as *mut f32,
+                e,
+                self.rank as i32,
+                nu,
+                ki,
+                si,
+            );
+            ops::ink_gemm_bf16(
+                s,
+                self.joint_proj.buf.ptr as *const u16,
+                self.markov_inp.ptr as *const f32,
+                self.joint.ptr as *mut f32,
+                (3 * self.rank) as i32,
+                (2 * self.rank + 2 * self.n_embd) as i32,
+                nu,
+            );
+            ops::ink_dspark_markov_update_multi(
+                s,
+                self.joint.ptr as *const f32,
+                self.joint_proj_b.ptr as *const f32,
+                self.state.ptr as *mut f32,
+                self.markov_out.ptr as *mut f32,
+                self.rank as i32,
+                nu,
+            );
+            ops::ink_gemm_bf16(
+                s,
+                self.hidden_out.buf.ptr as *const u16,
+                self.markov_out.ptr as *const f32,
+                self.delta_h.ptr as *mut f32,
+                e,
+                self.rank as i32,
+                nu,
+            );
+            ops::ink_dspark_add_bias_multi(
+                s,
+                self.hidden.ptr as *const f32,
+                self.delta_h.ptr as *const f32,
+                self.hidden_out_b.ptr as *const f32,
+                self.final_h.ptr as *mut f32,
+                e,
+                nu,
+                ki,
+                si,
+            );
+            ops::ink_quantize_q8_1(s, self.final_h.ptr as *const f32, self.xq.ptr, e, nu);
+            if target.output_is_q4() {
+                if n_users >= 12 {
+                    ops::ink_gemm_q4_0_wmma(s, target.output_ptr(), self.xq.ptr, self.logits.ptr as *mut f32, target.cfg.vocab_padded as i32, e, nu);
+                } else {
+                    ops::ink_gemm_q4_0_sudot4(s, target.output_ptr(), self.xq.ptr, self.logits.ptr as *mut f32, target.cfg.vocab_padded as i32, e, nu);
+                }
+            } else {
+                ops::ink_gemm_q8_0_sudot4(s, target.output_ptr(), self.xq.ptr, self.logits.ptr as *mut f32, target.cfg.vocab_padded as i32, e, nu);
+            }
+            ops::ink_softcap_argmax_batch(
+                s,
+                self.logits.ptr as *mut f32,
+                target.cfg.final_softcap,
+                target.cfg.vocab_padded as i32,
+                target.cfg.vocab_unpadded as i32,
+                self.d_slot_out.ptr as *mut i32,
+                nu,
+            );
+            ops::ink_dspark_scatter_toks(s, self.d_slot_out.ptr as *const i32, d_toks, nu, ki, si);
+        }
+    }
+
+    pub fn draft_multi(&mut self, seq_ids: &[i32], anchor_toks: &[i32], target: &InklingEngine, k_len: usize) -> Result<Vec<Vec<i32>>> {
+        let n_users = seq_ids.len();
+        assert_eq!(n_users, anchor_toks.len());
+        let k_len = k_len.min(self.block_size);
+        let ctx_lens: Vec<i32> = seq_ids.iter().map(|&s| self.seq_ctx_len[s as usize]).collect();
+        let seq_bytes = unsafe { std::slice::from_raw_parts(seq_ids.as_ptr() as *const u8, n_users * 4) };
+        let anc_bytes = unsafe { std::slice::from_raw_parts(anchor_toks.as_ptr() as *const u8, n_users * 4) };
+        let ctx_bytes = unsafe { std::slice::from_raw_parts(ctx_lens.as_ptr() as *const u8, n_users * 4) };
+        let key = (n_users, k_len);
+        if !self.multi_draft_graphs.contains_key(&key) {
+            let g = unsafe { CapturedGraph::capture(|s| self.enqueue_draft_multi(s, target, n_users, k_len)) }.map_err(he)?;
+            self.multi_draft_graphs.insert(key, g);
+        }
+        let g = self.multi_draft_graphs.get(&key).unwrap();
+        self.d_seq_ids.copy_from(seq_bytes, Some(g.stream)).map_err(he)?;
+        self.d_anchors.copy_from(anc_bytes, Some(g.stream)).map_err(he)?;
+        self.d_pos.copy_from(ctx_bytes, Some(g.stream)).map_err(he)?;
+        self.d_ctx_len.copy_from(ctx_bytes, Some(g.stream)).map_err(he)?;
+        g.launch().map_err(he)?;
+        g.sync().map_err(he)?;
+        let mut out_b = vec![0u8; n_users * k_len * 4];
+        let rc = unsafe {
+            rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.d_draft_toks.ptr, n_users * k_len * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
+        };
+        if rc != rad_hip::HIP_SUCCESS {
+            return Err(he(rc));
+        }
+        let flat: Vec<i32> = out_b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+        Ok(flat.chunks_exact(k_len).map(|c| c.to_vec()).collect())
     }
 
     unsafe fn enqueue_draft_seq(&self, s: HipStream, target: &InklingEngine, seq: usize, k_len: usize, mode: i32, add_hidden: bool, norm_anchor: bool) {

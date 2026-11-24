@@ -29,7 +29,9 @@ The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybri
 
 ## Benchmarks (AMD Radeon AI PRO R9700, `gfx1201`)
 
-Measured end-to-end on **Inkling-2-Mini** (`Inkling-2-Mini-UD-Q4_K_XL-v2.gguf` + `dspark-Inkling-2-Mini-Q8_0.gguf`, coherence-verified):
+![RAD Benchmarks on Radeon AI PRO R9700](assets/rad_benchmark.svg)
+
+Measured end-to-end on **Inkling-2-Mini** (`Inkling-2-Mini-UD-Q4_K_XL-v2.gguf` + `dspark-Inkling-2-Mini-Q8_0.gguf`, coherence-verified) on a single **AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)** — outperforming Unsloth's claimed **125 tok/s** on an **NVIDIA RTX PRO 6000 Blackwell (96 GB, ~\$8,500)**:
 
 | Workload | Throughput / Latency | Notes |
 | --- | --- | --- |
@@ -37,11 +39,11 @@ Measured end-to-end on **Inkling-2-Mini** (`Inkling-2-Mini-UD-Q4_K_XL-v2.gguf` +
 | **Long Prefill (`1,639 tok`)** | **1,651.7 tok/s** | RDNA4 WMMA INT8 (`16×32`) + WMMA FP16 FlashAttention-2 |
 | **Short Prompt TTFT (`27 tok`)** | **51.2 ms** | Split-K WMMA router + `Q4_0_SOA` |
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **32.5 ms** | Prefix-cache affinity hit |
-| **Single-User Decode (`B=1`, no-spec)** | **93.5 tok/s** | `hipGraph`-captured 48-visit loop + `half2` KV attention |
-| **Single-User Decode (DSpark `K=4..6`, code)** | **137.1 – 138.9 tok/s** | `hipGraph` draft (`2.76 ms`) + verify (`21.87 ms`, `emit=3.46`) |
+| **Single-User Decode (`B=1`, no-spec)** | **93.9 tok/s** | `hipGraph`-captured 48-visit loop + `half2` KV attention |
+| **Single-User Decode (DSpark `K=4..6`, code)** | **137.1 – 138.9 tok/s** | **+11.1% vs. Unsloth RTX PRO 6000 Blackwell (125 tok/s)** |
+| **Multi-User Decode (`B=4`, Batched DSpark `K=4`)** | **309.6 agg tok/s** | **`77.4 tok/s/user`** (`draft=3.62 ms`, `verify=35.41 ms`) |
 | **Multi-User Decode (`B=8`, no-spec)** | **238.2 agg tok/s** | `29.8 tok/s/user` (`hipGraph` + fused `moe_gu_sudot4_to_q8`) |
-| **Multi-User Decode (`B=4`, DSpark `K=4`)** | **261.1 agg tok/s** | **`65.3 tok/s/user`** (`verify_multi` `hipGraph`, `emit=3.24/user`) |
-| **Multi-User Decode (`B=8`, DSpark `K=4`)** | **351.6 agg tok/s** | **`44.0 tok/s/user`** (`+48%` over `B=8` no-spec, `emit=3.30/user`) |
+| **Multi-User Decode (`B=8`, Batched DSpark `K=4`)** | **458.6 agg tok/s** | **`57.3 tok/s/user`** (**+92%** over `B=8` no-spec, `draft=5.20 ms`) |
 | **Multi-User Decode (`B=16`, no-spec)** | **448.5 agg tok/s** | `28.0 tok/s/user` |
 | **Multi-User Decode (`B=32`, no-spec)** | **688.0 agg tok/s** | `21.5 tok/s/user` (~83% of peak R9700 HBM bandwidth) |
 | **Multi-User Decode (`B=64`, no-spec)** | **963.5 agg tok/s** | `15.1 tok/s/user` (WMMA INT8 MoE active at `B >= 48`) |
@@ -94,14 +96,16 @@ RAD_ARCH=gfx1201 bash kernels/build.sh
 cargo build --release
 ```
 
-### 3. Run the Server
+### 3. Run the CLI (`rad`)
+
+`rad` automatically detects sibling `tokenizer.json`, `dspark-Inkling-2-Mini-Q8_0.gguf`, and `mmproj-F16.gguf` files next to `--model`:
 
 ```bash
-RAD_MODEL=/path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf \
-RAD_TOKENIZER=/path/to/tokenizer.json \
-RAD_DSPARK=/path/to/dspark-Inkling-2-Mini-Q8_0.gguf \
-RAD_PORT=8088 \
-./target/release/rad-serve
+./target/release/rad serve -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf --port 8088
+
+./target/release/rad run "Write a concise Python LRU cache" -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf
+
+./target/release/rad info -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf
 ```
 
 ### 4. Run Benchmarks & API Tests
@@ -139,6 +143,7 @@ python3 scripts/test_serve.py
 
 ## Roadmap
 
+- **Vision (`mmproj`) GPU Encoder:** Full HIP ViT/SigLIP image-patch encoder for `mmproj-F16.gguf` (CLI `--mmproj` auto-detection is already wired in).
 - **Hardware backends:** CDNA (`gfx942` / MI300X), RDNA3 (`gfx1100`), NVIDIA CUDA, and Apple Metal backends behind a unified device trait.
 - **Model families:** Standard GQA/MLA transformers, Qwen3-MoE, Llama, DeepSeek, and hybrid SSM/attention architectures.
 - **Serving features:** Paged KV cache, chunked prefill, tool-calling grammar constraints, and Prometheus metrics.

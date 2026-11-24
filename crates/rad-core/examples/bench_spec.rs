@@ -129,9 +129,8 @@ fn main() -> Result<()> {
                 drafter.inject_target_feats_seq(u, fptr, j as i32)?;
             }
             cur_toks[u] = first;
-            let _ = drafter.draft_seq(u, first, &eng, k_len)?;
         }
-        let dummy_drafts: Vec<Vec<i32>> = (0..n_users).map(|u| vec![cur_toks[u]; k_len]).collect();
+        let dummy_drafts = drafter.draft_multi(&seq_ids, &cur_toks, &eng, k_len)?;
         let _ = eng.verify_multi(&seq_ids, &dummy_drafts)?;
         for u in 0..n_users {
             eng.reset_seq(u)?;
@@ -151,10 +150,7 @@ fn main() -> Result<()> {
         let t0 = Instant::now();
         for _ in 0..24 {
             let td = Instant::now();
-            let mut drafts = Vec::with_capacity(n_users);
-            for u in 0..n_users {
-                drafts.push(drafter.draft_seq(u, cur_toks[u], &eng, k_len)?);
-            }
+            let drafts = drafter.draft_multi(&seq_ids, &cur_toks, &eng, k_len)?;
             draft_ms += td.elapsed().as_secs_f64() * 1000.0;
 
             let pos_before: Vec<i32> = (0..n_users).map(|u| eng.seq_pos[u]).collect();
