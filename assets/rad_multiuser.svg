@@ -38,9 +38,9 @@
   <rect x="345" y="113" width="108" height="22" rx="5" fill="url(#tealGrad)"/>
   <text x="463" y="129" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#2dd4bf">458.5 tok/s</text>
 
-  <text x="56" y="162" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=8 Continuous Batching (64.5 tok/s/user)</text>
+  <text x="56" y="162" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=8 Continuous Batching (64.6 tok/s/user)</text>
   <rect x="345" y="147" width="122" height="22" rx="5" fill="url(#slateGrad)"/>
-  <text x="477" y="163" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#cbd5e1">515.7 tok/s</text>
+  <text x="477" y="163" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#cbd5e1">516.9 tok/s</text>
 
   <text x="56" y="196" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=8 Batched DSpark K=4 (57.3 tok/s/user)</text>
   <rect x="345" y="181" width="108" height="22" rx="5" fill="url(#greenGrad)"/>
@@ -51,8 +51,8 @@
   <text x="506" y="231" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#2dd4bf">638.1 tok/s</text>
 
   <text x="56" y="264" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=16 Continuous Batching (42.5 tok/s/user)</text>
-  <rect x="345" y="249" width="160" height="22" rx="5" fill="url(#cyanGrad)"/>
-  <text x="515" y="265" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">679.9 tok/s</text>
+  <rect x="345" y="249" width="161" height="22" rx="5" fill="url(#cyanGrad)"/>
+  <text x="516" y="265" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">680.2 tok/s</text>
 
   <text x="56" y="298" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=32 Continuous Batching (26.5 tok/s/user)</text>
   <rect x="345" y="283" width="200" height="22" rx="5" fill="url(#cyanGrad)"/>

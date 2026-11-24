@@ -66,10 +66,12 @@ __device__ __forceinline__ float s_warp_max32(float v) {
 extern "C" __global__ void quantize_q8_1_k(const float* __restrict__ X,
                                            q8_1_blk* __restrict__ Y,
                                            int k) {
-    int b = blockIdx.x;
-    int t = blockIdx.y;
-    int lane = threadIdx.x;
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
     int nblk = k >> 5;
+    int b = blockIdx.x * 4 + wid;
+    if (b >= nblk) return;
+    int t = blockIdx.y;
     float v = X[(size_t)t * k + (b << 5) + lane];
     float amax = s_warp_max32(fabsf(v));
     amax = __shfl(amax, 0, 32);
@@ -79,16 +81,16 @@ extern "C" __global__ void quantize_q8_1_k(const float* __restrict__ X,
     if (qi > 127) qi = 127;
     if (qi < -127) qi = -127;
     int32_t qsum = s_warp_sum32_i(qi);
-    __shared__ int8_t sm[32];
-    sm[lane] = (int8_t)qi;
-    __syncthreads();
+    int q1 = __shfl_down(qi, 1, 32);
+    int q2 = __shfl_down(qi, 2, 32);
+    int q3 = __shfl_down(qi, 3, 32);
     q8_1_blk* dst = Y + (size_t)t * nblk + b;
     if (lane == 0) {
         dst->d = d;
         dst->s = qsum;
     }
-    if (lane < 8) {
-        dst->q[lane] = pack4_i8(sm[lane * 4], sm[lane * 4 + 1], sm[lane * 4 + 2], sm[lane * 4 + 3]);
+    if ((lane & 3) == 0) {
+        dst->q[lane >> 2] = pack4_i8((int8_t)qi, (int8_t)q1, (int8_t)q2, (int8_t)q3);
     }
 }
 
@@ -517,7 +519,8 @@ extern "C" __global__ void wo_conv_res_q4_b1_8_k(const uint8_t* __restrict__ W, 
 extern "C" __global__ void moe_dn_conv_add_q4_b1_4_k(const uint8_t* __restrict__ W, const float* __restrict__ scales, const q8_1_blk* __restrict__ act_q, const int* __restrict__ itop, const float* __restrict__ wtop, const float* __restrict__ conv_w, float* __restrict__ hist, const float* __restrict__ ffn_inp, float* __restrict__ cur, int n_embd, int n_ff, int n_used);
 
 extern "C" int ink_quantize_q8_1(hipStream_t s, const float* X, void* Y, int k, int B) {
-    quantize_q8_1_k<<<dim3(k >> 5, B), dim3(32), 0, s>>>(X, (q8_1_blk*)Y, k);
+    int nblk = k >> 5;
+    quantize_q8_1_k<<<dim3((nblk + 3) / 4, B), dim3(128), 0, s>>>(X, (q8_1_blk*)Y, k);
     return 0;
 }
 

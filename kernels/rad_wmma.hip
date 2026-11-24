@@ -1398,7 +1398,7 @@ extern "C" __global__ void attn_batch_gated_flash_k(const float* __restrict__ Q,
                                                     int rel_extent, int swa_window,
                                                     int is_swa, int max_ctx, int B) {
     int h = blockIdx.x;
-    int bt_blk = blockIdx.y * 64;
+    int bt_blk = (gridDim.y - 1 - blockIdx.y) * 64;
     int wid = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int col = lane & 15;
