@@ -630,11 +630,11 @@ fn run_scheduler(
             }
         }
 
-        if active.len() >= 2 && active.len() <= 8 {
+        if active.len() >= 1 && active.len() <= 8 {
             if let Some(ref mut d) = drafter {
                 let all_ready = active.iter().all(|a| a.seq < d.max_seqs() && d.seq_ctx_len(a.seq) == engine.seq_pos[a.seq]);
                 if all_ready {
-                    let multi_k = 4usize;
+                    let multi_k = if active.len() == 1 { spec_k } else { 4usize };
                     let seq_ids: Vec<i32> = active.iter().map(|a| a.seq as i32).collect();
                     let anchors: Vec<i32> = active.iter().map(|a| a.next_tok).collect();
                     let pos_before: Vec<i32> = active.iter().map(|a| engine.seq_pos[a.seq]).collect();
