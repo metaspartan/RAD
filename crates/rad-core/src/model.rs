@@ -374,6 +374,8 @@ pub struct InklingEngine {
     pub pos: i32,
     pub seq_pos: Vec<i32>,
     pub seq_tokens: Vec<Vec<i32>>,
+    pub paged_kv: crate::paged_kv::PagedKvManager,
+    last_logits_in_sc: bool,
     b1_sudot4: bool,
 }
 
@@ -628,6 +630,13 @@ impl InklingEngine {
             pos: 0,
             seq_pos: vec![0; max_seqs],
             seq_tokens: vec![Vec::new(); max_seqs],
+            paged_kv: crate::paged_kv::PagedKvManager::new(
+                max_seqs,
+                max_ctx,
+                std::env::var("RAD_KV_BLOCK_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(16),
+                std::env::var("RAD_KV_BLOCKS").ok().and_then(|s| s.parse().ok()),
+            ),
+            last_logits_in_sc: false,
             b1_sudot4,
         })
     }
@@ -1712,8 +1721,12 @@ impl InklingEngine {
                 self.rewind_graphs.insert(key, g);
             }
             let g = self.rewind_graphs.get(&key).unwrap();
-            g.launch().map_err(he)?;
-            g.sync().map_err(he)?;
+            let target_s = if seq == 0 {
+                self.verify_graph.as_ref().map(|(_, vg)| vg.stream).unwrap_or(self.stream)
+            } else {
+                self.seq_verify_graphs.get(&(seq, b)).map(|vg| vg.stream).unwrap_or(self.stream)
+            };
+            g.launch_on(target_s).map_err(he)?;
             self.seq_pos[seq] -= (b - n_acc) as i32;
             if seq == 0 {
                 self.pos = self.seq_pos[0];
@@ -1728,6 +1741,15 @@ impl InklingEngine {
     }
 
     pub fn reset_seq(&mut self, seq: usize) -> Result<()> {
+        if let Some((_, ref vg)) = self.verify_graph {
+            let _ = vg.sync();
+        }
+        for ((s_id, _), vg) in &self.seq_verify_graphs {
+            if *s_id == seq {
+                let _ = vg.sync();
+            }
+        }
+        self.paged_kv.free_seq(seq);
         let kv_dim = self.cfg.n_head_kv * self.cfg.dh;
         let e = self.cfg.n_embd;
         let kv_bytes = kv_dim * 3 * 4;
@@ -1855,8 +1877,10 @@ impl InklingEngine {
             let nxt = self.step(tokens[0])?;
             self.seq_pos[0] = self.pos;
             self.seq_tokens[0].push(tokens[0]);
+            self.last_logits_in_sc = true;
             return Ok(vec![nxt]);
         }
+        self.last_logits_in_sc = false;
         let positions: Vec<i32> = seq_ids.iter().map(|&s| self.seq_pos[s as usize]).collect();
         let tok_bytes = unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, b * 4) };
         let seq_bytes = unsafe { std::slice::from_raw_parts(seq_ids.as_ptr() as *const u8, b * 4) };
@@ -2389,6 +2413,7 @@ impl InklingEngine {
     }
 
     pub fn prefill_tokens_seq(&mut self, seq: usize, tokens: &[i32]) -> Result<i32> {
+        self.last_logits_in_sc = false;
         let mut last = 0i32;
         let mut i = 0usize;
         while i < tokens.len() {
@@ -3089,6 +3114,29 @@ impl InklingEngine {
             b, t_amix*inv, t_qkvrg*inv, t_kvconv*inv, t_attn*inv, t_wo*inv, t_aconv*inv, t_fmix*inv, t_router*inv, t_mgu*inv, t_mdn*inv, t_fconv*inv, t_lm*inv, tot
         );
         Ok(())
+    }
+
+    pub fn read_batch_logits(&self, tok_idx: usize) -> Result<Vec<f32>> {
+        if self.last_logits_in_sc && tok_idx == 0 {
+            return self.read_logits();
+        }
+        let n = self.cfg.vocab_unpadded;
+        let stride = self.cfg.vocab_padded;
+        let mut raw = vec![0u8; n * 4];
+        let slice_len = raw.len();
+        let rc = unsafe {
+            let src = (self.bsc.logits.ptr as *const f32).add(tok_idx * stride) as *const core::ffi::c_void;
+            rad_hip::hipMemcpy(
+                raw.as_mut_ptr() as *mut core::ffi::c_void,
+                src,
+                slice_len,
+                rad_hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )
+        };
+        if rc != rad_hip::HIP_SUCCESS {
+            return Err(he(rc));
+        }
+        Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
     }
 
     pub fn read_logits(&self) -> Result<Vec<f32>> {

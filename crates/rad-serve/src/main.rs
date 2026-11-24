@@ -1,9 +1,12 @@
+mod grammar;
+mod metrics;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -42,6 +45,7 @@ struct GenJob {
     images: Vec<String>,
     max_tokens: usize,
     enable_thinking: bool,
+    json_grammar: bool,
     tx: mpsc::UnboundedSender<GenEvent>,
 }
 
@@ -118,6 +122,22 @@ impl Drafter {
         }
     }
 
+    fn inject_batch_seq_async(&mut self, seq: usize, engine: &InklingEngine, start_tok: usize, pos0: i32, n_tok: usize) -> anyhow::Result<()> {
+        match self {
+            Drafter::DFlash2(d) => {
+                let (fptr, mb) = engine.batch_dspark_feats_ptr();
+                d.inject_target_feats_batch_seq_async(seq, fptr, mb, start_tok, pos0, n_tok)
+            }
+            Drafter::Dspark(d) => {
+                for j in 0..n_tok {
+                    let fptr = engine.gather_batch_dspark_feats(start_tok + j);
+                    d.inject_target_feats_seq(seq, fptr, pos0 + j as i32)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn draft(&mut self, anchor_tok: i32, target: &InklingEngine, k_len: usize) -> anyhow::Result<Vec<i32>> {
         match self {
             Drafter::DFlash2(d) => d.draft(anchor_tok, target, k_len),
@@ -146,18 +166,33 @@ struct ActiveSlot {
     max_tokens: usize,
     emitted: usize,
     enable_thinking: bool,
+    grammar: Option<grammar::JsonGrammarState>,
     started_at: Instant,
+    last_tok_at: Instant,
     tx: mpsc::UnboundedSender<GenEvent>,
+}
+
+struct PrefillSlot {
+    seq: usize,
+    job: GenJob,
+    offset: usize,
+    cached_n: usize,
+    started_at: Instant,
 }
 
 struct AppState {
     job_tx: mpsc::UnboundedSender<GenJob>,
     tokenizer: Arc<Tokenizer>,
-    api_key: String,
+    metrics: Arc<metrics::Metrics>,
+    api_keys: Vec<String>,
+    metrics_auth: bool,
     spec_enabled: bool,
     spec_mode: &'static str,
     vision_enabled: bool,
     mmproj_path: Option<String>,
+    prefill_chunk_size: usize,
+    kv_block_size: usize,
+    port: u16,
 }
 
 #[derive(Serialize)]
@@ -168,6 +203,15 @@ struct Health {
     spec_mode: &'static str,
     vision_enabled: bool,
     mmproj_detected: bool,
+    paged_kv: bool,
+    kv_block_size: usize,
+    kv_blocks_used: u64,
+    kv_blocks_total: u64,
+    chunked_prefill: bool,
+    prefill_chunk_size: usize,
+    grammar_constraints: bool,
+    metrics_enabled: bool,
+    port: u16,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +244,10 @@ struct ChatRequest {
     stream: Option<bool>,
     #[serde(default)]
     tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
     #[serde(default)]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
@@ -242,12 +290,38 @@ struct WsAuthQuery {
     api_key: Option<String>,
 }
 
-fn check_auth(headers: &HeaderMap, expected: &str) -> bool {
-    if expected.is_empty() {
+fn const_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn check_auth_keys(headers: &HeaderMap, keys: &[String]) -> bool {
+    if keys.is_empty() {
         return true;
     }
-    match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        Some(h) => h.strip_prefix("Bearer ").map(|t| t == expected).unwrap_or(false),
+    let provided = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
+    match provided {
+        Some(tok) => keys.iter().any(|k| const_eq(tok.as_bytes(), k.as_bytes())),
+        None => false,
+    }
+}
+
+fn check_key_str(provided: Option<&str>, keys: &[String]) -> bool {
+    if keys.is_empty() {
+        return true;
+    }
+    match provided {
+        Some(tok) => keys.iter().any(|k| const_eq(tok.as_bytes(), k.as_bytes())),
         None => false,
     }
 }
@@ -480,21 +554,36 @@ fn prefill_with_drafter(
     }
 }
 
+fn sync_kv_metrics(engine: &InklingEngine, metrics: &metrics::Metrics) {
+    let st = engine.paged_kv.stats();
+    metrics.kv_blocks_total.store(st.total_blocks as u64, Ordering::Relaxed);
+    metrics.kv_blocks_used.store(st.used_blocks as u64, Ordering::Relaxed);
+    metrics.kv_blocks_shared.store(st.shared_blocks as u64, Ordering::Relaxed);
+}
+
 fn run_scheduler(
     mut engine: InklingEngine,
     mut drafter: Option<Drafter>,
     mut vision: Option<VisionEncoder>,
     image_tok_id: Option<i32>,
+    vocab_grammar: Arc<grammar::VocabGrammarTable>,
+    metrics: Arc<metrics::Metrics>,
+    prefill_chunk_size: usize,
     mut rx: mpsc::UnboundedReceiver<GenJob>,
 ) {
     let max_seqs = engine.max_seqs;
     let mut free = vec![true; max_seqs];
     let mut active: Vec<ActiveSlot> = Vec::with_capacity(max_seqs);
+    let mut prefilling: VecDeque<PrefillSlot> = VecDeque::new();
     let mut pending: VecDeque<GenJob> = VecDeque::new();
     let spec_k = drafter.as_ref().map(|d| d.spec_k()).unwrap_or(4);
+    sync_kv_metrics(&engine, &metrics);
 
     loop {
-        if active.is_empty() && pending.is_empty() {
+        if active.is_empty() && prefilling.is_empty() && pending.is_empty() {
+            metrics.requests_active.store(0, Ordering::Relaxed);
+            metrics.requests_queued.store(0, Ordering::Relaxed);
+            metrics.requests_prefilling.store(0, Ordering::Relaxed);
             match rx.blocking_recv() {
                 Some(job) => pending.push_back(job),
                 None => break,
@@ -512,61 +601,171 @@ fn run_scheduler(
             let Some(seq) = slot_opt else { break; };
             let job = pending.pop_front().unwrap();
             free[seq] = false;
-            let tp = Instant::now();
-            match prefill_with_drafter(&mut engine, seq, &job.prompt_ids, &job.images, image_tok_id, drafter.as_mut(), vision.as_mut()) {
-                Ok((first_tok, cached_n)) => {
-                    let pp_ms = tp.elapsed().as_secs_f64() * 1000.0;
-                    let _ = job.tx.send(GenEvent::Prefill {
-                        prompt_n: job.prompt_ids.len(),
-                        cached_n,
-                        pp_ms,
-                    });
-                    if job.max_tokens == 0 || first_tok == 200006 || (first_tok == 200008 && !job.enable_thinking) {
-                        let _ = job.tx.send(GenEvent::Done {
-                            finish_reason: if job.max_tokens == 0 { "length" } else { "stop" },
-                            pred_n: 0,
-                            dec_ms: 0.0,
-                        });
-                        free[seq] = true;
-                    } else {
-                        let _ = job.tx.send(GenEvent::Token(first_tok as u32));
-                        if job.max_tokens == 1 {
-                            let _ = job.tx.send(GenEvent::Done {
-                                finish_reason: "length",
-                                pred_n: 1,
-                                dec_ms: 0.0,
-                            });
+            if !job.images.is_empty() && vision.is_some() && image_tok_id.is_some() {
+                let tp = Instant::now();
+                match prefill_with_drafter(&mut engine, seq, &job.prompt_ids, &job.images, image_tok_id, drafter.as_mut(), vision.as_mut()) {
+                    Ok((mut first_tok, cached_n)) => {
+                        let pp_s = tp.elapsed().as_secs_f64();
+                        let pp_ms = pp_s * 1000.0;
+                        metrics.prompt_tokens_total.fetch_add(job.prompt_ids.len() as u64, Ordering::Relaxed);
+                        metrics.prefill_us_total.fetch_add((pp_s * 1e6) as u64, Ordering::Relaxed);
+                        metrics.observe_ttft(pp_s);
+                        let _ = engine.paged_kv.ensure_tokens(seq, engine.seq_pos[seq] as usize, &engine.seq_tokens[seq]);
+                        sync_kv_metrics(&engine, &metrics);
+                        let mut gram = if job.json_grammar { Some(grammar::JsonGrammarState::new_json()) } else { None };
+                        if let Some(ref mut g) = gram {
+                            if let Ok(logits) = engine.read_batch_logits(0) {
+                                first_tok = vocab_grammar.select_best_token(&logits, g);
+                            }
+                        }
+                        let _ = job.tx.send(GenEvent::Prefill { prompt_n: job.prompt_ids.len(), cached_n, pp_ms });
+                        if job.max_tokens == 0 || first_tok == 200006 || (first_tok == 200008 && !job.enable_thinking) {
+                            let _ = job.tx.send(GenEvent::Done { finish_reason: if job.max_tokens == 0 { "length" } else { "stop" }, pred_n: 0, dec_ms: 0.0 });
                             free[seq] = true;
                         } else {
-                            active.push(ActiveSlot {
-                                seq,
-                                next_tok: first_tok,
-                                max_tokens: job.max_tokens,
-                                emitted: 1,
-                                enable_thinking: job.enable_thinking,
-                                started_at: Instant::now(),
-                                tx: job.tx,
+                            let _ = job.tx.send(GenEvent::Token(first_tok as u32));
+                            metrics.generated_tokens_total.fetch_add(1, Ordering::Relaxed);
+                            if job.max_tokens == 1 {
+                                let _ = job.tx.send(GenEvent::Done { finish_reason: "length", pred_n: 1, dec_ms: 0.0 });
+                                free[seq] = true;
+                            } else {
+                                let now = Instant::now();
+                                active.push(ActiveSlot {
+                                    seq, next_tok: first_tok, max_tokens: job.max_tokens, emitted: 1,
+                                    enable_thinking: job.enable_thinking, grammar: gram,
+                                    started_at: now, last_tok_at: now, tx: job.tx,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = job.tx.send(GenEvent::Error(format!("{e}")));
+                        free[seq] = true;
+                    }
+                }
+            } else {
+                let mut common = 0usize;
+                {
+                    let cached = &engine.seq_tokens[seq];
+                    let lim = cached.len().min(job.prompt_ids.len().saturating_sub(1));
+                    while common < lim && cached[common] == job.prompt_ids[common] {
+                        common += 1;
+                    }
+                }
+                let drafter_matches = match drafter.as_ref() {
+                    Some(d) if seq < d.max_seqs() => d.seq_ctx_len(seq) as usize == common,
+                    _ => true,
+                };
+                if common == 0 || common != engine.seq_tokens[seq].len() || !drafter_matches {
+                    let _ = engine.reset_seq(seq);
+                    if let Some(ref mut d) = drafter {
+                        if seq < d.max_seqs() {
+                            d.reset_seq(seq);
+                        }
+                    }
+                    common = 0;
+                } else if common > 0 {
+                    metrics.prefix_cache_hits_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.prefix_cache_tokens_saved_total.fetch_add(common as u64, Ordering::Relaxed);
+                }
+                prefilling.push_back(PrefillSlot {
+                    seq,
+                    job,
+                    offset: common,
+                    cached_n: common,
+                    started_at: Instant::now(),
+                });
+            }
+        }
+
+        if let Some(mut pf) = prefilling.pop_front() {
+            let chunk_lim = if active.is_empty() { 1024 } else { prefill_chunk_size.max(64).min(1024) };
+            let end = (pf.offset + chunk_lim).min(pf.job.prompt_ids.len());
+            let chunk = &pf.job.prompt_ids[pf.offset..end];
+            let pos0 = engine.seq_pos[pf.seq];
+            match engine.prefill_tokens_seq(pf.seq, chunk) {
+                Ok(mut last_tok) => {
+                    if let Some(ref mut d) = drafter {
+                        if pf.seq < d.max_seqs() {
+                            let _ = d.inject_batch_seq(pf.seq, &engine, 0, pos0, chunk.len());
+                        }
+                    }
+                    let _ = engine.paged_kv.ensure_tokens(pf.seq, engine.seq_pos[pf.seq] as usize, &engine.seq_tokens[pf.seq]);
+                    sync_kv_metrics(&engine, &metrics);
+                    pf.offset = end;
+                    if pf.offset < pf.job.prompt_ids.len() {
+                        prefilling.push_back(pf);
+                    } else {
+                        let pp_s = pf.started_at.elapsed().as_secs_f64();
+                        let pp_ms = pp_s * 1000.0;
+                        metrics.prompt_tokens_total.fetch_add(pf.job.prompt_ids.len() as u64, Ordering::Relaxed);
+                        metrics.prefill_us_total.fetch_add((pp_s * 1e6) as u64, Ordering::Relaxed);
+                        metrics.observe_ttft(pp_s);
+                        let mut gram = if pf.job.json_grammar { Some(grammar::JsonGrammarState::new_json()) } else { None };
+                        if let Some(ref mut g) = gram {
+                            if let Ok(logits) = engine.read_batch_logits(0) {
+                                last_tok = vocab_grammar.select_best_token(&logits, g);
+                            }
+                        }
+                        let _ = pf.job.tx.send(GenEvent::Prefill {
+                            prompt_n: pf.job.prompt_ids.len(),
+                            cached_n: pf.cached_n,
+                            pp_ms,
+                        });
+                        if pf.job.max_tokens == 0 || last_tok == 200006 || (last_tok == 200008 && !pf.job.enable_thinking) {
+                            let _ = pf.job.tx.send(GenEvent::Done {
+                                finish_reason: if pf.job.max_tokens == 0 { "length" } else { "stop" },
+                                pred_n: 0,
+                                dec_ms: 0.0,
                             });
+                            free[pf.seq] = true;
+                        } else {
+                            let _ = pf.job.tx.send(GenEvent::Token(last_tok as u32));
+                            metrics.generated_tokens_total.fetch_add(1, Ordering::Relaxed);
+                            if pf.job.max_tokens == 1 {
+                                let _ = pf.job.tx.send(GenEvent::Done { finish_reason: "length", pred_n: 1, dec_ms: 0.0 });
+                                free[pf.seq] = true;
+                            } else {
+                                let now = Instant::now();
+                                active.push(ActiveSlot {
+                                    seq: pf.seq,
+                                    next_tok: last_tok,
+                                    max_tokens: pf.job.max_tokens,
+                                    emitted: 1,
+                                    enable_thinking: pf.job.enable_thinking,
+                                    grammar: gram,
+                                    started_at: now,
+                                    last_tok_at: now,
+                                    tx: pf.job.tx,
+                                });
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    let _ = job.tx.send(GenEvent::Error(format!("{e}")));
-                    free[seq] = true;
+                    let _ = pf.job.tx.send(GenEvent::Error(format!("{e}")));
+                    free[pf.seq] = true;
                 }
             }
         }
+
+        metrics.requests_active.store(active.len() as i64, Ordering::Relaxed);
+        metrics.requests_queued.store(pending.len() as i64, Ordering::Relaxed);
+        metrics.requests_prefilling.store(prefilling.len() as i64, Ordering::Relaxed);
 
         if active.is_empty() {
             continue;
         }
 
-        if active.len() == 1 {
+        let any_grammar = active.iter().any(|a| a.grammar.is_some());
+
+        if active.len() == 1 && !any_grammar {
             if let Some(ref mut d) = drafter {
                 let seq = active[0].seq;
                 if seq < d.max_seqs() && d.seq_ctx_len(seq) == engine.seq_pos[seq] {
                     let mut slot = active.pop().unwrap();
                     let pos0 = engine.seq_pos[seq];
+                    let t_step = Instant::now();
                     let res = (|| -> anyhow::Result<Vec<i32>> {
                         let draft = if seq == 0 {
                             d.draft(slot.next_tok, &engine, spec_k)?
@@ -583,10 +782,11 @@ fn run_scheduler(
                             }
                         }
                         engine.rewind_verify_seq_to(seq, n_acc, spec_k)?;
-                        d.inject_batch_seq(seq, &engine, 0, pos0, n_acc)?;
+                        d.inject_batch_seq_async(seq, &engine, 0, pos0, n_acc)?;
                         for j in 0..n_acc {
                             engine.seq_tokens[seq].push(draft[j]);
                         }
+                        let _ = engine.paged_kv.ensure_tokens(seq, engine.seq_pos[seq] as usize, &engine.seq_tokens[seq]);
                         let mut emitted_toks = Vec::with_capacity(n_acc);
                         for j in 1..n_acc {
                             emitted_toks.push(draft[j]);
@@ -594,8 +794,17 @@ fn run_scheduler(
                         emitted_toks.push(verified[n_acc - 1]);
                         Ok(emitted_toks)
                     })();
+                    let step_s = t_step.elapsed().as_secs_f64();
+                    sync_kv_metrics(&engine, &metrics);
                     match res {
                         Ok(toks_out) => {
+                            let n_out = toks_out.len();
+                            metrics.spec_rounds_total.fetch_add(1, Ordering::Relaxed);
+                            metrics.spec_accepted_tokens_total.fetch_add(n_out as u64, Ordering::Relaxed);
+                            metrics.decode_us_total.fetch_add((step_s * 1e6) as u64, Ordering::Relaxed);
+                            if n_out > 0 {
+                                metrics.observe_itl(step_s / n_out as f64);
+                            }
                             let mut finished = false;
                             let mut last_tok = slot.next_tok;
                             for nxt in toks_out {
@@ -612,6 +821,7 @@ fn run_scheduler(
                                     break;
                                 }
                                 slot.emitted += 1;
+                                metrics.generated_tokens_total.fetch_add(1, Ordering::Relaxed);
                                 let _ = slot.tx.send(GenEvent::Token(nxt as u32));
                                 last_tok = nxt;
                                 if slot.emitted >= slot.max_tokens {
@@ -628,6 +838,7 @@ fn run_scheduler(
                             }
                             if !finished {
                                 slot.next_tok = last_tok;
+                                slot.last_tok_at = Instant::now();
                                 active.push(slot);
                             }
                         }
@@ -641,7 +852,7 @@ fn run_scheduler(
             }
         }
 
-        if active.len() >= 1 && active.len() <= 8 {
+        if active.len() >= 1 && active.len() <= 8 && !any_grammar {
             if let Some(ref mut d) = drafter {
                 let all_ready = active.iter().all(|a| a.seq < d.max_seqs() && d.seq_ctx_len(a.seq) == engine.seq_pos[a.seq]);
                 if all_ready {
@@ -737,10 +948,20 @@ fn run_scheduler(
 
         let seq_ids: Vec<i32> = active.iter().map(|a| a.seq as i32).collect();
         let toks: Vec<i32> = active.iter().map(|a| a.next_tok).collect();
+        let t_step = Instant::now();
         match engine.step_multi(&seq_ids, &toks) {
             Ok(nexts) => {
+                let step_s = t_step.elapsed().as_secs_f64();
+                metrics.decode_us_total.fetch_add((step_s * 1e6) as u64, Ordering::Relaxed);
+                metrics.observe_itl(step_s);
                 let mut keep = Vec::with_capacity(active.len());
-                for (mut slot, nxt) in active.into_iter().zip(nexts.into_iter()) {
+                for (u, (mut slot, mut nxt)) in active.into_iter().zip(nexts.into_iter()).enumerate() {
+                    if let Some(ref mut g) = slot.grammar {
+                        if let Ok(logits) = engine.read_batch_logits(u) {
+                            nxt = vocab_grammar.select_best_token(&logits, g);
+                        }
+                    }
+                    let _ = engine.paged_kv.ensure_tokens(slot.seq, engine.seq_pos[slot.seq] as usize, &engine.seq_tokens[slot.seq]);
                     let is_stop = nxt == 200006 || (nxt == 200008 && !slot.enable_thinking);
                     if is_stop || slot.tx.is_closed() {
                         let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
@@ -752,6 +973,7 @@ fn run_scheduler(
                         free[slot.seq] = true;
                     } else {
                         slot.emitted += 1;
+                        metrics.generated_tokens_total.fetch_add(1, Ordering::Relaxed);
                         let _ = slot.tx.send(GenEvent::Token(nxt as u32));
                         if slot.emitted >= slot.max_tokens {
                             let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
@@ -763,10 +985,12 @@ fn run_scheduler(
                             free[slot.seq] = true;
                         } else {
                             slot.next_tok = nxt;
+                            slot.last_tok_at = Instant::now();
                             keep.push(slot);
                         }
                     }
                 }
+                sync_kv_metrics(&engine, &metrics);
                 active = keep;
             }
             Err(e) => {
@@ -786,10 +1010,11 @@ async fn collect_job(
     images: Vec<String>,
     max_tokens: usize,
     enable_thinking: bool,
+    json_grammar: bool,
 ) -> Result<(Vec<u32>, usize, usize, f64, f64, &'static str), String> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     st.job_tx
-        .send(GenJob { prompt_ids, images, max_tokens, enable_thinking, tx })
+        .send(GenJob { prompt_ids, images, max_tokens, enable_thinking, json_grammar, tx })
         .map_err(|_| "scheduler closed".to_string())?;
     let mut out_ids = Vec::with_capacity(max_tokens.min(4096));
     let mut prompt_n = 0usize;
@@ -824,11 +1049,33 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<Health> {
         spec_mode: st.spec_mode,
         vision_enabled: st.vision_enabled,
         mmproj_detected: st.mmproj_path.is_some(),
+        paged_kv: true,
+        kv_block_size: st.kv_block_size,
+        kv_blocks_used: st.metrics.kv_blocks_used.load(Ordering::Relaxed),
+        kv_blocks_total: st.metrics.kv_blocks_total.load(Ordering::Relaxed),
+        chunked_prefill: true,
+        prefill_chunk_size: st.prefill_chunk_size,
+        grammar_constraints: true,
+        metrics_enabled: true,
+        port: st.port,
     })
 }
 
+async fn metrics_endpoint(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if st.metrics_auth && !check_auth_keys(&headers, &st.api_keys) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
+    }
+    let body = st.metrics.render();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"))],
+        body,
+    )
+        .into_response()
+}
+
 async fn models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &st.api_key) {
+    if !check_auth_keys(&headers, &st.api_keys) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
     }
     let now = now_unix();
@@ -857,27 +1104,61 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    if !check_auth(&headers, &st.api_key) {
+    if !check_auth_keys(&headers, &st.api_keys) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
     }
     let model_id = req.model.unwrap_or_else(|| "inkling-2-mini".into());
     let max_tokens = req.max_tokens.unwrap_or(512).min(8192);
     let enable_thinking = req.chat_template_kwargs.and_then(|k| k.enable_thinking).unwrap_or(false);
     let stream = req.stream.unwrap_or(false);
-    let (mut prompt, images) = format_prompt_with_images(&req.messages, enable_thinking);
+    let mut allowed_tools: Vec<String> = Vec::new();
+    let mut force_tool_json = false;
+    let mut forced_tool_name: Option<String> = None;
+    if let Some(ref tc) = req.tool_choice {
+        if tc.as_str() == Some("required") {
+            force_tool_json = true;
+        } else if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+            force_tool_json = true;
+            forced_tool_name = Some(name.to_string());
+        }
+    }
+    let response_json = req.response_format.as_ref().and_then(|rf| rf.get("type")).and_then(|t| t.as_str()).map(|t| t == "json_object" || t == "json_schema").unwrap_or(false);
+    let json_grammar = force_tool_json || response_json;
+
+    let (mut prompt, images) = format_prompt_with_images(&req.messages, enable_thinking && !json_grammar);
     if let Some(ref tools) = req.tools {
         if !tools.is_empty() {
+            for t in tools {
+                if let Some(n) = t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+                    allowed_tools.push(n.to_string());
+                }
+            }
             let tools_json = serde_json::to_string(tools).unwrap_or_default();
-            let tool_sys = format!("<|message_system|><|content_text|>Available tools: {tools_json}<|end_message|>");
+            let extra = if let Some(ref fn_name) = forced_tool_name {
+                format!(" You MUST call tool `{fn_name}` by responding ONLY with valid JSON: {{\"name\": \"{fn_name}\", \"arguments\": {{...}}}}.")
+            } else if force_tool_json {
+                " You MUST respond ONLY with valid JSON tool call: {\"name\": \"<tool_name>\", \"arguments\": {...}}.".to_string()
+            } else {
+                " To call a tool, respond with JSON: {\"name\": \"<tool_name>\", \"arguments\": {...}}.".to_string()
+            };
+            let tool_sys = format!("<|message_system|><|content_text|>Available tools: {tools_json}{extra}<|end_message|>");
             if let Some(rest) = prompt.strip_prefix("<|begin_of_text|>") {
                 prompt = format!("<|begin_of_text|>{tool_sys}{rest}");
             }
+        }
+    } else if response_json {
+        let json_sys = "<|message_system|><|content_text|>Respond ONLY with valid JSON.<|end_message|>";
+        if let Some(rest) = prompt.strip_prefix("<|begin_of_text|>") {
+            prompt = format!("<|begin_of_text|>{json_sys}{rest}");
         }
     }
 
     let enc = match st.tokenizer.encode(prompt, false) {
         Ok(e) => e,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e}")}))).into_response(),
+        Err(e) => {
+            st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e}")}))).into_response();
+        }
     };
     let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
     let created = now_unix();
@@ -885,9 +1166,11 @@ async fn chat_completions(
 
     if stream {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, images, max_tokens, enable_thinking, tx }).is_err() {
+        if st.job_tx.send(GenJob { prompt_ids, images, max_tokens, enable_thinking: enable_thinking && !json_grammar, json_grammar, tx }).is_err() {
+            st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response();
         }
+        st.metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
         let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
         let tok = st.tokenizer.clone();
         tokio::spawn(async move {
@@ -943,15 +1226,28 @@ async fn chat_completions(
             .into_response();
     }
 
-    let (out_ids, prompt_n, cached_n, pp_ms, dec_ms, finish_reason) =
-        match collect_job(&st, prompt_ids, images, max_tokens, enable_thinking).await {
+    let (out_ids, prompt_n, cached_n, pp_ms, dec_ms, mut finish_reason) =
+        match collect_job(&st, prompt_ids, images, max_tokens, enable_thinking && !json_grammar, json_grammar).await {
             Ok(v) => v,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+            Err(e) => {
+                st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+            }
         };
+    st.metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
     let pred_n = out_ids.len();
     let raw_text = st.tokenizer.decode(&out_ids, false).unwrap_or_default();
-    let (reasoning, content) = split_thinking(&raw_text, enable_thinking);
-    let mut msg_obj = json!({"role": "assistant", "content": content});
+    let (reasoning, content) = split_thinking(&raw_text, enable_thinking && !json_grammar);
+    let mut msg_obj = if !allowed_tools.is_empty() {
+        if let Some(tcs) = grammar::parse_tool_calls(&content, &allowed_tools) {
+            finish_reason = "tool_calls";
+            json!({"role": "assistant", "content": serde_json::Value::Null, "tool_calls": tcs})
+        } else {
+            json!({"role": "assistant", "content": content})
+        }
+    } else {
+        json!({"role": "assistant", "content": content})
+    };
     if let Some(r) = reasoning {
         msg_obj["reasoning_content"] = json!(r);
     }
@@ -989,7 +1285,7 @@ async fn completions(
     headers: HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
-    if !check_auth(&headers, &st.api_key) {
+    if !check_auth_keys(&headers, &st.api_keys) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
     }
     let model_id = req.model.unwrap_or_else(|| "inkling-2-mini".into());
@@ -1011,7 +1307,7 @@ async fn completions(
         let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
         let st_c = st.clone();
         handles.push(tokio::spawn(async move {
-            collect_job(&st_c, prompt_ids, Vec::new(), max_tokens, false).await
+            collect_job(&st_c, prompt_ids, Vec::new(), max_tokens, false, false).await
         }));
     }
 
@@ -1065,7 +1361,7 @@ async fn responses_http(
     headers: HeaderMap,
     Json(req): Json<ResponsesRequest>,
 ) -> Response {
-    if !check_auth(&headers, &st.api_key) {
+    if !check_auth_keys(&headers, &st.api_keys) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
     }
     let model_id = req.model.unwrap_or_else(|| "inkling-2-mini".into());
@@ -1082,7 +1378,7 @@ async fn responses_http(
 
     if stream {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, images: Vec::new(), max_tokens, enable_thinking: false, tx }).is_err() {
+        if st.job_tx.send(GenJob { prompt_ids, images: Vec::new(), max_tokens, enable_thinking: false, json_grammar: false, tx }).is_err() {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response();
         }
         let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
@@ -1136,7 +1432,7 @@ async fn responses_http(
     }
 
     let (out_ids, prompt_n, cached_n, pp_ms, dec_ms, _) =
-        match collect_job(&st, prompt_ids, Vec::new(), max_tokens, false).await {
+        match collect_job(&st, prompt_ids, Vec::new(), max_tokens, false, false).await {
             Ok(v) => v,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
         };
@@ -1175,9 +1471,8 @@ async fn responses_ws(
     Query(q): Query<WsAuthQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let ok = check_auth(&headers, &st.api_key)
-        || st.api_key.is_empty()
-        || q.api_key.as_deref() == Some(st.api_key.as_str());
+    let ok = check_auth_keys(&headers, &st.api_keys)
+        || check_key_str(q.api_key.as_deref(), &st.api_keys);
     if !ok {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
     }
@@ -1218,7 +1513,7 @@ async fn handle_ws(mut socket: WebSocket, st: Arc<AppState>) {
         let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
         let resp_id = next_id("resp");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, images: Vec::new(), max_tokens, enable_thinking: false, tx }).is_err() {
+        if st.job_tx.send(GenJob { prompt_ids, images: Vec::new(), max_tokens, enable_thinking: false, json_grammar: false, tx }).is_err() {
             let _ = socket.send(Message::Text(json!({"type":"error","error":"scheduler closed"}).to_string())).await;
             break;
         }
@@ -1297,6 +1592,9 @@ struct CliOpts {
     dspark: Option<String>,
     mmproj: Option<String>,
     api_key: String,
+    metrics_auth: bool,
+    prefill_chunk_size: usize,
+    kv_block_size: usize,
     ctx: usize,
     max_seqs: usize,
     max_tokens: usize,
@@ -1322,11 +1620,14 @@ fn print_usage() {
     println!("  -d, --dspark <PATH>            DSpark draft GGUF (auto-detected if next to model)");
     println!("      --mmproj <PATH>            Vision mmproj GGUF (auto-detected, enabled by default)");
     println!("  -i, --image <PATH>             Image file for `rad run` multimodal inference");
-    println!("  -p, --port <PORT>              Server port [default: 8088] (env: RAD_PORT)");
+    println!("  -p, --port <PORT>              Server port [default: 6733] (env: RAD_PORT)");
     println!("      --ctx <TOKENS>             Context length per sequence [default: 8192] (env: RAD_CTX)");
     println!("      --max-seqs <N>             Max concurrent sequences [default: 32] (env: RAD_MAX_SEQS)");
+    println!("      --prefill-chunk-size <N>   Chunked prefill tokens per tick [default: 512] (env: RAD_PREFILL_CHUNK_SIZE)");
+    println!("      --kv-block-size <N>        Paged KV cache block size [default: 16] (env: RAD_KV_BLOCK_SIZE)");
     println!("  -n, --max-tokens <N>           Max tokens for `rad run` [default: 256]");
-    println!("      --api-key <KEY>            Optional Bearer API key (env: RAD_API_KEY)");
+    println!("      --api-key <KEY[,KEY2]>     Optional Bearer/X-API-Key auth (env: RAD_API_KEY)");
+    println!("      --metrics-auth             Require API key for GET /metrics");
     println!("      --no-spec                  Disable speculative decoding (DFlash 2 / DSpark)");
     println!("      --no-vision                Disable vision encoder loading");
     println!("      --thinking                 Enable thinking tokens for `rad run`");
@@ -1370,10 +1671,13 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
     let mut dspark = std::env::var("RAD_DSPARK").ok();
     let mut mmproj = std::env::var("RAD_MMPROJ").ok();
     let mut api_key = std::env::var("RAD_API_KEY").unwrap_or_default();
+    let mut metrics_auth = std::env::var("RAD_METRICS_AUTH").map(|v| v == "1").unwrap_or(false);
+    let mut prefill_chunk_size: usize = std::env::var("RAD_PREFILL_CHUNK_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
+    let mut kv_block_size: usize = std::env::var("RAD_KV_BLOCK_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
     let mut ctx: usize = std::env::var("RAD_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(8192);
     let mut max_seqs: usize = std::env::var("RAD_MAX_SEQS").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
     let mut max_tokens: usize = 256;
-    let mut port: u16 = std::env::var("RAD_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8088);
+    let mut port: u16 = std::env::var("RAD_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6733);
     let mut use_spec = std::env::var("RAD_SPEC").map(|v| v != "0").unwrap_or(true);
     let mut use_vision = std::env::var("RAD_VISION").map(|v| v != "0").unwrap_or(true);
     let mut thinking = false;
@@ -1428,6 +1732,17 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
                 idx += 1;
                 api_key = args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --api-key value"))?;
             }
+            "--metrics-auth" => {
+                metrics_auth = true;
+            }
+            "--prefill-chunk-size" => {
+                idx += 1;
+                prefill_chunk_size = args.get(idx).ok_or_else(|| anyhow::anyhow!("missing --prefill-chunk-size value"))?.parse()?;
+            }
+            "--kv-block-size" => {
+                idx += 1;
+                kv_block_size = args.get(idx).ok_or_else(|| anyhow::anyhow!("missing --kv-block-size value"))?.parse()?;
+            }
             "--no-spec" => {
                 use_spec = false;
             }
@@ -1470,6 +1785,9 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
         dspark,
         mmproj,
         api_key,
+        metrics_auth,
+        prefill_chunk_size,
+        kv_block_size,
         ctx,
         max_seqs,
         max_tokens,
@@ -1684,7 +2002,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
                 engine.rewind_verify_to(n_acc, k_len)?;
                 engine.seq_pos[0] = engine.pos;
                 let ti0 = Instant::now();
-                d.inject_batch_seq(0, &engine, 0, pos0, n_acc)?;
+                d.inject_batch_seq_async(0, &engine, 0, pos0, n_acc)?;
                 i_ms += ti0.elapsed().as_secs_f64() * 1000.0;
                 ct = preds[n_acc - 1];
                 gen += n_acc;
@@ -1872,6 +2190,7 @@ async fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let tokenizer = Arc::new(Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?);
     let image_tok_id = tokenizer.token_to_id("<|content_image|>").map(|id| id as i32);
+    std::env::set_var("RAD_KV_BLOCK_SIZE", opts.kv_block_size.to_string());
     let mut engine = InklingEngine::load_multi(Path::new(&opts.model), opts.ctx, opts.max_seqs)?;
     engine.capture_decode_graph()?;
     let drafter = load_drafter(&opts, &mut engine, opts.max_seqs.min(8))?;
@@ -1879,30 +2198,50 @@ async fn main() -> anyhow::Result<()> {
     let spec_enabled = drafter.is_some();
     let spec_mode = drafter.as_ref().map(|d| d.mode_name()).unwrap_or("none");
     let vision_enabled = vision.is_some();
+    let vocab_grammar = Arc::new(grammar::VocabGrammarTable::build(&tokenizer, engine.cfg.vocab_unpadded));
+    let metrics = Arc::new(metrics::Metrics::new());
+    let api_keys: Vec<String> = opts
+        .api_key
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     eprintln!(
-        "rad serve ready in {:.2}s (ctx={}, max_seqs={}, spec={}, vision={}, port={})",
+        "rad serve ready in {:.2}s (ctx={}, max_seqs={}, chunk={}, kv_blk={}, spec={}, vision={}, auth={}, port={})",
         t0.elapsed().as_secs_f64(),
         opts.ctx,
         opts.max_seqs,
+        opts.prefill_chunk_size,
+        opts.kv_block_size,
         spec_mode,
         vision_enabled,
+        !api_keys.is_empty(),
         opts.port
     );
 
     let (job_tx, job_rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || run_scheduler(engine, drafter, vision, image_tok_id, job_rx));
+    let sched_gram = vocab_grammar.clone();
+    let sched_metrics = metrics.clone();
+    let prefill_chunk = opts.prefill_chunk_size;
+    std::thread::spawn(move || run_scheduler(engine, drafter, vision, image_tok_id, sched_gram, sched_metrics, prefill_chunk, job_rx));
 
     let state = Arc::new(AppState {
         job_tx,
         tokenizer,
-        api_key: opts.api_key,
+        metrics,
+        api_keys,
+        metrics_auth: opts.metrics_auth,
         spec_enabled,
         spec_mode,
         vision_enabled,
         mmproj_path: opts.mmproj,
+        prefill_chunk_size: opts.prefill_chunk_size,
+        kv_block_size: opts.kv_block_size,
+        port: opts.port,
     });
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))

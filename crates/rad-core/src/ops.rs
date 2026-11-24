@@ -55,6 +55,7 @@ extern "C" {
     pub fn ink_dspark_rope_norm_ctx(s: HipStream, k_in: *const f32, v_in: *const f32, k_norm_w: *const f32, kc: *mut u16, vc: *mut u16, d_pos: *const i32, max_ctx: i32, n_head_kv: i32, dh: i32, freq_base: f32, is_swa: i32) -> i32;
     pub fn ink_dspark_rope_norm_qk(s: HipStream, q: *mut f32, k: *mut f32, q_norm_w: *const f32, k_norm_w: *const f32, d_pos0: *const i32, k_len: i32, n_head: i32, n_head_kv: i32, dh: i32, freq_base: f32) -> i32;
     pub fn ink_dspark_attn(s: HipStream, q: *const f32, k_blk: *const f32, v_blk: *const f32, kc: *const u16, vc: *const u16, d_ctx_len: *const i32, out: *mut f32, k_len: i32, n_head: i32, n_head_kv: i32, dh: i32, swa_window: i32, is_swa: i32, max_ctx: i32) -> i32;
+    pub fn ink_dspark_attn_q8(s: HipStream, q: *const f32, k_blk: *const f32, v_blk: *const f32, kc: *const u16, vc: *const u16, d_ctx_len: *const i32, out_q8: *mut core::ffi::c_void, k_len: i32, n_head: i32, n_head_kv: i32, dh: i32, swa_window: i32, is_swa: i32, max_ctx: i32) -> i32;
     pub fn ink_dspark_swiglu(s: HipStream, gate: *const f32, up: *const f32, out: *mut f32, n: i32) -> i32;
     pub fn ink_dspark_markov_inp(s: HipStream, state: *const f32, w1_bf16: *const u16, d_prev_tok: *const i32, hidden_i: *const f32, ctx_m: *const f32, out: *mut f32, n_embd: i32, rank: i32, mode: i32) -> i32;
     pub fn ink_dspark_markov_update(s: HipStream, joint: *const f32, bias: *const f32, state: *mut f32, markov_out: *mut f32, rank: i32) -> i32;

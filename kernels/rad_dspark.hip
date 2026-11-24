@@ -479,11 +479,211 @@ extern "C" __global__ void dspark_attn_split_reduce_k(const float* __restrict__ 
     oh[d3] = go3 * inv_l;
 }
 
+extern "C" __global__ void dspark_attn_gqa2_split8_k(const float* __restrict__ Q,
+                                                     const float* __restrict__ K_blk,
+                                                     const float* __restrict__ V_blk,
+                                                     const __half* __restrict__ kc,
+                                                     const __half* __restrict__ vc,
+                                                     const int* __restrict__ d_ctx_len,
+                                                     float* __restrict__ split_buf,
+                                                     int K_len, int n_head, int n_head_kv,
+                                                     int dh, int swa_window, int is_swa,
+                                                     int max_ctx) {
+    int h_pair = blockIdx.x;
+    int h0 = h_pair * 2;
+    int h1 = h0 + 1;
+    int sp = blockIdx.y;
+    int kv_h = h0 / (n_head / n_head_kv);
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int ctx_len = *d_ctx_len;
+    int t_start = is_swa ? max(0, ctx_len - swa_window) : 0;
+    int ctx_cnt = ctx_len - t_start;
+    int total_kv = ctx_cnt + K_len;
+
+    int chunk = (total_kv + 7) >> 3;
+    int s_beg = sp * chunk;
+    int s_end = min(total_kv, s_beg + chunk);
+
+    int p0 = lane * 2;
+    int p1 = lane * 2 + 64;
+    float q_scale = rsqrtf((float)dh);
+    float q0a = 0.0f, q0b = 0.0f, q1a = 0.0f, q1b = 0.0f;
+    float r0a = 0.0f, r0b = 0.0f, r1a = 0.0f, r1b = 0.0f;
+    if (wid < K_len) {
+        const float* qh0 = Q + ((size_t)wid * n_head + h0) * dh;
+        q0a = qh0[p0] * q_scale; q0b = qh0[p0 + 1] * q_scale;
+        q1a = qh0[p1] * q_scale; q1b = qh0[p1 + 1] * q_scale;
+        const float* qh1 = Q + ((size_t)wid * n_head + h1) * dh;
+        r0a = qh1[p0] * q_scale; r0b = qh1[p0 + 1] * q_scale;
+        r1a = qh1[p1] * q_scale; r1b = qh1[p1 + 1] * q_scale;
+    }
+
+    const __half* kc_h = kc + (size_t)kv_h * max_ctx * dh;
+    const __half* vc_h = vc + (size_t)kv_h * max_ctx * dh;
+
+    float m0 = -1e30f, l0 = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+    float m1 = -1e30f, l1 = 0.0f;
+    float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
+
+    __shared__ float2 sm_k0[8][32];
+    __shared__ float2 sm_k1[8][32];
+    __shared__ float2 sm_v0[8][32];
+    __shared__ float2 sm_v1[8][32];
+
+    for (int base = s_beg; base < s_end; base += 8) {
+        int idx = base + wid;
+        if (idx < s_end) {
+            if (idx < ctx_cnt) {
+                int t = t_start + idx;
+                int slot = is_swa ? (t % max_ctx) : t;
+                const __half2* kt2 = reinterpret_cast<const __half2*>(kc_h + (size_t)slot * dh);
+                const __half2* vt2 = reinterpret_cast<const __half2*>(vc_h + (size_t)slot * dh);
+                sm_k0[wid][lane] = __half22float2(kt2[lane]);
+                sm_k1[wid][lane] = __half22float2(kt2[lane + 32]);
+                sm_v0[wid][lane] = __half22float2(vt2[lane]);
+                sm_v1[wid][lane] = __half22float2(vt2[lane + 32]);
+            } else {
+                int bi = idx - ctx_cnt;
+                const float* kt = K_blk + ((size_t)bi * n_head_kv + kv_h) * dh;
+                const float* vt = V_blk + ((size_t)bi * n_head_kv + kv_h) * dh;
+                sm_k0[wid][lane] = make_float2(kt[p0], kt[p0 + 1]);
+                sm_k1[wid][lane] = make_float2(kt[p1], kt[p1 + 1]);
+                sm_v0[wid][lane] = make_float2(vt[p0], vt[p0 + 1]);
+                sm_v1[wid][lane] = make_float2(vt[p1], vt[p1 + 1]);
+            }
+        }
+        __syncthreads();
+        int n_tile = min(8, s_end - base);
+        if (wid < K_len) {
+            for (int j = 0; j < n_tile; ++j) {
+                float2 k0 = sm_k0[j][lane];
+                float2 k1 = sm_k1[j][lane];
+                float2 v0 = sm_v0[j][lane];
+                float2 v1 = sm_v1[j][lane];
+
+                float d0 = q0a * k0.x + q0b * k0.y + q1a * k1.x + q1b * k1.y;
+                float sc0 = __shfl(ds_warp_sum32(d0), 0, 32);
+                float mn0 = fmaxf(m0, sc0);
+                float al0 = (m0 > -1e20f) ? expf(m0 - mn0) : 0.0f;
+                float pv0 = expf(sc0 - mn0);
+                l0 = l0 * al0 + pv0; m0 = mn0;
+                o0 = fmaf(pv0, v0.x, o0 * al0); o1 = fmaf(pv0, v0.y, o1 * al0);
+                o2 = fmaf(pv0, v1.x, o2 * al0); o3 = fmaf(pv0, v1.y, o3 * al0);
+
+                float d1 = r0a * k0.x + r0b * k0.y + r1a * k1.x + r1b * k1.y;
+                float sc1 = __shfl(ds_warp_sum32(d1), 0, 32);
+                float mn1 = fmaxf(m1, sc1);
+                float al1 = (m1 > -1e20f) ? expf(m1 - mn1) : 0.0f;
+                float pv1 = expf(sc1 - mn1);
+                l1 = l1 * al1 + pv1; m1 = mn1;
+                u0 = fmaf(pv1, v0.x, u0 * al1); u1 = fmaf(pv1, v0.y, u1 * al1);
+                u2 = fmaf(pv1, v1.x, u2 * al1); u3 = fmaf(pv1, v1.y, u3 * al1);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (wid < K_len) {
+        float* dst0 = split_buf + (((size_t)h0 * K_len + wid) * 8 + sp) * 130;
+        dst0[p0] = o0; dst0[p0 + 1] = o1; dst0[p1] = o2; dst0[p1 + 1] = o3;
+        if (lane == 0) { dst0[128] = m0; dst0[129] = l0; }
+        float* dst1 = split_buf + (((size_t)h1 * K_len + wid) * 8 + sp) * 130;
+        dst1[p0] = u0; dst1[p0 + 1] = u1; dst1[p1] = u2; dst1[p1 + 1] = u3;
+        if (lane == 0) { dst1[128] = m1; dst1[129] = l1; }
+    }
+}
+
+struct ds_q8_1_blk {
+    float d;
+    int32_t s;
+    int32_t q[8];
+};
+
+__device__ __forceinline__ float ds_warp_max32(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down(v, off, 32));
+    return v;
+}
+
+__device__ __forceinline__ int32_t ds_warp_sum32_i(int32_t v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off, 32);
+    return v;
+}
+
+__device__ __forceinline__ int32_t ds_pack4_i8(int8_t a, int8_t b, int8_t c, int8_t d) {
+    return ((int32_t)(uint8_t)a) | (((int32_t)(uint8_t)b) << 8) | (((int32_t)(uint8_t)c) << 16) | (((int32_t)(uint8_t)d) << 24);
+}
+
+extern "C" __global__ void dspark_attn_split_reduce_q8_k(const float* __restrict__ split_buf,
+                                                         ds_q8_1_blk* __restrict__ out_q8,
+                                                         int K_len, int n_head, int n_splits) {
+    int h = blockIdx.x;
+    int bt = blockIdx.y;
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int d = wid * 32 + lane;
+    const float* base = split_buf + ((size_t)h * K_len + bt) * n_splits * 130;
+    float gm = -1e30f;
+    for (int sp = 0; sp < n_splits; ++sp) {
+        gm = fmaxf(gm, base[sp * 130 + 128]);
+    }
+    float gl = 0.0f;
+    float go = 0.0f;
+    for (int sp = 0; sp < n_splits; ++sp) {
+        const float* sb = base + sp * 130;
+        float ms = sb[128];
+        float ls = sb[129];
+        if (ls > 0.0f) {
+            float sc = expf(ms - gm);
+            gl += ls * sc;
+            go = fmaf(sb[d], sc, go);
+        }
+    }
+    float v = (gl > 0.0f) ? (go / gl) : 0.0f;
+    float amax = __shfl(ds_warp_max32(fabsf(v)), 0, 32);
+    float dq = amax / 127.0f;
+    float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    int qi = __float2int_rn(v * inv);
+    if (qi > 127) qi = 127;
+    if (qi < -127) qi = -127;
+    int32_t qsum = ds_warp_sum32_i(qi);
+    int q1 = __shfl_down(qi, 1, 32);
+    int q2 = __shfl_down(qi, 2, 32);
+    int q3 = __shfl_down(qi, 3, 32);
+    ds_q8_1_blk* dst = out_q8 + ((size_t)bt * n_head + h) * 4 + wid;
+    if (lane == 0) {
+        dst->d = dq;
+        dst->s = qsum;
+    }
+    if ((lane & 3) == 0) {
+        dst->q[lane >> 2] = ds_pack4_i8((int8_t)qi, (int8_t)q1, (int8_t)q2, (int8_t)q3);
+    }
+}
+
+extern "C" int ink_dspark_attn_q8(hipStream_t s, const float* Q, const float* K_blk, const float* V_blk, const __half* kc, const __half* vc, const int* d_ctx_len, void* out_q8, int K_len, int n_head, int n_head_kv, int dh, int swa_window, int is_swa, int max_ctx) {
+    float* sbuf = nullptr;
+    (void)hipGetSymbolAddress((void**)&sbuf, HIP_SYMBOL(g_ds_split_buf));
+    if ((n_head / n_head_kv) >= 2 && (n_head & 1) == 0) {
+        dspark_attn_gqa2_split8_k<<<dim3(n_head / 2, 8), dim3(256), 0, s>>>(Q, K_blk, V_blk, kc, vc, d_ctx_len, sbuf, K_len, n_head, n_head_kv, dh, swa_window, is_swa, max_ctx);
+    } else {
+        dspark_attn_split8_k<<<dim3(n_head, 8), dim3(256), 0, s>>>(Q, K_blk, V_blk, kc, vc, d_ctx_len, sbuf, K_len, n_head, n_head_kv, dh, swa_window, is_swa, max_ctx);
+    }
+    dspark_attn_split_reduce_q8_k<<<dim3(n_head, K_len), dim3(128), 0, s>>>(sbuf, (ds_q8_1_blk*)out_q8, K_len, n_head, 8);
+    return 0;
+}
+
 extern "C" int ink_dspark_attn(hipStream_t s, const float* Q, const float* K_blk, const float* V_blk, const __half* kc, const __half* vc, const int* d_ctx_len, float* out, int K_len, int n_head, int n_head_kv, int dh, int swa_window, int is_swa, int max_ctx) {
     if (dh == 128 && K_len <= 8 && n_head <= 32) {
         float* sbuf = nullptr;
         (void)hipGetSymbolAddress((void**)&sbuf, HIP_SYMBOL(g_ds_split_buf));
-        dspark_attn_split8_k<<<dim3(n_head, 8), dim3(256), 0, s>>>(Q, K_blk, V_blk, kc, vc, d_ctx_len, sbuf, K_len, n_head, n_head_kv, dh, swa_window, is_swa, max_ctx);
+        if ((n_head / n_head_kv) >= 2 && (n_head & 1) == 0) {
+            dspark_attn_gqa2_split8_k<<<dim3(n_head / 2, 8), dim3(256), 0, s>>>(Q, K_blk, V_blk, kc, vc, d_ctx_len, sbuf, K_len, n_head, n_head_kv, dh, swa_window, is_swa, max_ctx);
+        } else {
+            dspark_attn_split8_k<<<dim3(n_head, 8), dim3(256), 0, s>>>(Q, K_blk, V_blk, kc, vc, d_ctx_len, sbuf, K_len, n_head, n_head_kv, dh, swa_window, is_swa, max_ctx);
+        }
         dspark_attn_split_reduce_k<<<dim3(n_head, K_len), dim3(32), 0, s>>>(sbuf, out, K_len, n_head, 8);
         return 0;
     }

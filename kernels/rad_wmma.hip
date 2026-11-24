@@ -2061,7 +2061,7 @@ extern "C" __global__ void attn_b8_flash_q8_k(const float* __restrict__ Q,
     }
 }
 
-__device__ float g_b8_split_buf[32 * 8 * 16 * 130];
+__device__ float g_b8_split_buf[32 * 16 * 16 * 130];
 
 extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ Q,
                                                       const float* __restrict__ R,
@@ -2514,7 +2514,7 @@ extern "C" int ink_attn_b8_flash_q8(hipStream_t s, const float* Q, const float* 
         float* sbuf = nullptr;
         (void)hipGetSymbolAddress((void**)&sbuf, HIP_SYMBOL(g_b8_split_buf));
         if (n_head == 3 * n_head_kv) {
-            int n_splits = 8;
+            int n_splits = (!is_swa && max_ctx > 2048) ? 16 : 8;
             attn_b8_gqa3_flash_split_k<<<dim3(n_head_kv, n_splits), dim3(192), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, d_pos0, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B, n_splits);
             attn_b8_flash_reduce_q8_k<<<dim3(n_head, B), dim3(128), 0, s>>>(sbuf, gate, (w_q8_1_blk*)out_q8, n_head, n_splits);
             return 0;

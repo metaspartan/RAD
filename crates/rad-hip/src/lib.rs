@@ -92,6 +92,11 @@ impl CapturedGraph {
         if rc == HIP_SUCCESS { Ok(()) } else { Err(rc) }
     }
 
+    pub fn launch_on(&self, s: HipStream) -> Result<(), HipError> {
+        let rc = unsafe { hipGraphLaunch(self.exec, s) };
+        if rc == HIP_SUCCESS { Ok(()) } else { Err(rc) }
+    }
+
     pub fn sync(&self) -> Result<(), HipError> {
         let rc = unsafe { hipStreamSynchronize(self.stream) };
         if rc == HIP_SUCCESS { Ok(()) } else { Err(rc) }

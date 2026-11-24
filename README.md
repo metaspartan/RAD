@@ -19,9 +19,10 @@ The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybri
   - Custom `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` **FlashAttention-2** (reverse causal tile scheduling, bank-conflict-free LDS KV tile, register-preloaded `float4` relative-position projections, plus 4-warp Split-KV WMMA FlashAttention for `B=4..16`), fused multi-query `float4` state mixing (`mix_batch_f4_k`), register-cached `float4` RMSNorm, WMMA `sink_dyn_bf16`, single-pass `float4` & LDS WMMA loop controllers, and 64-CU `float4` router GEMM/GEMV.
 - **On-GPU `Q4_0_SOA` Weight Repacking & `hipGraph` Execution**
   - Converts `Q8_0`, `NVFP4`, and `BF16` tensors directly on GPU at load time (**~1.16 s** cold load) into 16-byte-aligned structure-of-arrays blocks for coalesced `uint4` loads and `sudot4` / WMMA execution.
-- **vLLM-Style Continuous Batching, Prefix Caching & Full OpenAI API (`rad`)**
-  - Dedicated GPU scheduler thread with prefix-cache affinity and continuous batched decode (`step_multi` with GQA 3:1 attention) scaling up to `B=128` concurrent sequences (**`1,856.0 agg tok/s`**).
-  - `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (text + vision, JSON + SSE), `POST /v1/completions` (single + batch), `POST /v1/responses` (HTTP + SSE), `GET /v1/responses` (WebSocket).
+- **vLLM-Style Continuous Batching, Paged KV Cache, Chunked Prefill, Tool-Calling Grammar & Prometheus Metrics (`rad`)**
+  - Dedicated GPU scheduler thread with **Paged KV block management** (`--kv-block-size 16`, copy-on-write prefix sharing & refcounting), **Chunked Prefill** (`--prefill-chunk-size 512`, interleaving long prefills with active decoders), **JSON & Tool-Calling Grammar Constraints** (`response_format: json_object/json_schema`, `tools` + `tool_choice` -> OpenAI `tool_calls`), **Prometheus `GET /metrics`** (TTFT/ITL histograms, speculative acceptance rate, KV block utilization), optional **multi-key API auth** (`Authorization: Bearer` & `X-API-Key`, `--metrics-auth`), and non-conflicting default port **`6733`**.
+  - Continuous batched decode (`step_multi` with GQA 3:1 attention) scaling up to `B=128` concurrent sequences (**`1,856.0 agg tok/s`**).
+  - `GET /health`, `GET /metrics`, `GET /v1/models`, `POST /v1/chat/completions` (text + vision + tools + JSON grammar, JSON + SSE), `POST /v1/completions` (single + batch), `POST /v1/responses` (HTTP + SSE), `GET /v1/responses` (WebSocket).
 
 ---
 
@@ -36,10 +37,10 @@ Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)**, *
 | Engine / Hardware | Decode (`tok/s`) | `pp2048` Prefill (`tok/s`) | Notes |
 | --- | --- | --- | --- |
 | **Stock `llama.cpp` (R9700 + DSpark)** | `70.5 tok/s` | `765.5 tok/s` | `-fa on -ctk q8_0 -ctv q8_0 --spec-type draft-dspark` |
-| **RAD (R9700, No-Spec `hipGraph`)** | **`109.4 ± 0.7 tok/s`** (`1.55×`) | **`3,459.8 ± 2.8 tok/s`** (**`4.52×`**) | `tg128 @ d=2048 = 99.0 tok/s`; `pp512 = 2,965.6 ± 3.6 tok/s` |
+| **RAD (R9700, No-Spec `hipGraph`)** | **`109.4 ± 0.7 tok/s`** (`1.55×`) | **`3,467.4 ± 1.5 tok/s`** (**`4.53×`**) | `tg128 @ d=2048 = 99.0 tok/s`; `pp512 = 2,976.1 ± 2.5 tok/s` |
 | **Unsloth RTX PRO 6000 Blackwell** | `125.0 tok/s` *(claimed)* | — | 96 GB workstation GPU (~\$8,500) |
-| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`3,459.8 tok/s`** (**`4.52×`**) | `verify=23.7 ms`, `avg_emit=4.27` |
-| **RAD (R9700 + DFlash 2 `K=8`)** | **`287.5 tok/s`** (**`4.08×`**) | **`3,419.5 ± 1.6 tok/s`** (**`4.47×`**) | **2.30× vs. RTX PRO 6000 Blackwell**, `draft=2.14–2.26 ms`, `verify=21.24–21.46 ms`, `2K/4K/8K SSE = 165.3 / 129.6 / 124.2 tok/s` |
+| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`3,467.4 tok/s`** (**`4.53×`**) | `verify=23.7 ms`, `avg_emit=4.27` |
+| **RAD (R9700 + DFlash 2 `K=8`)** | **`287.5 tok/s`** (**`4.08×`**) | **`3,426.5 ± 3.1 tok/s`** (**`4.48×`**) | **2.30× vs. RTX PRO 6000 Blackwell**, `draft=2.14–2.26 ms`, `verify=21.24 ms`, `inject=0.01–0.02 ms` (async), `2K/4K/8K SSE = 165.3 / 129.6 / 124.2 tok/s` |
 
 ### Multi-User Continuous Batching & Batched Speculative Decoding
 
@@ -47,14 +48,14 @@ Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)**, *
 
 | Workload | Throughput / Latency | Notes |
 | --- | --- | --- |
-| **Cold Load (`max_seqs=16`, DFlash 2)** | **1.83 s** | On-GPU `Q4_0_SOA` + `Q8_0` conversion & `hipGraph` capture |
-| **Short Prompt TTFT (`15 tok`)** | **34.6 ± 0.0 ms** | 3-run mean; 8-warp LDS WMMA + fused `float4` state mixing |
+| **Cold Load (`max_seqs=16`, DFlash 2)** | **1.82 s** | On-GPU `Q4_0_SOA` + `Q8_0` conversion & `hipGraph` capture |
+| **Short Prompt TTFT (`15 tok`)** | **34.5 ± 0.0 ms** | 3-run mean; 8-warp LDS WMMA + fused `float4` state mixing |
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **21.2 ms** | Prefix-cache affinity hit + GQA 3:1 Split-KV FlashAttention |
 | **Multi-User Decode (`B=4`, Batched DFlash 2 `K=4`)** | **468.8 agg tok/s** | **`117.2 tok/s/user`** (`ITL 8.5 ms`, zero-spill MoE + LDS WMMA) |
-| **Multi-User Decode (`B=8`, no-spec)** | **539.9 agg tok/s** | **`67.5 tok/s/user`** (`ITL 14.8 ms`, `hipGraph` + fused `router+groups+Q8_1` + 8-lane `qkvrg`) |
+| **Multi-User Decode (`B=8`, no-spec)** | **545.6 agg tok/s** | **`68.2 tok/s/user`** (`ITL 14.7 ms`, `hipGraph` + fused `router+groups+Q8_1` + 8-lane `qkvrg`) |
 | **Multi-User Decode (`B=8`, Batched DSpark `K=4`)** | **458.6 agg tok/s** | `57.3 tok/s/user` |
 | **Multi-User Decode (`B=8`, Batched DFlash 2 `K=4`)** | **638.1 agg tok/s** | **`79.8 tok/s/user`** (8 concurrent users each faster than single-user `llama.cpp`) |
-| **Multi-User Decode (`B=16`, no-spec)** | **683.5 agg tok/s** | `42.7 tok/s/user` (`ITL 23.4 ms`) |
+| **Multi-User Decode (`B=16`, no-spec)** | **687.3 agg tok/s** | **`43.0 tok/s/user`** (`ITL 23.3 ms`) |
 | **Multi-User Decode (`B=32`, no-spec)** | **867.2 agg tok/s** | `27.1 tok/s/user` (GQA 3:1 multi-user attention + `float4` RMSNorm) |
 | **Multi-User Decode (`B=64`, no-spec)** | **1,162.2 agg tok/s** | `18.2 tok/s/user` (8-warp `128×64` LDS WMMA MoE) |
 | **Multi-User Decode (`B=128`, no-spec)** | **1,856.0 agg tok/s** | **`14.5 tok/s/user`** (fused WMMA MoE-to-`Q8_1` + `float4` slot reduction) |
@@ -116,7 +117,7 @@ cargo build --release
 `rad` automatically detects sibling `tokenizer.json`, **DFlash 2** (`../inkling2-dflash2/model.safetensors`, preferred over DSpark), **DSpark** (`dspark-Inkling-2-Mini-Q8_0.gguf`), and **Vision** (`mmproj-F16.gguf`, enabled by default):
 
 ```bash
-./target/release/rad serve -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf --port 8088
+./target/release/rad serve -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf --port 6733
 
 ./target/release/rad run "Show me a Python quicksort function." -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf
 

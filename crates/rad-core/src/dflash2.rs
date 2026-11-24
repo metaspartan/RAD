@@ -400,7 +400,7 @@ impl DFlash2Drafter {
         unsafe { rad_hip::hipStreamSynchronize(self.stream); }
     }
 
-    pub fn inject_target_feats_batch_seq(&mut self, seq: usize, bsc_feats: *const f32, max_batch: usize, start_tok: usize, pos0: i32, n_tok: usize) -> Result<()> {
+    pub fn inject_target_feats_batch_seq_async(&mut self, seq: usize, bsc_feats: *const f32, max_batch: usize, start_tok: usize, pos0: i32, n_tok: usize) -> Result<()> {
         if n_tok == 0 {
             return Ok(());
         }
@@ -451,11 +451,16 @@ impl DFlash2Drafter {
             }
             off += chunk;
         }
-        unsafe { rad_hip::hipStreamSynchronize(self.stream); }
         self.seq_ctx_len[seq] = pos0 + n_tok as i32;
         if seq == 0 {
             self.ctx_len = pos0 + n_tok as i32;
         }
+        Ok(())
+    }
+
+    pub fn inject_target_feats_batch_seq(&mut self, seq: usize, bsc_feats: *const f32, max_batch: usize, start_tok: usize, pos0: i32, n_tok: usize) -> Result<()> {
+        self.inject_target_feats_batch_seq_async(seq, bsc_feats, max_batch, start_tok, pos0, n_tok)?;
+        unsafe { rad_hip::hipStreamSynchronize(self.stream); }
         Ok(())
     }
 
@@ -507,23 +512,46 @@ impl DFlash2Drafter {
                     self.freq_base,
                 );
                 let kv_off = seq * self.n_head_kv * l.max_ctx * self.dh;
-                ops::ink_dspark_attn(
-                    s,
-                    self.q.ptr as *const f32,
-                    self.k.ptr as *const f32,
-                    self.v.ptr as *const f32,
-                    (l.k_cache.ptr as *const u16).add(kv_off),
-                    (l.v_cache.ptr as *const u16).add(kv_off),
-                    self.d_ctx_len.ptr as *const i32,
-                    self.attn_out.ptr as *mut f32,
-                    ki,
-                    self.n_head as i32,
-                    self.n_head_kv as i32,
-                    self.dh as i32,
-                    self.swa_window as i32,
-                    1,
-                    l.max_ctx as i32,
-                );
+                if l.wo.ty == WeightType::Q4_0 && self.dh == 128 && k_len <= 8 && self.n_head <= 32 {
+                    ops::ink_dspark_attn_q8(
+                        s,
+                        self.q.ptr as *const f32,
+                        self.k.ptr as *const f32,
+                        self.v.ptr as *const f32,
+                        (l.k_cache.ptr as *const u16).add(kv_off),
+                        (l.v_cache.ptr as *const u16).add(kv_off),
+                        self.d_ctx_len.ptr as *const i32,
+                        self.xq.ptr,
+                        ki,
+                        self.n_head as i32,
+                        self.n_head_kv as i32,
+                        self.dh as i32,
+                        self.swa_window as i32,
+                        1,
+                        l.max_ctx as i32,
+                    );
+                } else {
+                    ops::ink_dspark_attn(
+                        s,
+                        self.q.ptr as *const f32,
+                        self.k.ptr as *const f32,
+                        self.v.ptr as *const f32,
+                        (l.k_cache.ptr as *const u16).add(kv_off),
+                        (l.v_cache.ptr as *const u16).add(kv_off),
+                        self.d_ctx_len.ptr as *const i32,
+                        self.attn_out.ptr as *mut f32,
+                        ki,
+                        self.n_head as i32,
+                        self.n_head_kv as i32,
+                        self.dh as i32,
+                        self.swa_window as i32,
+                        1,
+                        l.max_ctx as i32,
+                    );
+                    if l.wo.ty == WeightType::Q4_0 {
+                        ops::ink_quantize_q8_1(s, self.attn_out.ptr as *const f32, self.xq.ptr, q_dim, tot_b);
+                    }
+                }
             } else {
                 ops::ink_dspark_rope_norm_qk_multi(
                     s,
@@ -558,11 +586,11 @@ impl DFlash2Drafter {
                     1,
                     l.max_ctx as i32,
                 );
+                if l.wo.ty == WeightType::Q4_0 {
+                    ops::ink_quantize_q8_1(s, self.attn_out.ptr as *const f32, self.xq.ptr, q_dim, tot_b);
+                }
             }
 
-            if l.wo.ty == WeightType::Q4_0 {
-                ops::ink_quantize_q8_1(s, self.attn_out.ptr as *const f32, self.xq.ptr, q_dim, tot_b);
-            }
             self.gemm_w(s, &l.wo, self.attn_out.ptr as *const f32, self.xq.ptr, self.o_out.ptr as *mut f32, e, q_dim, tot_b);
             ops::ink_dflash2_conv_add(s, self.o_out.ptr as *const f32, self.dyn_buf.ptr as *const f32, l.attn_conv_base.ptr as *const f32, self.x.ptr as *mut f32, e, ki, gs, 1, tot_b);
 
@@ -738,11 +766,11 @@ impl DFlash2Drafter {
         let use_graph = self.draft_graph.as_ref().map(|(gk, _)| *gk == k_len).unwrap_or(false);
         if use_graph {
             let (_, ref g) = self.draft_graph.as_ref().unwrap();
-            self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(g.stream)).map_err(he)?;
-            self.d_pos.copy_from(&pos0.to_le_bytes(), Some(g.stream)).map_err(he)?;
-            self.d_ctx_len.copy_from(&self.ctx_len.to_le_bytes(), Some(g.stream)).map_err(he)?;
-            g.launch().map_err(he)?;
-            g.sync().map_err(he)?;
+            self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(self.stream)).map_err(he)?;
+            self.d_pos.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
+            self.d_ctx_len.copy_from(&self.ctx_len.to_le_bytes(), Some(self.stream)).map_err(he)?;
+            g.launch_on(self.stream).map_err(he)?;
+            unsafe { rad_hip::hipStreamSynchronize(self.stream); }
         } else {
             self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(self.stream)).map_err(he)?;
             self.d_pos.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
@@ -772,11 +800,11 @@ impl DFlash2Drafter {
             self.seq_draft_graphs.insert(key, g);
         }
         let g = self.seq_draft_graphs.get(&key).unwrap();
-        self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(g.stream)).map_err(he)?;
-        self.d_pos.copy_from(&pos0.to_le_bytes(), Some(g.stream)).map_err(he)?;
-        self.d_ctx_len.copy_from(&ctx_len.to_le_bytes(), Some(g.stream)).map_err(he)?;
-        g.launch().map_err(he)?;
-        g.sync().map_err(he)?;
+        self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(self.stream)).map_err(he)?;
+        self.d_pos.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
+        self.d_ctx_len.copy_from(&ctx_len.to_le_bytes(), Some(self.stream)).map_err(he)?;
+        g.launch_on(self.stream).map_err(he)?;
+        unsafe { rad_hip::hipStreamSynchronize(self.stream); }
         let mut out_b = vec![0u8; k_len * 4];
         let rc = unsafe {
             rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.d_draft_toks.ptr, k_len * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
