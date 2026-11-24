@@ -20,7 +20,7 @@ The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybri
 - **On-GPU `Q4_0_SOA` Weight Repacking & `hipGraph` Execution**
   - Converts `Q8_0`, `NVFP4`, and `BF16` tensors directly on GPU at load time (**~1.2 s** cold load) into 16-byte-aligned structure-of-arrays blocks for coalesced `uint4` loads and `sudot4` / WMMA execution.
 - **vLLM-Style Continuous Batching, Prefix Caching & Full OpenAI API (`rad`)**
-  - Dedicated GPU scheduler thread with prefix-cache affinity and continuous batched decode (`step_multi`) scaling up to `B=128` concurrent sequences (**`1,675.7 agg tok/s`**).
+  - Dedicated GPU scheduler thread with prefix-cache affinity and continuous batched decode (`step_multi` with GQA 3:1 attention) scaling up to `B=128` concurrent sequences (**`1,757.3 agg tok/s`**).
   - `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (text + vision, JSON + SSE), `POST /v1/completions` (single + batch), `POST /v1/responses` (HTTP + SSE), `GET /v1/responses` (WebSocket).
 
 ---
@@ -55,9 +55,9 @@ Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)** (`
 | **Multi-User Decode (`B=8`, Batched DSpark `K=4`)** | **458.6 agg tok/s** | `57.3 tok/s/user` |
 | **Multi-User Decode (`B=8`, Batched DFlash 2 `K=4`)** | **638.1 agg tok/s** | **`79.8 tok/s/user`** (8 concurrent users each faster than single-user `llama.cpp`) |
 | **Multi-User Decode (`B=16`, no-spec)** | **661.1 agg tok/s** | `41.3 tok/s/user` (`ITL 24.2 ms`) |
-| **Multi-User Decode (`B=32`, no-spec)** | **814.5 agg tok/s** | `25.5 tok/s/user` |
+| **Multi-User Decode (`B=32`, no-spec)** | **827.2 agg tok/s** | `25.9 tok/s/user` (GQA 3:1 multi-user attention) |
 | **Multi-User Decode (`B=64`, no-spec)** | **1,049.3 agg tok/s** | `16.4 tok/s/user` (coalesced `64×64` LDS WMMA MoE) |
-| **Multi-User Decode (`B=128`, no-spec)** | **1,682.1 agg tok/s** | `13.1 tok/s/user` |
+| **Multi-User Decode (`B=128`, no-spec)** | **1,757.3 agg tok/s** | **`13.7 tok/s/user`** (`float4` MoE slot reduction + GQA 3:1) |
 
 ---
 

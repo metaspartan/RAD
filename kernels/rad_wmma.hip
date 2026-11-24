@@ -29,7 +29,7 @@ __device__ __forceinline__ float w_warp_sum32(float v) {
     return v;
 }
 
-extern "C" __global__ void gemm_q4_0_wmma64_k(const uint8_t* __restrict__ W,
+extern "C" __global__ __launch_bounds__(128, 3) void gemm_q4_0_wmma64_k(const uint8_t* __restrict__ W,
                                               const w_q8_1_blk* __restrict__ Xq,
                                               float* __restrict__ Y,
                                               int n, int k, int B) {
@@ -190,7 +190,7 @@ extern "C" __global__ void gemm_q4_0_wmma64_k(const uint8_t* __restrict__ W,
     }
 }
 
-extern "C" __global__ void gemm_q4_0_wmma_k(const uint8_t* __restrict__ W,
+extern "C" __global__ __launch_bounds__(128, 4) void gemm_q4_0_wmma_k(const uint8_t* __restrict__ W,
                                             const w_q8_1_blk* __restrict__ Xq,
                                             float* __restrict__ Y,
                                             int n, int k, int B) {
@@ -312,7 +312,7 @@ extern "C" __global__ void gemm_q4_0_wmma_k(const uint8_t* __restrict__ W,
     }
 }
 
-extern "C" __global__ void qkvrg_gemm_q4_wmma64_k(const uint8_t* __restrict__ wq,
+extern "C" __global__ __launch_bounds__(128, 3) void qkvrg_gemm_q4_wmma64_k(const uint8_t* __restrict__ wq,
                                                   const uint8_t* __restrict__ wk,
                                                   const uint8_t* __restrict__ wv,
                                                   const uint8_t* __restrict__ wr,
@@ -501,7 +501,7 @@ extern "C" __global__ void qkvrg_gemm_q4_wmma64_k(const uint8_t* __restrict__ wq
     }
 }
 
-extern "C" __global__ void qkvrg_gemm_q4_wmma_k(const uint8_t* __restrict__ wq,
+extern "C" __global__ __launch_bounds__(128, 4) void qkvrg_gemm_q4_wmma_k(const uint8_t* __restrict__ wq,
                                                 const uint8_t* __restrict__ wk,
                                                 const uint8_t* __restrict__ wv,
                                                 const uint8_t* __restrict__ wr,
@@ -1144,16 +1144,20 @@ extern "C" __global__ void moe_dn_q4_0_wmma_k(const uint8_t* __restrict__ W,
 extern "C" __global__ void reduce_moe_slots_k(const float* __restrict__ slots,
                                               float* __restrict__ y_out,
                                               int n_embd, int n_used) {
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    int r4 = blockIdx.x * blockDim.x + threadIdx.x;
+    int e4 = n_embd >> 2;
     int t = blockIdx.y;
-    if (r >= n_embd) return;
-    const float* base = slots + (size_t)t * n_used * n_embd + r;
-    float sum = 0.0f;
+    if (r4 >= e4) return;
+    const float4* base = reinterpret_cast<const float4*>(slots + (size_t)t * n_used * n_embd) + r4;
+    float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
     for (int s = 0; s < 8; ++s) {
-        if (s < n_used) sum += base[(size_t)s * n_embd];
+        if (s < n_used) {
+            float4 v = base[(size_t)s * e4];
+            sum.x += v.x; sum.y += v.y; sum.z += v.z; sum.w += v.w;
+        }
     }
-    y_out[(size_t)t * n_embd + r] = sum;
+    reinterpret_cast<float4*>(y_out + (size_t)t * n_embd)[r4] = sum;
 }
 
 extern "C" __global__ void gemm_f32_wmma_k(const float* __restrict__ W,
@@ -1641,7 +1645,7 @@ extern "C" int ink_moe_dn_q4_0_wmma(hipStream_t s, const uint8_t* W, const void*
     int gy = (B * n_used < 128) ? (B * n_used) : 128;
     int gz = (B >= 512) ? 2 : 1;
     moe_dn_q4_0_wmma_k<<<dim3((n_embd + 63) / 64, gy, gz), dim3(128), 0, s>>>(W, (const w_q8_1_blk*)act_q, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, moe_slots, n_embd, n_ff, n_used);
-    reduce_moe_slots_k<<<dim3((n_embd + 255) / 256, B), dim3(256), 0, s>>>(moe_slots, y_out, n_embd, n_used);
+    reduce_moe_slots_k<<<dim3(((n_embd >> 2) + 255) / 256, B), dim3(256), 0, s>>>(moe_slots, y_out, n_embd, n_used);
     return 0;
 }
 

@@ -2703,7 +2703,135 @@ extern "C" __global__ void inkling_attn_multi_gated_q8_k(const float* __restrict
     }
 }
 
+extern "C" __global__ void inkling_attn_multi_gqa3_q8_k(const float* __restrict__ Q,
+                                                        const float* __restrict__ R,
+                                                        const float* __restrict__ sinks,
+                                                        const float* __restrict__ rel_bias,
+                                                        const __half* __restrict__ k_cache_pool,
+                                                        const __half* __restrict__ v_cache_pool,
+                                                        const float* __restrict__ gate,
+                                                        const int* __restrict__ d_seq_ids,
+                                                        const int* __restrict__ d_positions,
+                                                        q8_1_blk* __restrict__ out_q8,
+                                                        int n_head, int n_head_kv,
+                                                        int dh, int d_rel,
+                                                        int rel_extent, int swa_window,
+                                                        int is_swa, int max_ctx) {
+    int kv_h = blockIdx.x;
+    int bt = blockIdx.y;
+    int seq = d_seq_ids[bt];
+    int pos = d_positions[bt];
+    int h0 = kv_h * 3;
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int q_dim = n_head * dh;
+    int r_dim = n_head * d_rel;
+
+    int p0 = lane * 2;
+    int p1 = lane * 2 + 64;
+    float q_scale = rsqrtf((float)dh);
+    float q0a[3], q0b[3], q1a[3], q1b[3];
+    float rv[3], sk[3];
+    float m[3], l[3], o0[3], o1[3], o2[3], o3[3];
+#pragma unroll
+    for (int g = 0; g < 3; ++g) {
+        int h = h0 + g;
+        const float* qh = Q + (size_t)bt * q_dim + (size_t)h * dh;
+        q0a[g] = qh[p0] * q_scale;
+        q0b[g] = qh[p0 + 1] * q_scale;
+        q1a[g] = qh[p1] * q_scale;
+        q1b[g] = qh[p1 + 1] * q_scale;
+        rv[g] = (lane < d_rel) ? R[(size_t)bt * r_dim + (size_t)h * d_rel + lane] : 0.0f;
+        sk[g] = sinks[(size_t)bt * n_head + h];
+        m[g] = (wid == 0) ? 0.0f : -1e30f;
+        l[g] = (wid == 0) ? 1.0f : 0.0f;
+        o0[g] = 0.0f; o1[g] = 0.0f; o2[g] = 0.0f; o3[g] = 0.0f;
+    }
+
+    int t_start = is_swa ? max(0, pos - swa_window + 1) : 0;
+    int t_end = pos + 1;
+    size_t seq_kv_stride = (size_t)n_head_kv * max_ctx * dh;
+    const __half* kc_h = k_cache_pool + (size_t)seq * seq_kv_stride + (size_t)kv_h * max_ctx * dh;
+    const __half* vc_h = v_cache_pool + (size_t)seq * seq_kv_stride + (size_t)kv_h * max_ctx * dh;
+
+    for (int t = t_start + wid; t < t_end; t += 8) {
+        int kv_slot = is_swa ? (t % max_ctx) : t;
+        const __half2* kt2 = reinterpret_cast<const __half2*>(kc_h + (size_t)kv_slot * dh);
+        float2 k0 = __half22float2(kt2[lane]);
+        float2 k1 = __half22float2(kt2[lane + 32]);
+        const __half2* vt2 = reinterpret_cast<const __half2*>(vc_h + (size_t)kv_slot * dh);
+        float2 v0 = __half22float2(vt2[lane]);
+        float2 v1 = __half22float2(vt2[lane + 32]);
+        int dist = pos - t;
+        bool has_rb = (dist < rel_extent);
+        float rb_l = (has_rb && lane < d_rel) ? rel_bias[(size_t)dist * d_rel + lane] : 0.0f;
+
+#pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            float dot = q0a[g] * k0.x + q0b[g] * k0.y + q1a[g] * k1.x + q1b[g] * k1.y;
+            float score = __shfl(s_warp_sum32(dot), 0, 32);
+            if (has_rb) score += __shfl(s_warp_sum32(rb_l * rv[g]), 0, 32);
+            score -= sk[g];
+            float m_new = fmaxf(m[g], score);
+            float alpha = (m[g] > -1e20f) ? expf(m[g] - m_new) : 0.0f;
+            float p = expf(score - m_new);
+            l[g] = l[g] * alpha + p;
+            m[g] = m_new;
+            o0[g] = fmaf(p, v0.x, o0[g] * alpha);
+            o1[g] = fmaf(p, v0.y, o1[g] * alpha);
+            o2[g] = fmaf(p, v1.x, o2[g] * alpha);
+            o3[g] = fmaf(p, v1.y, o3[g] * alpha);
+        }
+    }
+
+    __shared__ float sm_m[8];
+    __shared__ float sm_l[8];
+    __shared__ float sm_o[8][128];
+    __shared__ int8_t smq[32];
+    int d0 = lane, d1 = lane + 32, d2 = lane + 64, d3 = lane + 96;
+#pragma unroll
+    for (int g = 0; g < 3; ++g) {
+        if (lane == 0) { sm_m[wid] = m[g]; sm_l[wid] = l[g]; }
+        sm_o[wid][p0] = o0[g]; sm_o[wid][p0 + 1] = o1[g];
+        sm_o[wid][p1] = o2[g]; sm_o[wid][p1 + 1] = o3[g];
+        __syncthreads();
+        if (wid == 0) {
+            float gm = sm_m[0];
+#pragma unroll
+            for (int w = 1; w < 8; ++w) gm = fmaxf(gm, sm_m[w]);
+            float gl = 0.0f;
+            float go0 = 0.0f, go1 = 0.0f, go2 = 0.0f, go3 = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                float sc = (sm_m[w] > -1e20f) ? expf(sm_m[w] - gm) : 0.0f;
+                gl += sm_l[w] * sc;
+                go0 += sm_o[w][d0] * sc;
+                go1 += sm_o[w][d1] * sc;
+                go2 += sm_o[w][d2] * sc;
+                go3 += sm_o[w][d3] * sc;
+            }
+            float inv_l = 1.0f / gl;
+            int h = h0 + g;
+            const float* gh = gate + (size_t)bt * q_dim + (size_t)h * dh;
+            float v0 = (go0 * inv_l) / (1.0f + expf(-gh[d0]));
+            float v1 = (go1 * inv_l) / (1.0f + expf(-gh[d1]));
+            float v2 = (go2 * inv_l) / (1.0f + expf(-gh[d2]));
+            float v3 = (go3 * inv_l) / (1.0f + expf(-gh[d3]));
+            size_t qbase = ((size_t)bt * n_head + h) * 4;
+            store_q8_1_from_warp(v0, lane, out_q8 + qbase + 0, smq);
+            store_q8_1_from_warp(v1, lane, out_q8 + qbase + 1, smq);
+            store_q8_1_from_warp(v2, lane, out_q8 + qbase + 2, smq);
+            store_q8_1_from_warp(v3, lane, out_q8 + qbase + 3, smq);
+        }
+        __syncthreads();
+    }
+}
+
 extern "C" int ink_attn_multi_gated_q8(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const __half* kc_pool, const __half* vc_pool, const float* gate, const int* d_seq_ids, const int* d_positions, void* out_q8, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int swa_window, int is_swa, int max_ctx, int B) {
+    if (dh == 128 && n_head == n_head_kv * 3 && B >= 8) {
+        inkling_attn_multi_gqa3_q8_k<<<dim3(n_head_kv, B), dim3(256), 0, s>>>(Q, R, sinks, rel_bias, kc_pool, vc_pool, gate, d_seq_ids, d_positions, (q8_1_blk*)out_q8, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx);
+        return 0;
+    }
     inkling_attn_multi_gated_q8_k<<<dim3(n_head, B), dim3(256), 0, s>>>(Q, R, sinks, rel_bias, kc_pool, vc_pool, gate, d_seq_ids, d_positions, (q8_1_blk*)out_q8, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx);
     return 0;
 }
