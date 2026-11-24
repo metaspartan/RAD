@@ -94,6 +94,12 @@ impl Drafter {
         }
     }
 
+    fn sync(&self) {
+        if let Drafter::DFlash2(d) = self {
+            d.sync();
+        }
+    }
+
     fn reset_seq(&mut self, seq: usize) {
         match self {
             Drafter::DFlash2(d) => d.reset_seq(seq),
@@ -1330,11 +1336,12 @@ fn run_scheduler(
                         engine.rewind_verify_multi(&seq_ids, &emits, multi_k)?;
                         for u in 0..active.len() {
                             let su = seq_ids[u] as usize;
-                            d.inject_batch_seq(su, &engine, u * multi_k, pos_before[u], emits[u])?;
+                            d.inject_batch_seq_async(su, &engine, u * multi_k, pos_before[u], emits[u])?;
                             for j in 0..emits[u] {
                                 engine.seq_tokens[su].push(drafts[u][j]);
                             }
                         }
+                        d.sync();
                         Ok(outs)
                     })();
                     match res {
@@ -2974,8 +2981,9 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
                     }
                     engine.rewind_verify_multi(&seq_ids, &emits, mk)?;
                     for u in 0..b {
-                        d.inject_batch_seq(u, &engine, u * mk, pos0[u], emits[u])?;
+                        d.inject_batch_seq_async(u, &engine, u * mk, pos0[u], emits[u])?;
                     }
+                    d.sync();
                 }
                 let agg = tot as f64 / t1.elapsed().as_secs_f64();
                 let per_u = agg / b as f64;
