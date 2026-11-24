@@ -734,6 +734,85 @@ extern "C" __global__ void sink_dyn_bf16_wmma_k(const uint16_t* __restrict__ wsi
     }
 }
 
+extern "C" __global__ void sink_dyn_bf16_smallb_k(const uint16_t* __restrict__ wsink,
+                                                  const uint16_t* __restrict__ wkdyn,
+                                                  const uint16_t* __restrict__ wvdyn,
+                                                  const float* __restrict__ X0,
+                                                  const float* __restrict__ X1,
+                                                  const float* __restrict__ X2,
+                                                  float* __restrict__ S,
+                                                  float* __restrict__ Kdyn,
+                                                  float* __restrict__ Vdyn,
+                                                  int k, int n_head, int dyn_dim, int B) {
+    int gid = blockIdx.x;
+    int t0 = blockIdx.y * 8;
+    int n_t = min(8, B - t0);
+    if (n_t <= 0 || gid >= n_head + 2 * dyn_dim) return;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    const uint16_t* W;
+    const float* X;
+    float* Y;
+    int row, n_out;
+    if (gid < n_head) { W = wsink; X = X0; Y = S; row = gid; n_out = n_head; }
+    else if (gid < n_head + dyn_dim) { W = wkdyn; X = X1; Y = Kdyn; row = gid - n_head; n_out = dyn_dim; }
+    else { W = wvdyn; X = X2; Y = Vdyn; row = gid - n_head - dyn_dim; n_out = dyn_dim; }
+    const uint2* wrow4 = reinterpret_cast<const uint2*>(W + (size_t)row * k);
+    int k4 = k >> 2;
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    if (n_t == 8) {
+        const float4* xp0 = reinterpret_cast<const float4*>(X + (size_t)(t0 + 0) * k);
+        const float4* xp1 = reinterpret_cast<const float4*>(X + (size_t)(t0 + 1) * k);
+        const float4* xp2 = reinterpret_cast<const float4*>(X + (size_t)(t0 + 2) * k);
+        const float4* xp3 = reinterpret_cast<const float4*>(X + (size_t)(t0 + 3) * k);
+        const float4* xp4 = reinterpret_cast<const float4*>(X + (size_t)(t0 + 4) * k);
+        const float4* xp5 = reinterpret_cast<const float4*>(X + (size_t)(t0 + 5) * k);
+        const float4* xp6 = reinterpret_cast<const float4*>(X + (size_t)(t0 + 6) * k);
+        const float4* xp7 = reinterpret_cast<const float4*>(X + (size_t)(t0 + 7) * k);
+        for (int j = tid; j < k4; j += 256) {
+            uint2 w2 = wrow4[j];
+            float w0 = w_bf16_f32((uint16_t)(w2.x & 0xFFFFu));
+            float w1 = w_bf16_f32((uint16_t)(w2.x >> 16));
+            float w2f = w_bf16_f32((uint16_t)(w2.y & 0xFFFFu));
+            float w3 = w_bf16_f32((uint16_t)(w2.y >> 16));
+            float4 v0 = xp0[j]; acc[0] = fmaf(w0, v0.x, fmaf(w1, v0.y, fmaf(w2f, v0.z, fmaf(w3, v0.w, acc[0]))));
+            float4 v1 = xp1[j]; acc[1] = fmaf(w0, v1.x, fmaf(w1, v1.y, fmaf(w2f, v1.z, fmaf(w3, v1.w, acc[1]))));
+            float4 v2 = xp2[j]; acc[2] = fmaf(w0, v2.x, fmaf(w1, v2.y, fmaf(w2f, v2.z, fmaf(w3, v2.w, acc[2]))));
+            float4 v3 = xp3[j]; acc[3] = fmaf(w0, v3.x, fmaf(w1, v3.y, fmaf(w2f, v3.z, fmaf(w3, v3.w, acc[3]))));
+            float4 v4 = xp4[j]; acc[4] = fmaf(w0, v4.x, fmaf(w1, v4.y, fmaf(w2f, v4.z, fmaf(w3, v4.w, acc[4]))));
+            float4 v5 = xp5[j]; acc[5] = fmaf(w0, v5.x, fmaf(w1, v5.y, fmaf(w2f, v5.z, fmaf(w3, v5.w, acc[5]))));
+            float4 v6 = xp6[j]; acc[6] = fmaf(w0, v6.x, fmaf(w1, v6.y, fmaf(w2f, v6.z, fmaf(w3, v6.w, acc[6]))));
+            float4 v7 = xp7[j]; acc[7] = fmaf(w0, v7.x, fmaf(w1, v7.y, fmaf(w2f, v7.z, fmaf(w3, v7.w, acc[7]))));
+        }
+    } else {
+        for (int j = tid; j < k4; j += 256) {
+            uint2 w2 = wrow4[j];
+            float w0 = w_bf16_f32((uint16_t)(w2.x & 0xFFFFu));
+            float w1 = w_bf16_f32((uint16_t)(w2.x >> 16));
+            float w2f = w_bf16_f32((uint16_t)(w2.y & 0xFFFFu));
+            float w3 = w_bf16_f32((uint16_t)(w2.y >> 16));
+            for (int m = 0; m < n_t; ++m) {
+                float4 v = reinterpret_cast<const float4*>(X + (size_t)(t0 + m) * k)[j];
+                acc[m] = fmaf(w0, v.x, fmaf(w1, v.y, fmaf(w2f, v.z, fmaf(w3, v.w, acc[m]))));
+            }
+        }
+    }
+    __shared__ float sm[8][8];
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        if (m < n_t) {
+            float v = w_warp_sum32(acc[m]);
+            if (lane == 0) sm[m][wid] = v;
+        }
+    }
+    __syncthreads();
+    if (tid < n_t) {
+        float tot = sm[tid][0] + sm[tid][1] + sm[tid][2] + sm[tid][3] + sm[tid][4] + sm[tid][5] + sm[tid][6] + sm[tid][7];
+        Y[(size_t)(t0 + tid) * n_out + row] = tot;
+    }
+}
+
 extern "C" __global__ void sink_dyn_bf16_k(const uint16_t* __restrict__ wsink,
                                            const uint16_t* __restrict__ wkdyn,
                                            const uint16_t* __restrict__ wvdyn,
@@ -1169,7 +1248,7 @@ extern "C" __global__ void moe_dn_q4_0_wmma_k(const uint8_t* __restrict__ W,
                                               const int* __restrict__ tok_sorted,
                                               const int* __restrict__ slot_sorted,
                                               const float* __restrict__ wt_sorted,
-                                              float* __restrict__ y_out,
+                                              __half* __restrict__ y_out,
                                               int n_embd, int n_ff, int n_used) {
     int exp_id = exp_counts[128 + blockIdx.y];
     if (exp_id < 0) return;
@@ -1305,44 +1384,48 @@ extern "C" __global__ void moe_dn_q4_0_wmma_k(const uint8_t* __restrict__ W,
         if (n0 + col < nt) {
             int idx0 = off0 + t0 + n0 + col;
             float wt0 = wt_sorted[idx0];
-            float* dst = y_out + ((size_t)tok_sorted[idx0] * n_used + slot_sorted[idx0]) * n_embd;
+            __half* dst = y_out + ((size_t)tok_sorted[idx0] * n_used + slot_sorted[idx0]) * n_embd;
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 int r0 = blk_row0 + m0 + half * 8 + i;
-                if (r0 < n_embd) dst[r0] = acc00[i] * wt0;
+                if (r0 < n_embd) dst[r0] = __float2half(acc00[i] * wt0);
                 int r1 = blk_row0 + m1 + half * 8 + i;
-                if (r1 < n_embd) dst[r1] = acc10[i] * wt0;
+                if (r1 < n_embd) dst[r1] = __float2half(acc10[i] * wt0);
             }
         }
         if (n1 + col < nt) {
             int idx1 = off0 + t0 + n1 + col;
             float wt1 = wt_sorted[idx1];
-            float* dst = y_out + ((size_t)tok_sorted[idx1] * n_used + slot_sorted[idx1]) * n_embd;
+            __half* dst = y_out + ((size_t)tok_sorted[idx1] * n_used + slot_sorted[idx1]) * n_embd;
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 int r0 = blk_row0 + m0 + half * 8 + i;
-                if (r0 < n_embd) dst[r0] = acc01[i] * wt1;
+                if (r0 < n_embd) dst[r0] = __float2half(acc01[i] * wt1);
                 int r1 = blk_row0 + m1 + half * 8 + i;
-                if (r1 < n_embd) dst[r1] = acc11[i] * wt1;
+                if (r1 < n_embd) dst[r1] = __float2half(acc11[i] * wt1);
             }
         }
     }
 }
 
-extern "C" __global__ void reduce_moe_slots_k(const float* __restrict__ slots,
+extern "C" __global__ void reduce_moe_slots_k(const __half* __restrict__ slots,
                                               float* __restrict__ y_out,
                                               int n_embd, int n_used) {
     int r4 = blockIdx.x * blockDim.x + threadIdx.x;
     int e4 = n_embd >> 2;
     int t = blockIdx.y;
     if (r4 >= e4) return;
-    const float4* base = reinterpret_cast<const float4*>(slots + (size_t)t * n_used * n_embd) + r4;
+    const uint2* base = reinterpret_cast<const uint2*>(slots + (size_t)t * n_used * n_embd) + r4;
     float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
     for (int s = 0; s < 8; ++s) {
         if (s < n_used) {
-            float4 v = base[(size_t)s * e4];
-            sum.x += v.x; sum.y += v.y; sum.z += v.z; sum.w += v.w;
+            uint2 v = base[(size_t)s * e4];
+            __half2 h0 = *reinterpret_cast<const __half2*>(&v.x);
+            __half2 h1 = *reinterpret_cast<const __half2*>(&v.y);
+            float2 f0 = __half22float2(h0);
+            float2 f1 = __half22float2(h1);
+            sum.x += f0.x; sum.y += f0.y; sum.z += f1.x; sum.w += f1.y;
         }
     }
     reinterpret_cast<float4*>(y_out + (size_t)t * n_embd)[r4] = sum;
@@ -1984,9 +2067,11 @@ extern "C" int ink_qkvrg_gemm_q4_wmma(hipStream_t s, const uint8_t* wq, const ui
         qkvrg_gemm_q4_wmma_k<<<dim3((qkv_rows + 63) / 64, (B + 31) / 32), dim3(128), 0, s>>>(wq, wk, wv, wr, wg, (const w_q8_1_blk*)Xq0, (const w_q8_1_blk*)Xq1, (const w_q8_1_blk*)Xq2, Q, K, V, R, G, k, q_dim, kv_dim, r_dim, B);
     }
     int sd_rows = n_head + 2 * dyn_dim;
-    if (B >= 8 && (k & 31) == 0 && n_head <= 32 && dyn_dim <= 32) {
+    if (B > 64 && (k & 31) == 0 && n_head <= 32 && dyn_dim <= 32) {
         int n_parts = (dyn_dim > 0) ? 6 : ((n_head > 16) ? 2 : 1);
         sink_dyn_bf16_wmma_k<<<dim3(n_parts, (B + 63) / 64), dim3(128), 0, s>>>(wsink, wkdyn, wvdyn, X0, X1, X2, S, Kdyn, Vdyn, k, n_head, dyn_dim, B);
+    } else if ((k & 3) == 0) {
+        sink_dyn_bf16_smallb_k<<<dim3(sd_rows, (B + 7) / 8), dim3(256), 0, s>>>(wsink, wkdyn, wvdyn, X0, X1, X2, S, Kdyn, Vdyn, k, n_head, dyn_dim, B);
     } else {
         sink_dyn_bf16_k<<<dim3((sd_rows + 3) / 4, (B + 7) / 8), dim3(128), 0, s>>>(wsink, wkdyn, wvdyn, X0, X1, X2, S, Kdyn, Vdyn, k, n_head, dyn_dim, B);
     }
@@ -2010,8 +2095,9 @@ extern "C" int ink_moe_gu_q4_0_wmma_to_q8(hipStream_t s, const uint8_t* W, const
 extern "C" int ink_moe_dn_q4_0_wmma(hipStream_t s, const uint8_t* W, const void* act_q, const int* exp_counts, const int* exp_offsets, const int* tok_sorted, const int* slot_sorted, const float* wt_sorted, float* moe_slots, float* y_out, int n_embd, int n_ff, int n_used, int B) {
     int gy = (B * n_used < 128) ? (B * n_used) : 128;
     int gz = (B >= 512) ? 6 : ((B >= 128) ? 2 : 1);
-    moe_dn_q4_0_wmma_k<<<dim3((n_embd + 127) / 128, gy, gz), dim3(256), 0, s>>>(W, (const w_q8_1_blk*)act_q, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, moe_slots, n_embd, n_ff, n_used);
-    reduce_moe_slots_k<<<dim3(((n_embd >> 2) + 255) / 256, B), dim3(256), 0, s>>>(moe_slots, y_out, n_embd, n_used);
+    __half* hslots = reinterpret_cast<__half*>(moe_slots);
+    moe_dn_q4_0_wmma_k<<<dim3((n_embd + 127) / 128, gy, gz), dim3(256), 0, s>>>(W, (const w_q8_1_blk*)act_q, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, hslots, n_embd, n_ff, n_used);
+    reduce_moe_slots_k<<<dim3(((n_embd >> 2) + 255) / 256, B), dim3(256), 0, s>>>(hslots, y_out, n_embd, n_used);
     return 0;
 }
 
