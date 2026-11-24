@@ -101,4 +101,15 @@ extern "C" {
     pub fn ink_dspark_add_bias_multi(s: HipStream, hidden: *const f32, delta: *const f32, bias: *const f32, out: *mut f32, n_embd: i32, n_users: i32, k_len: i32, slot: i32) -> i32;
     pub fn ink_dspark_scatter_toks(s: HipStream, src_toks: *const i32, dst_toks: *mut i32, n_users: i32, k_len: i32, slot: i32) -> i32;
     pub fn ink_attn_batch_gated_q8(s: HipStream, q: *const f32, r: *const f32, sinks: *const f32, rel_bias: *const f32, kc: *const u16, vc: *const u16, gate: *const f32, d_pos0: *const i32, out_q8: *mut core::ffi::c_void, n_head: i32, n_head_kv: i32, dh: i32, d_rel: i32, rel_extent: i32, swa_window: i32, is_swa: i32, max_ctx: i32, b: i32) -> i32;
+    pub fn ink_bf16_to_q4_0(s: HipStream, src: *const u16, dst: *mut u8, n_rows: usize, nblk: i32) -> i32;
+    pub fn ink_bf16_to_f32(s: HipStream, src: *const u16, dst: *mut f32, n: usize) -> i32;
+    pub fn ink_dflash2_conv(s: HipStream, hidden: *const f32, dynamic: *const f32, base_kernel: *const f32, out: *mut f32, n_embd: i32, block_size: i32, group_size: i32, side: i32, n_tokens: i32) -> i32;
+    pub fn ink_dflash2_topk16(s: HipStream, logits: *const f32, cand_ids: *mut i32, cand_vals: *mut f32, vocab_padded: i32, vocab_unpadded: i32, n_rows: i32) -> i32;
+    pub fn ink_dflash2_select_path(s: HipStream, cand_ids: *const i32, cand_vals: *const f32, h_proj: *const f32, pred_cb: *const u16, succ_cb: *const u16, d_draft_toks: *mut i32, n_users: i32, k_len: i32, rank: i32, softcap: f32) -> i32;
+    pub fn ink_gemm_f16_bias(s: HipStream, w: *const u16, bias: *const f32, x: *const f32, y: *mut f32, n: i32, k: i32, b: i32) -> i32;
+    pub fn ink_layernorm_f32(s: HipStream, x: *const f32, w: *const f32, b: *const f32, y: *mut f32, n: i32, rows: i32, eps: f32) -> i32;
+    pub fn ink_gelu_f32(s: HipStream, x: *mut f32, n: usize) -> i32;
+    pub fn ink_ls_res_add_f32(s: HipStream, x: *mut f32, delta: *const f32, ls_w: *const f32, n: i32, rows: i32) -> i32;
+    pub fn ink_vit_attn_f32(s: HipStream, q: *const f32, k: *const f32, v: *const f32, o: *mut f32, seq_len: i32, n_head: i32, dh: i32) -> i32;
+    pub fn ink_vit_merge_2x2(s: HipStream, x: *const f32, y: *mut f32, grid_h: i32, grid_w: i32, c: i32) -> i32;
 }

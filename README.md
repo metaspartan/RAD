@@ -1,29 +1,27 @@
 # RAD — Inference Engine
 
-**RAD** is a high-performance, from-scratch LLM inference engine written in **Rust** and **ROCm/HIP**, engineered for low-latency single-user generation and high-throughput multi-user serving.
+**RAD** is a high-performance, from-scratch multimodal LLM inference engine written in **Rust** and **ROCm/HIP**, engineered for ultra-fast single-user speculative generation and high-throughput multi-user serving.
 
-The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybrid SWA + full attention, dynamic shortconv, rank-64 loop controllers, and DSpark speculative decoding) on **AMD Radeon AI PRO R9700 (RDNA4 `gfx1201`)**, with a modular crate architecture built to expand to additional hardware targets and model families.
+The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybrid SWA + full attention, dynamic shortconv, rank-64 loop controllers, native **DFlash 2** & **DSpark** speculative decoding, and native **GPU Vision** via `mmproj-F16.gguf`) on **AMD Radeon AI PRO R9700 (RDNA4 `gfx1201`)**, with a modular crate architecture built to expand to additional hardware targets and model families.
 
 ---
 
 ## Highlights
 
+- **Native `incoai/Inkling-2-Mini-DFlash2` Speculative Decoding (`194.1 tok/s` Single-User)**
+  - Zero-copy `safetensors` loader + 5-layer parallel block-diffusion drafter with grouped dynamic convolutions (`conv_kernel_size=2`, `conv_group_size=16`), 1 parallel `lm_head` pass, and GPU top-16 candidate path selector (`draft=3.48 ms`, `avg_emit=6.52` on code, `5.52` on math).
+  - Full `hipGraph`-captured draft & verify loops for both single-user (`B=1`) and multi-user (`B=4..8`), plus fallback support for **DSpark** (`dspark-Inkling-2-Mini-Q8_0.gguf`).
+- **Native GPU Vision (`mmproj-F16.gguf`, Enabled by Default)**
+  - Full 23-layer HIP ViT encoder (`640×640`, `20×20` patches, LayerScale `ls1`/`ls2`, bidirectional self-attention, `2×2` spatial merge, `inkling2v` MLP projector) outputting 256 multimodal embeddings directly into `InklingEngine` and `DFlash2Drafter`.
+  - Works out of the box via OpenAI `image_url` (data URLs / local files) in `/v1/chat/completions` and `rad run --image <PATH>`.
 - **RDNA4 (`gfx1201`) Wave32 WMMA Matrix Core Suite**
   - Custom `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12` kernels for `Q4_0_SOA` × `Q8_1` GEMM (`qkvrg`, `wo`, `lm_head`, grouped MoE gate/up, and zero-atomic grouped MoE down).
   - Custom `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` **FlashAttention-2** (64 query tokens sharing an 8 KB LDS KV tile), WMMA FP16 loop controllers, and WMMA FP16 MoE router.
-- **On-GPU `Q4_0_SOA` Weight Repacking**
-  - Converts `Q8_0` and `NVFP4` tensors directly on GPU at load time (~10 ms, **~1.2 s** total cold load) into 16-byte-aligned structure-of-arrays blocks for coalesced `uint4` loads and `sudot4` / WMMA execution.
-- **`hipGraph`-Captured Decode, Continuous Batching & Multi-User DSpark Speculative Decoding**
-  - Full 48-visit decode step (`B=1`), multi-user decode steps (`B=2..128`), multi-user speculative verification (`verify_multi`), and multi-step `K`-token DSpark draft loops are all captured into `hipGraph`s (zero mid-loop host syncs), paired with exact O(1) per-user shortconv & ring-buffer KV rewind.
-- **vLLM-Style Continuous Batching & Prefix Caching**
-  - Dedicated GPU scheduler thread with prefix-cache affinity, automatic DSpark speculative decoding, and continuous batched decode (`step_multi`) scaling up to `B=128` concurrent sequences.
-- **Full OpenAI-Compatible Serving API (`rad-serve`)**
-  - `GET /health`
-  - `GET /v1/models`
-  - `POST /v1/chat/completions` (JSON + token-by-token SSE + `timings` + `cached_tokens`)
-  - `POST /v1/completions` (single prompt and batch array)
-  - `POST /v1/responses` (HTTP + SSE)
-  - `GET /v1/responses` (**WebSocket** low-latency streaming)
+- **On-GPU `Q4_0_SOA` Weight Repacking & `hipGraph` Execution**
+  - Converts `Q8_0`, `NVFP4`, and `BF16` tensors directly on GPU at load time (**~1.2 s** cold load) into 16-byte-aligned structure-of-arrays blocks for coalesced `uint4` loads and `sudot4` / WMMA execution.
+- **vLLM-Style Continuous Batching, Prefix Caching & Full OpenAI API (`rad`)**
+  - Dedicated GPU scheduler thread with prefix-cache affinity and continuous batched decode (`step_multi`) scaling up to `B=128` concurrent sequences (`1,266.3 agg tok/s`).
+  - `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (text + vision, JSON + SSE), `POST /v1/completions` (single + batch), `POST /v1/responses` (HTTP + SSE), `GET /v1/responses` (WebSocket).
 
 ---
 
@@ -33,16 +31,17 @@ The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybri
 
 ![RAD vs Stock llama.cpp and RTX PRO 6000 Blackwell](assets/rad_benchmark.svg)
 
-Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)** with identical prompts (`Inkling-2-Mini-UD-Q4_K_XL` + `dspark-Inkling-2-Mini-Q8_0.gguf`, coherence-verified) — achieving **2.10× faster decode** and **2.16× faster prefill** than stock `llama.cpp`, and outperforming Unsloth's claimed **125 tok/s** on an **NVIDIA RTX PRO 6000 Blackwell (96 GB, ~\$8,500)** by **+18.5%**:
+Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)** (`Inkling-2-Mini-UD-Q4_K_XL` + `incoai/Inkling-2-Mini-DFlash2` / `dspark-Inkling-2-Mini-Q8_0.gguf`, coherence-verified) — achieving **2.75× faster decode** and **2.16× faster prefill** than stock `llama.cpp`, and outperforming Unsloth's claimed **125 tok/s** on an **NVIDIA RTX PRO 6000 Blackwell (96 GB, ~\$8,500)** by **+55.3%**:
 
 | Engine / Hardware | Decode (`tok/s`) | Long Prefill (`1,639 tok`) | Notes |
 | --- | --- | --- | --- |
 | **Stock `llama.cpp` (R9700 + DSpark)** | `70.5 tok/s` | `765.5 tok/s` | `-fa on -ctk q8_0 -ctv q8_0 --spec-type draft-dspark` |
 | **RAD (R9700, No-Spec `hipGraph`)** | **`93.9 tok/s`** (`1.33×`) | **`1,651.7 tok/s`** (`2.16×`) | Beats stock `llama.cpp`+DSpark without speculation |
 | **Unsloth RTX PRO 6000 Blackwell** | `125.0 tok/s` *(claimed)* | — | 96 GB workstation GPU (~\$8,500) |
-| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (**`2.10×`**) | **`1,651.7 tok/s`** (**`2.16×`**) | **+18.5% vs. RTX PRO 6000 Blackwell**, `verify=23.7 ms` |
+| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`1,651.7 tok/s`** (`2.16×`) | `verify=23.7 ms`, `avg_emit=4.27` |
+| **RAD (R9700 + DFlash 2 `K=8`)** | **`194.1 tok/s`** (**`2.75×`**) | **`1,651.7 tok/s`** (**`2.16×`**) | **+55.3% vs. RTX PRO 6000 Blackwell**, `draft=3.48 ms`, `avg_emit=6.52` (code), `173.6 tok/s` (math) |
 
-### Multi-User Continuous Batching & Batched DSpark
+### Multi-User Continuous Batching & Batched Speculative Decoding
 
 ![RAD Multi-User Scaling on Single R9700](assets/rad_multiuser.svg)
 
@@ -53,6 +52,7 @@ Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)** wi
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **32.5 ms** | Prefix-cache affinity hit |
 | **Multi-User Decode (`B=4`, Batched DSpark `K=4`)** | **318.8 agg tok/s** | **`79.7 tok/s/user`** (`draft=3.62 ms`, `verify=34.67 ms`) |
 | **Multi-User Decode (`B=8`, no-spec)** | **238.2 agg tok/s** | `29.8 tok/s/user` (`hipGraph` + fused `moe_gu_sudot4_to_q8`) |
+| **Multi-User Decode (`B=8`, Batched DFlash 2 `K=4`)** | **416.5 agg tok/s** | **`52.1 tok/s/user`** (`draft=7.08 ms`, `verify=48.86 ms`) |
 | **Multi-User Decode (`B=8`, Batched DSpark `K=4`)** | **458.6 agg tok/s** | **`57.3 tok/s/user`** (**+92%** over `B=8` no-spec, `draft=5.20 ms`) |
 | **Multi-User Decode (`B=16`, no-spec)** | **448.5 agg tok/s** | `28.0 tok/s/user` |
 | **Multi-User Decode (`B=32`, no-spec)** | **688.0 agg tok/s** | `21.5 tok/s/user` (~83% of peak R9700 HBM bandwidth) |
@@ -71,13 +71,18 @@ RAD/
 │   ├── rad_ops.hip            Core decode, RMSNorm, shortconv, attention, loop-ctrl kernels
 │   ├── rad_batch.hip          Batched prefill & multi-user kernels
 │   ├── rad_dspark.hip         DSpark speculative drafter kernels
+│   ├── rad_dflash2.hip        DFlash 2 grouped dynamic conv, top-16 & path selector kernels
+│   ├── rad_vision.hip         ViT FP16 GEMM, LayerNorm, GELU, LayerScale, bidirectional attn & 2x2 merge
 │   ├── rad_sudot4.hip         Q4_0_SOA / Q8_1 / NVFP4 sudot4 & fused B=1 kernels
 │   └── rad_wmma.hip           RDNA4 Wave32 WMMA INT8 GEMM, MoE, & FP16 FlashAttention-2
 ├── crates/
 │   ├── rad-gguf/              Zero-copy mmap GGUF reader
 │   ├── rad-hip/               Minimal ROCm/HIP FFI, RAII DevBuf, and CapturedGraph
-│   ├── rad-core/              Model engine, DSpark drafter, and benchmark examples
-│   └── rad-serve/             Axum HTTP/SSE/WebSocket server with continuous batching
+│   ├── rad-core/              Model engine, DFlash 2 & DSpark drafters, VisionEncoder, safetensors reader
+│   └── rad-serve/             `rad` CLI + Axum HTTP/SSE/WebSocket server with continuous batching
+├── assets/
+│   ├── rad_benchmark.svg      Single-user decode & prefill comparison chart
+│   └── rad_multiuser.svg      Multi-user throughput scaling chart
 └── scripts/
     └── test_serve.py          End-to-end HTTP, SSE, batch, and WebSocket test suite
 ```
@@ -90,7 +95,7 @@ RAD/
 
 - Linux with **ROCm 6.x / 7.x** (`hipcc`, `libamdhip64`, `libhipblas`, `librocblas`)
 - **Rust** toolchain (`cargo`, edition 2021)
-- GGUF model weights + `tokenizer.json` (and optional DSpark draft GGUF)
+- GGUF model weights + `tokenizer.json` (plus optional `incoai/Inkling-2-Mini-DFlash2`, `dspark-Inkling-2-Mini-Q8_0.gguf`, and `mmproj-F16.gguf`)
 
 ### 1. Build HIP Kernels
 
@@ -100,7 +105,7 @@ RAD_ARCH=gfx1201 bash kernels/build.sh
 
 ### 2. Build RAD
 
-`crates/rad-core/build.rs` automatically links `kernels/librad_ops.so` with `-Wl,-rpath`, so no manual `RUSTFLAGS` or `LD_LIBRARY_PATH` is required:
+`crates/rad-core/build.rs` and `crates/rad-serve/build.rs` automatically link `kernels/librad_ops.so` with `-Wl,-rpath`, so no manual `RUSTFLAGS` or `LD_LIBRARY_PATH` is required:
 
 ```bash
 cargo build --release
@@ -108,27 +113,25 @@ cargo build --release
 
 ### 3. Run the CLI (`rad`)
 
-`rad` automatically detects sibling `tokenizer.json`, `dspark-Inkling-2-Mini-Q8_0.gguf`, and `mmproj-F16.gguf` files next to `--model`:
+`rad` automatically detects sibling `tokenizer.json`, **DFlash 2** (`../inkling2-dflash2/model.safetensors`, preferred over DSpark), **DSpark** (`dspark-Inkling-2-Mini-Q8_0.gguf`), and **Vision** (`mmproj-F16.gguf`, enabled by default):
 
 ```bash
 ./target/release/rad serve -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf --port 8088
 
-./target/release/rad run "Write a concise Python LRU cache" -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf
+./target/release/rad run "Show me a Python quicksort function." -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf
+
+./target/release/rad run "Describe this image." --image /path/to/photo.png -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf
 
 ./target/release/rad info -m /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf
 ```
 
-### 4. Run Benchmarks & API Tests
+### 4. Run Benchmarks
 
 ```bash
-RAD_MODEL=/path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf \
-RAD_TOKENIZER=/path/to/tokenizer.json \
-cargo run --release --example bench_all
-
-RAD_MODEL=/path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf \
-RAD_DSPARK=/path/to/dspark-Inkling-2-Mini-Q8_0.gguf \
-RAD_TOKENIZER=/path/to/tokenizer.json \
-cargo run --release --example bench_spec
+cargo run --release --example bench_dflash2 -- \
+  /path/to/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf \
+  /path/to/inkling2-dflash2 \
+  /path/to/tokenizer.json
 
 python3 scripts/test_serve.py
 ```
@@ -140,11 +143,14 @@ python3 scripts/test_serve.py
 | Environment Variable | Default | Description |
 | --- | --- | --- |
 | `RAD_MODEL` | `./models/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf` | Target model GGUF path |
-| `RAD_TOKENIZER` | `./models/tokenizer.json` | HuggingFace `tokenizer.json` path |
-| `RAD_DSPARK` | `./models/dspark-Inkling-2-Mini-Q8_0.gguf` | Optional DSpark drafter GGUF path |
-| `RAD_SPEC` | `1` | Enable (`1`) or disable (`0`) DSpark speculative decoding |
+| `RAD_TOKENIZER` | *(auto-detected)* | HuggingFace `tokenizer.json` path |
+| `RAD_DFLASH2` | *(auto-detected)* | Optional DFlash 2 safetensors dir/file (preferred over DSpark) |
+| `RAD_DSPARK` | *(auto-detected)* | Optional DSpark drafter GGUF path |
+| `RAD_MMPROJ` | *(auto-detected)* | Optional vision `mmproj-F16.gguf` path |
+| `RAD_SPEC` | `1` | Enable (`1`) or disable (`0`) speculative decoding |
+| `RAD_VISION` | `1` | Enable (`1`) or disable (`0`) GPU vision encoder |
 | `RAD_CTX` | `8192` | Per-sequence KV context length |
-| `RAD_MAX_SEQS` | `16` | Maximum concurrent sequences in KV pool |
+| `RAD_MAX_SEQS` | `32` | Maximum concurrent sequences in KV pool |
 | `RAD_PORT` | `8088` | HTTP/WebSocket bind port |
 | `RAD_API_KEY` | *(empty)* | Optional Bearer token (if empty, auth is disabled) |
 | `RAD_ARCH` | `gfx1201` | Target GPU architecture for `kernels/build.sh` |
@@ -153,8 +159,6 @@ python3 scripts/test_serve.py
 
 ## Roadmap
 
-- **DFlash 2 (`incoai/Inkling-2-Mini-DFlash2`) Drafter:** Native 5-layer parallel block-diffusion drafter + top-16 candidate path selector (same `[5, 23, 41, 48]` target layers, 1 parallel `lm_head` pass, +32%–43% acceptance length).
-- **Vision (`mmproj`) GPU Encoder:** Full HIP ViT/SigLIP image-patch encoder for `mmproj-F16.gguf` (CLI `--mmproj` auto-detection is already wired in).
 - **Hardware backends:** CDNA (`gfx942` / MI300X), RDNA3 (`gfx1100`), NVIDIA CUDA, and Apple Metal backends behind a unified device trait.
 - **Model families:** Standard GQA/MLA transformers, Qwen3-MoE, Llama, DeepSeek, and hybrid SSM/attention architectures.
 - **Serving features:** Paged KV cache, chunked prefill, tool-calling grammar constraints, and Prometheus metrics.
@@ -163,4 +167,4 @@ python3 scripts/test_serve.py
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — Copyright (c) 2026 Carsen Klock. See [LICENSE](LICENSE).

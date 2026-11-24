@@ -584,7 +584,7 @@ impl InklingEngine {
             moe_act: DevBuf::new(mb * cfg.n_expert_used * cfg.n_ff_exp * 4).map_err(he)?,
             moe_dn_slots: DevBuf::new(mb * cfg.n_expert_used * e * 4).map_err(he)?,
             moe_raw: DevBuf::new(mb * e * 4).map_err(he)?,
-            logits: DevBuf::new(max_seqs.max(32) * cfg.vocab_padded * 4).map_err(he)?,
+            logits: DevBuf::new((max_seqs.min(8) * 8).max(max_seqs).max(32) * cfg.vocab_padded * 4).map_err(he)?,
             dspark_feats: DevBuf::new(4 * mb * e * 4).map_err(he)?,
             xq: DevBuf::new(3 * mb * (q_dim / 32) * 40).map_err(he)?,
             act_q: DevBuf::new(mb * cfg.n_expert_used * (cfg.n_ff_exp / 32) * 40).map_err(he)?,
@@ -1607,19 +1607,23 @@ impl InklingEngine {
     pub fn single_dspark_feats_ptr(&self) -> *const f32 {
         self.sc.dspark_feats.ptr as *const f32
     }
-    pub fn gather_batch_dspark_feats(&self, tok_idx: usize) -> *const f32 {
+    pub fn gather_batch_dspark_feats_async(&self, s: HipStream, tok_idx: usize) -> *const f32 {
         unsafe {
             ops::ink_gather_dspark_feats(
-                self.stream,
+                s,
                 self.bsc.dspark_feats.ptr as *const f32,
                 self.sc.dspark_feats.ptr as *mut f32,
                 tok_idx as i32,
                 MAX_BATCH as i32,
                 self.cfg.n_embd as i32,
             );
-            rad_hip::hipStreamSynchronize(self.stream);
         }
         self.sc.dspark_feats.ptr as *const f32
+    }
+    pub fn gather_batch_dspark_feats(&self, tok_idx: usize) -> *const f32 {
+        let p = self.gather_batch_dspark_feats_async(self.stream, tok_idx);
+        unsafe { rad_hip::hipStreamSynchronize(self.stream); }
+        p
     }
     pub fn rewind_verify_to(&mut self, n_acc: usize, b: usize) -> Result<()> {
         if n_acc < b {
@@ -2246,14 +2250,81 @@ impl InklingEngine {
     }
 
     pub unsafe fn enqueue_forward_batch_seq(&self, s: HipStream, seq: usize, b: usize, all_logits: bool) {
-        self.enqueue_forward_ex(s, b, all_logits, Some(seq), 1);
+        self.enqueue_forward_ex_emb(s, b, all_logits, Some(seq), 1, false);
     }
 
     pub unsafe fn enqueue_forward_multi(&self, s: HipStream, b: usize) {
-        self.enqueue_forward_ex(s, b, true, None, 1);
+        self.enqueue_forward_ex_emb(s, b, true, None, 1, false);
+    }
+
+    pub fn prefill_tokens_seq(&mut self, seq: usize, tokens: &[i32]) -> Result<i32> {
+        let mut last = 0i32;
+        let mut i = 0usize;
+        while i < tokens.len() {
+            let chunk = &tokens[i..(i + MAX_BATCH).min(tokens.len())];
+            let b = chunk.len();
+            let pos0 = self.seq_pos[seq];
+            let tok_bytes = unsafe { std::slice::from_raw_parts(chunk.as_ptr() as *const u8, b * 4) };
+            self.bsc.d_toks.copy_from(tok_bytes, Some(self.stream)).map_err(he)?;
+            self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
+            unsafe {
+                self.enqueue_forward_ex_emb(self.stream, b, false, Some(seq), 1, false);
+                rad_hip::hipStreamSynchronize(self.stream);
+            }
+            let mut out_b = [0u8; 4];
+            let rc = unsafe {
+                rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
+            };
+            if rc != rad_hip::HIP_SUCCESS { return Err(he(rc)); }
+            last = i32::from_le_bytes(out_b);
+            self.seq_pos[seq] += b as i32;
+            self.seq_tokens[seq].extend_from_slice(chunk);
+            if seq == 0 {
+                self.pos = self.seq_pos[0];
+            }
+            i += b;
+        }
+        Ok(last)
+    }
+
+    pub fn prefill_embeds_seq(&mut self, seq: usize, embeds: &[f32], n_tok: usize) -> Result<i32> {
+        assert_eq!(embeds.len(), n_tok * self.cfg.n_embd);
+        let mut last = 0i32;
+        let mut i = 0usize;
+        while i < n_tok {
+            let chunk_n = (n_tok - i).min(MAX_BATCH);
+            let pos0 = self.seq_pos[seq];
+            let slice = &embeds[(i * self.cfg.n_embd)..((i + chunk_n) * self.cfg.n_embd)];
+            let ebytes = unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4) };
+            self.bsc.cur.copy_from(ebytes, Some(self.stream)).map_err(he)?;
+            self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
+            unsafe {
+                self.enqueue_forward_ex_emb(self.stream, chunk_n, false, Some(seq), 1, true);
+                rad_hip::hipStreamSynchronize(self.stream);
+            }
+            let mut out_b = [0u8; 4];
+            let rc = unsafe {
+                rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
+            };
+            if rc != rad_hip::HIP_SUCCESS { return Err(he(rc)); }
+            last = i32::from_le_bytes(out_b);
+            self.seq_pos[seq] += chunk_n as i32;
+            for _ in 0..chunk_n {
+                self.seq_tokens[seq].push(-1);
+            }
+            if seq == 0 {
+                self.pos = self.seq_pos[0];
+            }
+            i += chunk_n;
+        }
+        Ok(last)
     }
 
     unsafe fn enqueue_forward_ex(&self, s: HipStream, b: usize, all_logits: bool, seq_opt: Option<usize>, multi_k: usize) {
+        self.enqueue_forward_ex_emb(s, b, all_logits, seq_opt, multi_k, false);
+    }
+
+    unsafe fn enqueue_forward_ex_emb(&self, s: HipStream, b: usize, all_logits: bool, seq_opt: Option<usize>, multi_k: usize, skip_embed: bool) {
         let e = self.cfg.n_embd as i32;
         let mb = MAX_BATCH as i32;
         let bi = b as i32;
@@ -2266,7 +2337,9 @@ impl InklingEngine {
         let msgs = self.bsc.msgs.ptr as *mut f32;
         let feats = self.bsc.dspark_feats.ptr as *mut f32;
 
-        ops::ink_embed_q8_0_norm_batch(s, self.tok_embd.buf.ptr as *const u8, self.tok_norm.ptr as *const f32, self.bsc.d_toks.ptr as *const i32, cur, e, bi);
+        if !skip_embed {
+            ops::ink_embed_q8_0_norm_batch(s, self.tok_embd.buf.ptr as *const u8, self.tok_norm.ptr as *const f32, self.bsc.d_toks.ptr as *const i32, cur, e, bi);
+        }
 
         let mut n_blocks = 0usize;
         let mut visit = 0usize;

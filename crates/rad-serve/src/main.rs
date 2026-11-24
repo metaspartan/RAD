@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::StreamExt;
-use rad_core::{DsparkDrafter, InklingEngine, Tokenizer};
+use rad_core::{DFlash2Drafter, DsparkDrafter, InklingEngine, Tokenizer, VisionEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -39,9 +39,59 @@ enum GenEvent {
 
 struct GenJob {
     prompt_ids: Vec<i32>,
+    images: Vec<String>,
     max_tokens: usize,
     enable_thinking: bool,
     tx: mpsc::UnboundedSender<GenEvent>,
+}
+
+enum Drafter {
+    DFlash2(DFlash2Drafter),
+    Dspark(DsparkDrafter),
+}
+
+impl Drafter {
+    fn spec_k(&self) -> usize {
+        match self {
+            Drafter::DFlash2(_) => 8,
+            Drafter::Dspark(_) => 6,
+        }
+    }
+
+    fn mode_name(&self) -> &'static str {
+        match self {
+            Drafter::DFlash2(_) => "dflash2",
+            Drafter::Dspark(_) => "dspark",
+        }
+    }
+
+    fn ctx_len(&self) -> i32 {
+        match self {
+            Drafter::DFlash2(d) => d.ctx_len,
+            Drafter::Dspark(d) => d.ctx_len,
+        }
+    }
+
+    fn reset_seq(&mut self, seq: usize) {
+        match self {
+            Drafter::DFlash2(d) => d.reset_seq(seq),
+            Drafter::Dspark(d) => d.reset_seq(seq),
+        }
+    }
+
+    fn inject_target_feats_seq(&mut self, seq: usize, feats_ptr: *const f32, pos: i32) -> anyhow::Result<()> {
+        match self {
+            Drafter::DFlash2(d) => d.inject_target_feats_seq(seq, feats_ptr, pos),
+            Drafter::Dspark(d) => d.inject_target_feats_seq(seq, feats_ptr, pos),
+        }
+    }
+
+    fn draft(&mut self, anchor_tok: i32, target: &InklingEngine, k_len: usize) -> anyhow::Result<Vec<i32>> {
+        match self {
+            Drafter::DFlash2(d) => d.draft(anchor_tok, target, k_len),
+            Drafter::Dspark(d) => d.draft(anchor_tok, target, k_len),
+        }
+    }
 }
 
 struct ActiveSlot {
@@ -59,6 +109,8 @@ struct AppState {
     tokenizer: Arc<Tokenizer>,
     api_key: String,
     spec_enabled: bool,
+    spec_mode: &'static str,
+    vision_enabled: bool,
     mmproj_path: Option<String>,
 }
 
@@ -67,6 +119,8 @@ struct Health {
     status: &'static str,
     engine: &'static str,
     speculative_decoding: bool,
+    spec_mode: &'static str,
+    vision_enabled: bool,
     mmproj_detected: bool,
 }
 
@@ -153,13 +207,19 @@ fn next_id(prefix: &str) -> String {
     format!("{prefix}-rad-{}-{n}", now_unix())
 }
 
-fn msg_text(val: &serde_json::Value) -> String {
+fn msg_text_and_images(val: &serde_json::Value, images: &mut Vec<String>) -> String {
     match val {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(arr) => {
             let mut out = String::new();
             for item in arr {
-                if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                let ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ty == "image_url" || ty == "input_image" {
+                    if let Some(url) = item.get("image_url").and_then(|u| u.get("url").or(Some(u))).and_then(|v| v.as_str()) {
+                        images.push(url.to_string());
+                        out.push_str("<|content_image|>");
+                    }
+                } else if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
                     out.push_str(t);
                 } else if let Some(s) = item.as_str() {
                     out.push_str(s);
@@ -171,10 +231,11 @@ fn msg_text(val: &serde_json::Value) -> String {
     }
 }
 
-fn format_prompt(messages: &[ChatMessage], enable_thinking: bool) -> String {
+fn format_prompt_with_images(messages: &[ChatMessage], enable_thinking: bool) -> (String, Vec<String>) {
     let mut s = String::from("<|begin_of_text|>");
+    let mut images = Vec::new();
     for m in messages {
-        let txt = msg_text(&m.content);
+        let txt = msg_text_and_images(&m.content, &mut images);
         match m.role.as_str() {
             "system" | "developer" => {
                 s.push_str("<|message_system|><|content_text|>");
@@ -204,7 +265,11 @@ fn format_prompt(messages: &[ChatMessage], enable_thinking: bool) -> String {
     } else {
         s.push_str("<|message_model|><|content_thinking|><|content_text|>");
     }
-    s
+    (s, images)
+}
+
+fn format_prompt(messages: &[ChatMessage], enable_thinking: bool) -> String {
+    format_prompt_with_images(messages, enable_thinking).0
 }
 
 fn format_responses_input(input: &serde_json::Value, instructions: Option<&str>) -> String {
@@ -270,12 +335,114 @@ fn pick_best_slot(eng: &InklingEngine, free: &[bool], prompt: &[i32]) -> Option<
     best.map(|(s, _)| s)
 }
 
-fn run_scheduler(mut engine: InklingEngine, mut drafter: Option<DsparkDrafter>, mut rx: mpsc::UnboundedReceiver<GenJob>) {
+fn prefill_with_drafter(
+    engine: &mut InklingEngine,
+    seq: usize,
+    prompt_ids: &[i32],
+    images: &[String],
+    image_tok_id: Option<i32>,
+    mut drafter: Option<&mut Drafter>,
+    mut vision: Option<&mut VisionEncoder>,
+) -> anyhow::Result<(i32, usize)> {
+    if !images.is_empty() {
+        if let (Some(vis), Some(img_id)) = (vision.as_deref_mut(), image_tok_id) {
+            engine.reset_seq(seq)?;
+            if let Some(ref mut d) = drafter {
+                d.reset_seq(seq);
+            }
+            let mut img_idx = 0usize;
+            let mut seg_start = 0usize;
+            let mut last_tok = 0i32;
+            for idx in 0..prompt_ids.len() {
+                if prompt_ids[idx] == img_id && img_idx < images.len() {
+                    let seg = &prompt_ids[seg_start..idx];
+                    if !seg.is_empty() {
+                        let pos0 = engine.seq_pos[seq];
+                        last_tok = engine.prefill_tokens_seq(seq, seg)?;
+                        if let Some(ref mut d) = drafter {
+                            for j in 0..seg.len() {
+                                let fptr = engine.gather_batch_dspark_feats(j);
+                                d.inject_target_feats_seq(seq, fptr, pos0 + j as i32)?;
+                            }
+                        }
+                    }
+                    let embeds = vis.encode_data_url(&images[img_idx])?;
+                    let n_vis = vis.out_tokens;
+                    let pos0 = engine.seq_pos[seq];
+                    last_tok = engine.prefill_embeds_seq(seq, &embeds, n_vis)?;
+                    if let Some(ref mut d) = drafter {
+                        for j in 0..n_vis {
+                            let fptr = engine.gather_batch_dspark_feats(j);
+                            d.inject_target_feats_seq(seq, fptr, pos0 + j as i32)?;
+                        }
+                    }
+                    img_idx += 1;
+                    seg_start = idx + 1;
+                }
+            }
+            if seg_start < prompt_ids.len() {
+                let seg = &prompt_ids[seg_start..];
+                let pos0 = engine.seq_pos[seq];
+                last_tok = engine.prefill_tokens_seq(seq, seg)?;
+                if let Some(ref mut d) = drafter {
+                    for j in 0..seg.len() {
+                        let fptr = engine.gather_batch_dspark_feats(j);
+                        d.inject_target_feats_seq(seq, fptr, pos0 + j as i32)?;
+                    }
+                }
+            }
+            return Ok((last_tok, 0));
+        }
+    }
+    match drafter {
+        Some(Drafter::Dspark(d)) => engine.prefill_seq_dspark(seq, prompt_ids, Some(d)),
+        Some(Drafter::DFlash2(d)) => {
+            if seq == 0 {
+                let cached = &engine.seq_tokens[0];
+                let mut common = 0usize;
+                let lim = cached.len().min(prompt_ids.len().saturating_sub(1));
+                while common < lim && cached[common] == prompt_ids[common] {
+                    common += 1;
+                }
+                if common == 0 || common != cached.len() || d.ctx_len as usize != common {
+                    engine.reset_seq(0)?;
+                    d.reset_seq(0);
+                    common = 0;
+                }
+                let rem = &prompt_ids[common..];
+                let mut last = 0i32;
+                let mut i = 0usize;
+                while i < rem.len() {
+                    let chunk = &rem[i..(i + 256).min(rem.len())];
+                    let pos0 = engine.seq_pos[0];
+                    last = engine.prefill_tokens_seq(0, chunk)?;
+                    for j in 0..chunk.len() {
+                        let fptr = engine.gather_batch_dspark_feats(j);
+                        d.inject_target_feats_seq(0, fptr, pos0 + j as i32)?;
+                    }
+                    i += chunk.len();
+                }
+                Ok((last, common))
+            } else {
+                engine.prefill_seq_dspark(seq, prompt_ids, None)
+            }
+        }
+        None => engine.prefill_seq_dspark(seq, prompt_ids, None),
+    }
+}
+
+fn run_scheduler(
+    mut engine: InklingEngine,
+    mut drafter: Option<Drafter>,
+    mut vision: Option<VisionEncoder>,
+    image_tok_id: Option<i32>,
+    mut rx: mpsc::UnboundedReceiver<GenJob>,
+) {
     let max_seqs = engine.max_seqs;
     let mut free = vec![true; max_seqs];
     let mut active: Vec<ActiveSlot> = Vec::with_capacity(max_seqs);
     let mut pending: VecDeque<GenJob> = VecDeque::new();
-    let spec_k = 4usize;
+    let spec_k = drafter.as_ref().map(|d| d.spec_k()).unwrap_or(4);
 
     loop {
         if active.is_empty() && pending.is_empty() {
@@ -297,7 +464,7 @@ fn run_scheduler(mut engine: InklingEngine, mut drafter: Option<DsparkDrafter>, 
             let job = pending.pop_front().unwrap();
             free[seq] = false;
             let tp = Instant::now();
-            match engine.prefill_seq_dspark(seq, &job.prompt_ids, drafter.as_mut()) {
+            match prefill_with_drafter(&mut engine, seq, &job.prompt_ids, &job.images, image_tok_id, drafter.as_mut(), vision.as_mut()) {
                 Ok((first_tok, cached_n)) => {
                     let pp_ms = tp.elapsed().as_secs_f64() * 1000.0;
                     let _ = job.tx.send(GenEvent::Prefill {
@@ -347,7 +514,7 @@ fn run_scheduler(mut engine: InklingEngine, mut drafter: Option<DsparkDrafter>, 
 
         if active.len() == 1 && active[0].seq == 0 {
             if let Some(ref mut d) = drafter {
-                if d.ctx_len == engine.seq_pos[0] {
+                if d.ctx_len() == engine.seq_pos[0] {
                     let mut slot = active.pop().unwrap();
                     engine.pos = engine.seq_pos[0];
                     let pos0 = engine.pos;
@@ -366,7 +533,7 @@ fn run_scheduler(mut engine: InklingEngine, mut drafter: Option<DsparkDrafter>, 
                         engine.seq_pos[0] = engine.pos;
                         for j in 0..n_acc {
                             let fptr = engine.gather_batch_dspark_feats(j);
-                            d.inject_target_feats(fptr, pos0 + j as i32)?;
+                            d.inject_target_feats_seq(0, fptr, pos0 + j as i32)?;
                             engine.seq_tokens[0].push(draft[j]);
                         }
                         let mut emitted_toks = Vec::with_capacity(n_acc);
@@ -471,12 +638,13 @@ fn run_scheduler(mut engine: InklingEngine, mut drafter: Option<DsparkDrafter>, 
 async fn collect_job(
     st: &AppState,
     prompt_ids: Vec<i32>,
+    images: Vec<String>,
     max_tokens: usize,
     enable_thinking: bool,
 ) -> Result<(Vec<u32>, usize, usize, f64, f64, &'static str), String> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     st.job_tx
-        .send(GenJob { prompt_ids, max_tokens, enable_thinking, tx })
+        .send(GenJob { prompt_ids, images, max_tokens, enable_thinking, tx })
         .map_err(|_| "scheduler closed".to_string())?;
     let mut out_ids = Vec::with_capacity(max_tokens.min(4096));
     let mut prompt_n = 0usize;
@@ -508,6 +676,8 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<Health> {
         status: "ok",
         engine: "rad",
         speculative_decoding: st.spec_enabled,
+        spec_mode: st.spec_mode,
+        vision_enabled: st.vision_enabled,
         mmproj_detected: st.mmproj_path.is_some(),
     })
 }
@@ -527,6 +697,8 @@ async fn models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
                 "owned_by": "rad",
                 "capabilities": {
                     "speculative_decoding": st.spec_enabled,
+                    "spec_mode": st.spec_mode,
+                    "vision": st.vision_enabled,
                     "mmproj_detected": st.mmproj_path.is_some()
                 }
             }
@@ -547,7 +719,7 @@ async fn chat_completions(
     let max_tokens = req.max_tokens.unwrap_or(512).min(8192);
     let enable_thinking = req.chat_template_kwargs.and_then(|k| k.enable_thinking).unwrap_or(false);
     let stream = req.stream.unwrap_or(false);
-    let prompt = format_prompt(&req.messages, enable_thinking);
+    let (prompt, images) = format_prompt_with_images(&req.messages, enable_thinking);
 
     let enc = match st.tokenizer.encode(prompt, false) {
         Ok(e) => e,
@@ -559,7 +731,7 @@ async fn chat_completions(
 
     if stream {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, max_tokens, enable_thinking, tx }).is_err() {
+        if st.job_tx.send(GenJob { prompt_ids, images, max_tokens, enable_thinking, tx }).is_err() {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response();
         }
         let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
@@ -618,7 +790,7 @@ async fn chat_completions(
     }
 
     let (out_ids, prompt_n, cached_n, pp_ms, dec_ms, finish_reason) =
-        match collect_job(&st, prompt_ids, max_tokens, enable_thinking).await {
+        match collect_job(&st, prompt_ids, images, max_tokens, enable_thinking).await {
             Ok(v) => v,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
         };
@@ -685,7 +857,7 @@ async fn completions(
         let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
         let st_c = st.clone();
         handles.push(tokio::spawn(async move {
-            collect_job(&st_c, prompt_ids, max_tokens, false).await
+            collect_job(&st_c, prompt_ids, Vec::new(), max_tokens, false).await
         }));
     }
 
@@ -756,7 +928,7 @@ async fn responses_http(
 
     if stream {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, max_tokens, enable_thinking: false, tx }).is_err() {
+        if st.job_tx.send(GenJob { prompt_ids, images: Vec::new(), max_tokens, enable_thinking: false, tx }).is_err() {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response();
         }
         let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
@@ -810,7 +982,7 @@ async fn responses_http(
     }
 
     let (out_ids, prompt_n, cached_n, pp_ms, dec_ms, _) =
-        match collect_job(&st, prompt_ids, max_tokens, false).await {
+        match collect_job(&st, prompt_ids, Vec::new(), max_tokens, false).await {
             Ok(v) => v,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
         };
@@ -892,7 +1064,7 @@ async fn handle_ws(mut socket: WebSocket, st: Arc<AppState>) {
         let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
         let resp_id = next_id("resp");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if st.job_tx.send(GenJob { prompt_ids, max_tokens, enable_thinking: false, tx }).is_err() {
+        if st.job_tx.send(GenJob { prompt_ids, images: Vec::new(), max_tokens, enable_thinking: false, tx }).is_err() {
             let _ = socket.send(Message::Text(json!({"type":"error","error":"scheduler closed"}).to_string())).await;
             break;
         }
@@ -964,8 +1136,10 @@ async fn handle_ws(mut socket: WebSocket, st: Arc<AppState>) {
 struct CliOpts {
     cmd: String,
     prompt: Option<String>,
+    image: Option<String>,
     model: String,
     tokenizer: Option<String>,
+    dflash2: Option<String>,
     dspark: Option<String>,
     mmproj: Option<String>,
     api_key: String,
@@ -974,6 +1148,7 @@ struct CliOpts {
     max_tokens: usize,
     port: u16,
     use_spec: bool,
+    use_vision: bool,
     thinking: bool,
 }
 
@@ -988,14 +1163,17 @@ fn print_usage() {
     println!("OPTIONS:");
     println!("  -m, --model <PATH>             Target GGUF model path (env: RAD_MODEL)");
     println!("  -t, --tokenizer <PATH>         HuggingFace tokenizer.json (auto-detected if next to model)");
+    println!("      --dflash2 <PATH>           DFlash 2 safetensors dir/file (auto-detected, preferred over DSpark)");
     println!("  -d, --dspark <PATH>            DSpark draft GGUF (auto-detected if next to model)");
-    println!("      --mmproj <PATH>            Vision mmproj GGUF (auto-detected if next to model)");
+    println!("      --mmproj <PATH>            Vision mmproj GGUF (auto-detected, enabled by default)");
+    println!("  -i, --image <PATH>             Image file for `rad run` multimodal inference");
     println!("  -p, --port <PORT>              Server port [default: 8088] (env: RAD_PORT)");
     println!("      --ctx <TOKENS>             Context length per sequence [default: 8192] (env: RAD_CTX)");
     println!("      --max-seqs <N>             Max concurrent sequences [default: 32] (env: RAD_MAX_SEQS)");
     println!("  -n, --max-tokens <N>           Max tokens for `rad run` [default: 256]");
     println!("      --api-key <KEY>            Optional Bearer API key (env: RAD_API_KEY)");
-    println!("      --no-spec                  Disable DSpark speculative decoding");
+    println!("      --no-spec                  Disable speculative decoding (DFlash 2 / DSpark)");
+    println!("      --no-vision                Disable vision encoder loading");
     println!("      --thinking                 Enable thinking tokens for `rad run`");
     println!("  -h, --help                     Show this help message");
 }
@@ -1029,9 +1207,11 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
         }
     }
     let mut prompt: Option<String> = None;
+    let mut image: Option<String> = None;
     let mut model = std::env::var("RAD_MODEL")
         .unwrap_or_else(|_| "./models/Inkling-2-Mini-UD-Q4_K_XL-v2.gguf".into());
     let mut tokenizer = std::env::var("RAD_TOKENIZER").ok();
+    let mut dflash2 = std::env::var("RAD_DFLASH2").ok();
     let mut dspark = std::env::var("RAD_DSPARK").ok();
     let mut mmproj = std::env::var("RAD_MMPROJ").ok();
     let mut api_key = std::env::var("RAD_API_KEY").unwrap_or_default();
@@ -1040,6 +1220,7 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
     let mut max_tokens: usize = 256;
     let mut port: u16 = std::env::var("RAD_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8088);
     let mut use_spec = std::env::var("RAD_SPEC").map(|v| v != "0").unwrap_or(true);
+    let mut use_vision = std::env::var("RAD_VISION").map(|v| v != "0").unwrap_or(true);
     let mut thinking = false;
 
     while idx < args.len() {
@@ -1056,6 +1237,10 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
                 idx += 1;
                 tokenizer = Some(args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --tokenizer value"))?);
             }
+            "--dflash2" => {
+                idx += 1;
+                dflash2 = Some(args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --dflash2 value"))?);
+            }
             "-d" | "--dspark" => {
                 idx += 1;
                 dspark = Some(args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --dspark value"))?);
@@ -1063,6 +1248,10 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
             "--mmproj" => {
                 idx += 1;
                 mmproj = Some(args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --mmproj value"))?);
+            }
+            "-i" | "--image" => {
+                idx += 1;
+                image = Some(args.get(idx).cloned().ok_or_else(|| anyhow::anyhow!("missing --image value"))?);
             }
             "-p" | "--port" => {
                 idx += 1;
@@ -1087,6 +1276,9 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
             "--no-spec" => {
                 use_spec = false;
             }
+            "--no-vision" => {
+                use_vision = false;
+            }
             "--thinking" => {
                 thinking = true;
             }
@@ -1103,6 +1295,9 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
     if tokenizer.is_none() {
         tokenizer = resolve_sibling(&model, &["tokenizer.json", "../inkling2-src/tokenizer.json"]);
     }
+    if dflash2.is_none() {
+        dflash2 = resolve_sibling(&model, &["../inkling2-dflash2/model.safetensors", "dflash2/model.safetensors", "model.safetensors"]);
+    }
     if dspark.is_none() {
         dspark = resolve_sibling(&model, &["dspark-Inkling-2-Mini-Q8_0.gguf", "dspark.gguf"]);
     }
@@ -1113,8 +1308,10 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
     Ok(CliOpts {
         cmd,
         prompt,
+        image,
         model,
         tokenizer,
+        dflash2,
         dspark,
         mmproj,
         api_key,
@@ -1123,8 +1320,44 @@ fn parse_cli() -> anyhow::Result<CliOpts> {
         max_tokens,
         port,
         use_spec,
+        use_vision,
         thinking,
     })
+}
+
+fn load_drafter(opts: &CliOpts, engine: &mut InklingEngine, max_seqs: usize) -> anyhow::Result<Option<Drafter>> {
+    if !opts.use_spec {
+        return Ok(None);
+    }
+    if let Some(ref p) = opts.dflash2 {
+        if Path::new(p).exists() {
+            engine.capture_verify_graph(8)?;
+            let mut d = DFlash2Drafter::load_multi(Path::new(p), opts.ctx, max_seqs)?;
+            d.capture_draft_graph(engine, 8)?;
+            return Ok(Some(Drafter::DFlash2(d)));
+        }
+    }
+    if let Some(ref p) = opts.dspark {
+        if Path::new(p).exists() {
+            engine.capture_verify_graph(6)?;
+            let mut d = DsparkDrafter::load_multi(Path::new(p), opts.ctx, max_seqs)?;
+            d.capture_draft_graph(engine, 6)?;
+            return Ok(Some(Drafter::Dspark(d)));
+        }
+    }
+    Ok(None)
+}
+
+fn load_vision(opts: &CliOpts) -> anyhow::Result<Option<VisionEncoder>> {
+    if !opts.use_vision {
+        return Ok(None);
+    }
+    if let Some(ref p) = opts.mmproj {
+        if Path::new(p).exists() {
+            return Ok(Some(VisionEncoder::load(Path::new(p))?));
+        }
+    }
+    Ok(None)
 }
 
 #[tokio::main]
@@ -1136,8 +1369,9 @@ async fn main() -> anyhow::Result<()> {
         println!("RAD v{}", env!("CARGO_PKG_VERSION"));
         println!("  model:     {} (exists={})", opts.model, Path::new(&opts.model).exists());
         println!("  tokenizer: {} (exists={})", tok_path, Path::new(&tok_path).exists());
+        println!("  dflash2:   {:?}", opts.dflash2);
         println!("  dspark:    {:?}", opts.dspark);
-        println!("  mmproj:    {:?}", opts.mmproj);
+        println!("  mmproj:    {:?} (vision={})", opts.mmproj, opts.use_vision && opts.mmproj.is_some());
         println!("  ctx:       {}", opts.ctx);
         println!("  max_seqs:  {}", opts.max_seqs);
         println!("  port:      {}", opts.port);
@@ -1146,41 +1380,34 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if opts.cmd == "run" {
-        let user_prompt = opts.prompt.ok_or_else(|| anyhow::anyhow!("rad run requires a <PROMPT>"))?;
+        let user_prompt = opts.prompt.clone().ok_or_else(|| anyhow::anyhow!("rad run requires a <PROMPT>"))?;
         let t0 = Instant::now();
         let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        let image_tok_id = tokenizer.token_to_id("<|content_image|>").map(|id| id as i32);
         let mut engine = InklingEngine::load(Path::new(&opts.model), opts.ctx)?;
         engine.capture_decode_graph()?;
-        let mut drafter = if opts.use_spec {
-            if let Some(ref dp) = opts.dspark {
-                if Path::new(dp).exists() {
-                    engine.capture_verify_graph(4)?;
-                    let mut d = DsparkDrafter::load(Path::new(dp), opts.ctx)?;
-                    d.capture_draft_graph(&engine, 4)?;
-                    Some(d)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+        let mut drafter = load_drafter(&opts, &mut engine, 1)?;
+        let mut vision = if opts.image.is_some() { load_vision(&opts)? } else { None };
+        let spec_mode = drafter.as_ref().map(|d| d.mode_name()).unwrap_or("none");
+        eprintln!("rad loaded in {:.2}s (spec={}, vision={})", t0.elapsed().as_secs_f64(), spec_mode, vision.is_some());
+        let (images, prompt_content) = if let Some(ref img_path) = opts.image {
+            (vec![img_path.clone()], format!("<|content_image|>{user_prompt}"))
         } else {
-            None
+            (Vec::new(), user_prompt)
         };
-        eprintln!("rad loaded in {:.2}s (spec={})", t0.elapsed().as_secs_f64(), drafter.is_some());
         let formatted = format_prompt(
-            &[ChatMessage { role: "user".into(), content: serde_json::Value::String(user_prompt) }],
+            &[ChatMessage { role: "user".into(), content: serde_json::Value::String(prompt_content) }],
             opts.thinking,
         );
         let ids: Vec<i32> = tokenizer.encode(formatted, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
         let tp = Instant::now();
-        let (mut cur_tok, _) = engine.prefill_seq_dspark(0, &ids, drafter.as_mut())?;
+        let (mut cur_tok, _) = prefill_with_drafter(&mut engine, 0, &ids, &images, image_tok_id, drafter.as_mut(), vision.as_mut())?;
         let pp_ms = tp.elapsed().as_secs_f64() * 1000.0;
         let td = Instant::now();
         let mut emitted: Vec<u32> = Vec::new();
         let mut prev_len = 0usize;
         if let Some(ref mut dr) = drafter {
-            let k_len = 4usize;
+            let k_len = dr.spec_k();
             while emitted.len() < opts.max_tokens {
                 if cur_tok == 200006 || cur_tok == 200008 { break; }
                 let draft = dr.draft(cur_tok, &engine, k_len)?;
@@ -1196,7 +1423,7 @@ async fn main() -> anyhow::Result<()> {
                     if t == 200006 || t == 200008 { stop = true; break; }
                     emitted.push(t as u32);
                     let fptr = engine.gather_batch_dspark_feats(j);
-                    dr.inject_target_feats(fptr, pos_before + j as i32)?;
+                    dr.inject_target_feats_seq(0, fptr, pos_before + j as i32)?;
                     if emitted.len() >= opts.max_tokens { stop = true; break; }
                 }
                 let txt = tokenizer.decode(&emitted, true).unwrap_or_default();
@@ -1234,43 +1461,34 @@ async fn main() -> anyhow::Result<()> {
 
     let t0 = Instant::now();
     let tokenizer = Arc::new(Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?);
+    let image_tok_id = tokenizer.token_to_id("<|content_image|>").map(|id| id as i32);
     let mut engine = InklingEngine::load_multi(Path::new(&opts.model), opts.ctx, opts.max_seqs)?;
     engine.capture_decode_graph()?;
-    let drafter = if opts.use_spec {
-        if let Some(ref dpath) = opts.dspark {
-            if Path::new(dpath).exists() {
-                engine.capture_verify_graph(4)?;
-                let mut d = DsparkDrafter::load_multi(Path::new(dpath), opts.ctx, opts.max_seqs.min(8))?;
-                d.capture_draft_graph(&engine, 4)?;
-                Some(d)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let drafter = load_drafter(&opts, &mut engine, opts.max_seqs.min(8))?;
+    let vision = load_vision(&opts)?;
     let spec_enabled = drafter.is_some();
+    let spec_mode = drafter.as_ref().map(|d| d.mode_name()).unwrap_or("none");
+    let vision_enabled = vision.is_some();
     eprintln!(
-        "rad serve ready in {:.2}s (ctx={}, max_seqs={}, spec={}, mmproj={}, port={})",
+        "rad serve ready in {:.2}s (ctx={}, max_seqs={}, spec={}, vision={}, port={})",
         t0.elapsed().as_secs_f64(),
         opts.ctx,
         opts.max_seqs,
-        spec_enabled,
-        opts.mmproj.is_some(),
+        spec_mode,
+        vision_enabled,
         opts.port
     );
 
     let (job_tx, job_rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || run_scheduler(engine, drafter, job_rx));
+    std::thread::spawn(move || run_scheduler(engine, drafter, vision, image_tok_id, job_rx));
 
     let state = Arc::new(AppState {
         job_tx,
         tokenizer,
         api_key: opts.api_key,
         spec_enabled,
+        spec_mode,
+        vision_enabled,
         mmproj_path: opts.mmproj,
     });
     let app = Router::new()
