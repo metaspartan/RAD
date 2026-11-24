@@ -206,7 +206,7 @@ extern "C" __global__ void gemv_f32_k(const float* __restrict__ W,
                                       int n, int k) {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    int row = blockIdx.x * 4 + warp;
+    int row = blockIdx.x * 2 + warp;
     if (row >= n) return;
     int k4 = k >> 2;
     const float4* w4 = reinterpret_cast<const float4*>(W + (size_t)row * k);
@@ -954,7 +954,7 @@ extern "C" int ink_gemv_bf16(hipStream_t s, const uint16_t* W, const float* x, f
 }
 
 extern "C" int ink_gemv_f32(hipStream_t s, const float* W, const float* x, float* y, int n, int k) {
-    gemv_f32_k<<<dim3((n + 3) / 4), dim3(128), 0, s>>>(W, x, y, n, k);
+    gemv_f32_k<<<dim3((n + 1) / 2), dim3(64), 0, s>>>(W, x, y, n, k);
     return 0;
 }
 
@@ -963,14 +963,16 @@ extern "C" int ink_embed_q8_0_norm(hipStream_t s, const uint8_t* tok_embd, const
     return 0;
 }
 
+extern "C" int ink_rmsnorm_batch(hipStream_t s, const float* X, const float* w, float* Y, int n, int B, float eps);
+
 extern "C" int ink_rmsnorm(hipStream_t s, const float* x, const float* w, float* y, int n, float eps) {
-    rmsnorm_f32_k<<<dim3(1), dim3(256), 0, s>>>(x, w, y, n, eps);
-    return 0;
+    return ink_rmsnorm_batch(s, x, w, y, n, 1, eps);
 }
 
+extern "C" int ink_mix_batch(hipStream_t s, const float* blocks, int n_blocks, int max_B, const float* cur, const float* query, const float* w0, const float* w1, const float* w2, float* out, int n_embd, int n_queries, int B, float eps);
+
 extern "C" int ink_attn_res_mix(hipStream_t s, const float* blocks, int n_blocks, const float* cur, const float* query, float* out, int n_embd, int n_queries) {
-    attn_res_mix_k<<<dim3(n_queries), dim3(256), 0, s>>>(blocks, n_blocks, cur, query, out, n_embd);
-    return 0;
+    return ink_mix_batch(s, blocks, n_blocks, 1, cur, query, nullptr, nullptr, nullptr, out, n_embd, n_queries, 1, 1e-6f);
 }
 
 extern "C" int ink_loop_ctrl(hipStream_t s, const float* cur, const float* msg, const float* w_down, const float* w_gain, const float* w_forget, float* h_buf, float* out, int n_embd, int rank) {
@@ -1685,52 +1687,54 @@ extern "C" __global__ void loop_ctrl_down_batch_k(const float* __restrict__ cur0
     const float* cur = (c == 0) ? cur0 : ((c == 1) ? cur1 : cur2);
     const float* msg = msgs + (size_t)c * n_embd;
     const float* wd = (c == 0) ? wd0 : ((c == 1) ? wd1 : wd2);
-    __shared__ float red[8];
-    __shared__ float rc_s, rm_s;
-    int wid = threadIdx.x >> 5;
-    int nw = blockDim.x >> 5;
+    const float* wr = wd + (size_t)r * (2 * n_embd);
+    __shared__ float red_sc[8];
+    __shared__ float red_sm[8];
+    __shared__ float red_ac[8];
+    __shared__ float red_am[8];
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    int e4 = n_embd >> 2;
+    const float4* c4 = reinterpret_cast<const float4*>(cur);
+    const float4* m4 = reinterpret_cast<const float4*>(msg);
+    const float4* wc4 = reinterpret_cast<const float4*>(wr);
+    const float4* wm4 = reinterpret_cast<const float4*>(wr + n_embd);
 
-    float sc = 0.0f, sm = 0.0f;
-    for (int j = threadIdx.x; j < n_embd; j += blockDim.x) {
-        float vc = cur[j];
-        float vm = msg[j];
-        sc += vc * vc;
-        sm += vm * vm;
+    float sc = 0.0f, sm = 0.0f, ac = 0.0f, am = 0.0f;
+    for (int j = tid; j < e4; j += 256) {
+        float4 vc = c4[j];
+        float4 vm = m4[j];
+        float4 wcv = wc4[j];
+        float4 wmv = wm4[j];
+        sc = fmaf(vc.x, vc.x, fmaf(vc.y, vc.y, fmaf(vc.z, vc.z, fmaf(vc.w, vc.w, sc))));
+        sm = fmaf(vm.x, vm.x, fmaf(vm.y, vm.y, fmaf(vm.z, vm.z, fmaf(vm.w, vm.w, sm))));
+        ac = fmaf(wcv.x, vc.x, fmaf(wcv.y, vc.y, fmaf(wcv.z, vc.z, fmaf(wcv.w, vc.w, ac))));
+        am = fmaf(wmv.x, vm.x, fmaf(wmv.y, vm.y, fmaf(wmv.z, vm.z, fmaf(wmv.w, vm.w, am))));
     }
     sc = warp_sum32(sc);
-    if ((threadIdx.x & 31) == 0) red[wid] = sc;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float t = 0.0f;
-        for (int i = 0; i < nw; ++i) t += red[i];
-        rc_s = rsqrtf(t / (float)n_embd + 1e-6f);
-    }
-    __syncthreads();
-
     sm = warp_sum32(sm);
-    if ((threadIdx.x & 31) == 0) red[wid] = sm;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float t = 0.0f;
-        for (int i = 0; i < nw; ++i) t += red[i];
-        rm_s = rsqrtf(t / (float)n_embd + 1e-6f);
+    ac = warp_sum32(ac);
+    am = warp_sum32(am);
+    if (lane == 0) {
+        red_sc[wid] = sc;
+        red_sm[wid] = sm;
+        red_ac[wid] = ac;
+        red_am[wid] = am;
     }
     __syncthreads();
-
-    const float* wr = wd + (size_t)r * (2 * n_embd);
-    float rc = rc_s;
-    float rm = rm_s;
-    float acc = 0.0f;
-    for (int j = threadIdx.x; j < n_embd; j += blockDim.x) {
-        acc += wr[j] * (cur[j] * rc) + wr[n_embd + j] * (msg[j] * rm);
-    }
-    acc = warp_sum32(acc);
-    if ((threadIdx.x & 31) == 0) red[wid] = acc;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float t = 0.0f;
-        for (int i = 0; i < nw; ++i) t += red[i];
-        h_out[(size_t)c * rank + r] = t;
+    if (tid == 0) {
+        float tsc = 0.0f, tsm = 0.0f, tac = 0.0f, tam = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            tsc += red_sc[i];
+            tsm += red_sm[i];
+            tac += red_ac[i];
+            tam += red_am[i];
+        }
+        float rc = rsqrtf(tsc / (float)n_embd + 1e-6f);
+        float rm = rsqrtf(tsm / (float)n_embd + 1e-6f);
+        h_out[(size_t)c * rank + r] = tac * rc + tam * rm;
     }
 }
 
@@ -1825,13 +1829,17 @@ extern "C" __global__ void loop_ctrl_up_fast_k(const float* __restrict__ cur0,
     const float* wg = (c == 0) ? wg0 : ((c == 1) ? wg1 : wg2);
     const float* wf = (c == 0) ? wf0 : ((c == 1) ? wf1 : wf2);
     float* out = (c == 0) ? out0 : ((c == 1) ? out1 : out2);
-    const float* wgi = wg + (size_t)i * rank;
-    const float* wfi = wf + (size_t)i * rank;
+    const float2* wgi = reinterpret_cast<const float2*>(wg + (size_t)i * rank);
+    const float2* wfi = reinterpret_cast<const float2*>(wf + (size_t)i * rank);
+    const float2* h2 = reinterpret_cast<const float2*>(h);
+    int r2 = rank >> 1;
     float g = 0.0f, f = 0.0f;
-    for (int r = lane; r < rank; r += 32) {
-        float hr = h[r];
-        g = fmaf(wgi[r], hr, g);
-        f = fmaf(wfi[r], hr, f);
+    for (int r = lane; r < r2; r += 32) {
+        float2 hr = h2[r];
+        float2 gv = wgi[r];
+        float2 fv = wfi[r];
+        g = fmaf(gv.x, hr.x, fmaf(gv.y, hr.y, g));
+        f = fmaf(fv.x, hr.x, fmaf(fv.y, hr.y, f));
     }
     g = warp_sum32(g);
     f = warp_sum32(f);
@@ -1852,30 +1860,45 @@ extern "C" __global__ void rmsnorm_multi_inplace_k(float* __restrict__ out0,
     float* out = (c == 0) ? out0 : ((c == 1) ? out1 : out2);
     const float* nw = (c == 0) ? nw0 : ((c == 1) ? nw1 : nw2);
     __shared__ float red[8];
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    int e4 = n_embd >> 2;
+    float4* o4 = reinterpret_cast<float4*>(out);
+    const float4* w4 = reinterpret_cast<const float4*>(nw);
+    float4 reg[3];
     float ss = 0.0f;
-    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
-        float v = out[i];
-        ss += v * v;
+#pragma unroll
+    for (int p = 0; p < 3; ++p) {
+        int j = tid + p * 256;
+        if (j < e4) {
+            float4 v = o4[j];
+            reg[p] = v;
+            ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
+        }
     }
     ss = warp_sum32(ss);
-    int wid = threadIdx.x >> 5;
-    int nwarps = blockDim.x >> 5;
-    if ((threadIdx.x & 31) == 0) red[wid] = ss;
+    if (lane == 0) red[wid] = ss;
     __syncthreads();
     __shared__ float inv;
-    if (threadIdx.x == 0) {
+    if (tid == 0) {
         float t = 0.0f;
-        for (int i = 0; i < nwarps; ++i) t += red[i];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) t += red[i];
         inv = rsqrtf(t / (float)n_embd + eps);
     }
     __syncthreads();
     float io = inv;
-    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
-        out[i] = out[i] * io * nw[i];
+#pragma unroll
+    for (int p = 0; p < 3; ++p) {
+        int j = tid + p * 256;
+        if (j < e4) {
+            float4 v = reg[p];
+            float4 w = w4[j];
+            o4[j] = make_float4(v.x * io * w.x, v.y * io * w.y, v.z * io * w.z, v.w * io * w.w);
+        }
     }
 }
-
-extern "C" int ink_mix_batch(hipStream_t s, const float* blocks, int n_blocks, int max_B, const float* cur, const float* query, const float* w0, const float* w1, const float* w2, float* out, int n_embd, int n_queries, int B, float eps);
 
 extern "C" int ink_mix_rmsnorm(hipStream_t s, const float* blocks, int n_blocks, const float* cur, const float* query, const float* w0, const float* w1, const float* w2, float* out, int n_embd, int n_queries, float eps) {
     return ink_mix_batch(s, blocks, n_blocks, 1, cur, query, w0, w1, w2, out, n_embd, n_queries, 1, eps);
@@ -1889,7 +1912,7 @@ extern "C" int ink_loop_ctrl_3_norm(hipStream_t s, const float* cur0, const floa
 }
 
 extern "C" int ink_loop_ctrl_1_norm(hipStream_t s, const float* cur, const float* msg, const float* wd, const float* wg, const float* wf, const float* nw, float* h_buf, float* out, int n_embd, int rank, float eps) {
-    loop_ctrl_down_k<<<dim3(rank), dim3(256), 0, s>>>(cur, msg, wd, h_buf, n_embd, rank);
+    loop_ctrl_down_batch_k<<<dim3(rank, 1), dim3(256), 0, s>>>(cur, cur, cur, msg, wd, wd, wd, h_buf, n_embd, rank);
     loop_ctrl_up_fast_k<<<dim3((n_embd + 7) / 8, 1), dim3(256), 0, s>>>(cur, cur, cur, msg, h_buf, wg, wg, wg, wf, wf, wf, out, out, out, n_embd, rank);
     rmsnorm_multi_inplace_k<<<dim3(1), dim3(256), 0, s>>>(out, out, out, nw, nw, nw, n_embd, eps);
     return 0;

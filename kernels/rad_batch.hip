@@ -290,20 +290,71 @@ extern "C" __global__ void rmsnorm_batch_k(const float* __restrict__ X,
                                            float* __restrict__ Y,
                                            int n, float eps) {
     int t = blockIdx.x;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
     const float* xv = X + (size_t)t * n;
     float* yv = Y + (size_t)t * n;
+    __shared__ float red[8];
+    __shared__ float inv;
+    if ((n & 3) == 0 && n <= 3072) {
+        int e4 = n >> 2;
+        const float4* x4 = reinterpret_cast<const float4*>(xv);
+        float4* y4 = reinterpret_cast<float4*>(yv);
+        float4 reg[3];
+        float ss = 0.0f;
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            int j = tid + p * 256;
+            if (j < e4) {
+                float4 v = x4[j];
+                reg[p] = v;
+                ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
+            }
+        }
+        ss = b_warp_sum32(ss);
+        if (lane == 0) red[wid] = ss;
+        __syncthreads();
+        if (tid == 0) {
+            float tot = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) tot += red[i];
+            inv = rsqrtf(tot / (float)n + eps);
+        }
+        __syncthreads();
+        float io = inv;
+        if (w) {
+            const float4* w4 = reinterpret_cast<const float4*>(w);
+#pragma unroll
+            for (int p = 0; p < 3; ++p) {
+                int j = tid + p * 256;
+                if (j < e4) {
+                    float4 v = reg[p];
+                    float4 wv = w4[j];
+                    y4[j] = make_float4(v.x * io * wv.x, v.y * io * wv.y, v.z * io * wv.z, v.w * io * wv.w);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int p = 0; p < 3; ++p) {
+                int j = tid + p * 256;
+                if (j < e4) {
+                    float4 v = reg[p];
+                    y4[j] = make_float4(v.x * io, v.y * io, v.z * io, v.w * io);
+                }
+            }
+        }
+        return;
+    }
     float ss = 0.0f;
-    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+    for (int j = tid; j < n; j += blockDim.x) {
         float v = xv[j];
         ss += v * v;
     }
     ss = b_warp_sum32(ss);
-    __shared__ float red[8];
-    int wid = threadIdx.x >> 5;
-    if ((threadIdx.x & 31) == 0) red[wid] = ss;
+    if (lane == 0) red[wid] = ss;
     __syncthreads();
-    __shared__ float inv;
-    if (threadIdx.x == 0) {
+    if (tid == 0) {
         float tot = 0.0f;
         int nw = blockDim.x >> 5;
         for (int i = 0; i < nw; ++i) tot += red[i];
@@ -312,9 +363,9 @@ extern "C" __global__ void rmsnorm_batch_k(const float* __restrict__ X,
     __syncthreads();
     float io = inv;
     if (w) {
-        for (int j = threadIdx.x; j < n; j += blockDim.x) yv[j] = xv[j] * io * w[j];
+        for (int j = tid; j < n; j += blockDim.x) yv[j] = xv[j] * io * w[j];
     } else {
-        for (int j = threadIdx.x; j < n; j += blockDim.x) yv[j] = xv[j] * io;
+        for (int j = tid; j < n; j += blockDim.x) yv[j] = xv[j] * io;
     }
 }
 
@@ -1431,28 +1482,67 @@ extern "C" __global__ void rmsnorm_multi_inplace_b_k(float* __restrict__ out0,
                                                      int n_embd, float eps) {
     int c = blockIdx.x;
     int t = blockIdx.y;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
     float* out = ((c == 0) ? out0 : ((c == 1) ? out1 : out2)) + (size_t)t * n_embd;
     const float* nw = (c == 0) ? nw0 : ((c == 1) ? nw1 : nw2);
     __shared__ float red[8];
+    __shared__ float inv;
+    if ((n_embd & 3) == 0 && n_embd <= 3072) {
+        int e4 = n_embd >> 2;
+        float4* o4 = reinterpret_cast<float4*>(out);
+        const float4* w4 = reinterpret_cast<const float4*>(nw);
+        float4 reg[3];
+        float ss = 0.0f;
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            int j = tid + p * 256;
+            if (j < e4) {
+                float4 v = o4[j];
+                reg[p] = v;
+                ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
+            }
+        }
+        ss = b_warp_sum32(ss);
+        if (lane == 0) red[wid] = ss;
+        __syncthreads();
+        if (tid == 0) {
+            float tot = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) tot += red[i];
+            inv = rsqrtf(tot / (float)n_embd + eps);
+        }
+        __syncthreads();
+        float io = inv;
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            int j = tid + p * 256;
+            if (j < e4) {
+                float4 v = reg[p];
+                float4 wv = w4[j];
+                o4[j] = make_float4(v.x * io * wv.x, v.y * io * wv.y, v.z * io * wv.z, v.w * io * wv.w);
+            }
+        }
+        return;
+    }
     float ss = 0.0f;
-    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+    for (int i = tid; i < n_embd; i += blockDim.x) {
         float v = out[i];
         ss += v * v;
     }
     ss = b_warp_sum32(ss);
-    int wid = threadIdx.x >> 5;
     int nwarps = blockDim.x >> 5;
-    if ((threadIdx.x & 31) == 0) red[wid] = ss;
+    if (lane == 0) red[wid] = ss;
     __syncthreads();
-    __shared__ float inv;
-    if (threadIdx.x == 0) {
+    if (tid == 0) {
         float tot = 0.0f;
         for (int i = 0; i < nwarps; ++i) tot += red[i];
         inv = rsqrtf(tot / (float)n_embd + eps);
     }
     __syncthreads();
     float io = inv;
-    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+    for (int i = tid; i < n_embd; i += blockDim.x) {
         out[i] = out[i] * io * nw[i];
     }
 }
