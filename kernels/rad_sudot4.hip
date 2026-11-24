@@ -2176,11 +2176,9 @@ extern "C" __global__ void attn_decode_gqa_splitkv_k(const float* __restrict__ Q
                                                      int dh, int d_rel,
                                                      int rel_extent, int swa_window,
                                                      int is_swa, int max_ctx, int n_splits) {
-    int blk_g = blockIdx.x;
+    int kv_h = blockIdx.x;
     int sp = blockIdx.y;
-    int gqa = n_head / n_head_kv;
-    int h0 = blk_g * 6;
-    int kv_h = h0 / gqa;
+    int h0 = kv_h * 3;
     int wid = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int pos = *d_pos;
@@ -2192,7 +2190,7 @@ extern "C" __global__ void attn_decode_gqa_splitkv_k(const float* __restrict__ Q
     int te = min(t_end, ts + chunk);
 
     if (ts >= te) {
-        if (wid == 0 && lane < 6) {
+        if (wid == 0 && lane < 3) {
             int h = h0 + lane;
             float* dst = split_buf + ((size_t)h * n_splits + sp) * 130;
             dst[0] = -1e30f;
@@ -2204,11 +2202,11 @@ extern "C" __global__ void attn_decode_gqa_splitkv_k(const float* __restrict__ Q
     int p0 = lane * 2;
     int p1 = lane * 2 + 64;
     float q_scale = rsqrtf((float)dh);
-    float q0a[6], q0b[6], q1a[6], q1b[6];
-    float rv[6], sk[6];
-    float m[6], l[6], o0[6], o1[6], o2[6], o3[6];
+    float q0a[3], q0b[3], q1a[3], q1b[3];
+    float rv[3], sk[3];
+    float m[3], l[3], o0[3], o1[3], o2[3], o3[3];
 #pragma unroll
-    for (int g = 0; g < 6; ++g) {
+    for (int g = 0; g < 3; ++g) {
         int h = h0 + g;
         const float* qh = Q + (size_t)h * dh;
         q0a[g] = qh[p0] * q_scale;
@@ -2238,7 +2236,7 @@ extern "C" __global__ void attn_decode_gqa_splitkv_k(const float* __restrict__ Q
         bool has_rb = (dist < rel_extent);
 
 #pragma unroll
-        for (int g = 0; g < 6; ++g) {
+        for (int g = 0; g < 3; ++g) {
             float dot = q0a[g] * k0.x + q0b[g] * k0.y + q1a[g] * k1.x + q1b[g] * k1.y;
             float score = __shfl(s_warp_sum32(dot), 0, 32);
             if (has_rb) {
@@ -2262,7 +2260,7 @@ extern "C" __global__ void attn_decode_gqa_splitkv_k(const float* __restrict__ Q
     __shared__ float sm_o[8][128];
     int d0 = lane, d1 = lane + 32, d2 = lane + 64, d3 = lane + 96;
 #pragma unroll
-    for (int g = 0; g < 6; ++g) {
+    for (int g = 0; g < 3; ++g) {
         if (lane == 0) { sm_m[wid] = m[g]; sm_l[wid] = l[g]; }
         sm_o[wid][p0] = o0[g]; sm_o[wid][p0 + 1] = o1[g];
         sm_o[wid][p1] = o2[g]; sm_o[wid][p1 + 1] = o3[g];
@@ -2326,11 +2324,11 @@ extern "C" __global__ void attn_decode_splitkv_reduce_q8_k(const float* __restri
 __device__ float g_b1_split_buf[32 * 16 * 130];
 
 extern "C" int ink_attn_decode_gated_q8(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const __half* kc, const __half* vc, const float* gate, const int* d_pos, void* out_q8, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int swa_window, int is_swa, int max_ctx) {
-    if (dh == 128 && (n_head % 6) == 0 && ((n_head / n_head_kv) % 6) == 0 && n_head <= 32) {
-        int n_splits = 16;
+    if (dh == 128 && n_head == n_head_kv * 3 && n_head <= 32) {
+        int n_splits = 8;
         float* sbuf = nullptr;
         (void)hipGetSymbolAddress((void**)&sbuf, HIP_SYMBOL(g_b1_split_buf));
-        attn_decode_gqa_splitkv_k<<<dim3(n_head / 6, n_splits), dim3(256), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, d_pos, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, n_splits);
+        attn_decode_gqa_splitkv_k<<<dim3(n_head_kv, n_splits), dim3(256), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, d_pos, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, n_splits);
         attn_decode_splitkv_reduce_q8_k<<<dim3(n_head), dim3(128), 0, s>>>(sbuf, gate, (q8_1_blk*)out_q8, n_splits);
         return 0;
     }

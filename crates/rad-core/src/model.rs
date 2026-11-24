@@ -260,6 +260,7 @@ struct SlotState {
     ffn_post_snap: DevBuf,
 }
 
+#[allow(dead_code)]
 struct Scratch {
     d_tok: DevBuf,
     d_pos: DevBuf,
@@ -2428,12 +2429,12 @@ impl InklingEngine {
         let kv_dim = (self.cfg.n_head_kv * self.cfg.dh) as i32;
         let q_dim = (self.cfg.n_head * self.cfg.dh) as i32;
         let r_dim = (self.cfg.n_head * self.cfg.d_rel) as i32;
-        let l = &self.layers[6];
-        let sl = &self.slots[6];
-        let ll = &self.loop_layers[0];
+        let _l = &self.layers[6];
+        let _sl = &self.slots[6];
+        let _ll = &self.loop_layers[0];
         let iters = 200;
 
-        let bench = |name: &str, mult: f64, f: &dyn Fn()| {
+        let _bench = |name: &str, mult: f64, f: &dyn Fn()| {
             for _ in 0..5 { f(); }
             unsafe { rad_hip::hipStreamSynchronize(s); }
             let t0 = std::time::Instant::now();
@@ -2462,10 +2463,9 @@ impl InklingEngine {
         let xq_stride = MAX_BATCH * ((q_dim as usize) / 32) * 40;
         let xq1 = unsafe { (self.bsc.xq.ptr as *mut u8).add(xq_stride) as *mut core::ffi::c_void };
         let xq2 = unsafe { (self.bsc.xq.ptr as *mut u8).add(2 * xq_stride) as *mut core::ffi::c_void };
-        let mut n_blocks = 0usize;
         let runs = 5;
         for _ in 0..runs {
-            n_blocks = 0;
+            let mut n_blocks = 0usize;
             for ip in 0..self.cfg.n_phys {
                 let l = &self.layers[ip];
                 let sl = &self.slots[ip];

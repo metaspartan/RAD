@@ -93,6 +93,7 @@ impl Drafter {
         }
     }
 
+    #[allow(dead_code)]
     fn inject_target_feats_seq(&mut self, seq: usize, feats_ptr: *const f32, pos: i32) -> anyhow::Result<()> {
         match self {
             Drafter::DFlash2(d) => d.inject_target_feats_seq(seq, feats_ptr, pos),
@@ -167,8 +168,10 @@ struct ChatMessage {
     #[serde(default)]
     content: serde_json::Value,
     #[serde(default)]
+    #[allow(dead_code)]
     tool_calls: Option<Vec<serde_json::Value>>,
     #[serde(default)]
+    #[allow(dead_code)]
     name: Option<String>,
 }
 

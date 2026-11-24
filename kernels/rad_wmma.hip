@@ -1325,14 +1325,15 @@ extern "C" __global__ void loop_ctrl_up_wmma_k(const float* __restrict__ cur0,
                                                float* __restrict__ out1,
                                                float* __restrict__ out2,
                                                int n_embd, int rank, int max_B, int B) {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
     int col = lane & 15;
     int half = lane >> 4;
-    int row0 = (blockIdx.x * 4 + warp) * 16;
+    int blk_row0 = blockIdx.x * 64;
     int c = blockIdx.y;
     int t0 = blockIdx.z * 32;
-    if (row0 >= n_embd || t0 >= B) return;
+    if (blk_row0 >= n_embd || t0 >= B) return;
     bool has1 = (t0 + 16 < B);
 
     const float* cur_base = (c == 0) ? cur0 : ((c == 1) ? cur1 : cur2);
@@ -1342,27 +1343,54 @@ extern "C" __global__ void loop_ctrl_up_wmma_k(const float* __restrict__ cur0,
     const float* wf = (c == 0) ? wf0 : ((c == 1) ? wf1 : wf2);
     float* out_base = (c == 0) ? out0 : ((c == 1) ? out1 : out2);
 
-    int r_load = min(row0 + col, n_embd - 1);
-    int t_load0 = min(t0 + col, B - 1);
-    int t_load1 = min(t0 + 16 + col, B - 1);
-    const float* wgr = wg + (size_t)r_load * rank;
-    const float* wfr = wf + (size_t)r_load * rank;
-    const float* hr0 = h_base + (size_t)t_load0 * rank;
-    const float* hr1 = h_base + (size_t)t_load1 * rank;
+    __shared__ _Float16 sm_wg[64][24];
+    __shared__ _Float16 sm_wf[64][24];
+    __shared__ _Float16 sm_h[32][24];
 
+    int r_loc = tid >> 2;
+    int k4_loc = tid & 3;
+    int r_g0 = min(blk_row0 + r_loc, n_embd - 1);
+    int r_g1 = min(blk_row0 + r_loc + 32, n_embd - 1);
+    int t_g = min(t0 + r_loc, B - 1);
+    const float4* wg_r0 = reinterpret_cast<const float4*>(wg + (size_t)r_g0 * rank);
+    const float4* wg_r1 = reinterpret_cast<const float4*>(wg + (size_t)r_g1 * rank);
+    const float4* wf_r0 = reinterpret_cast<const float4*>(wf + (size_t)r_g0 * rank);
+    const float4* wf_r1 = reinterpret_cast<const float4*>(wf + (size_t)r_g1 * rank);
+    const float4* h_r = reinterpret_cast<const float4*>(h_base + (size_t)t_g * rank);
+
+    int m0 = warp * 16;
     wmma_f8_v cg0 = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     wmma_f8_v cf0 = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     wmma_f8_v cg1 = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     wmma_f8_v cf1 = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    for (int kk = 0; kk < rank; kk += 16) {
-        int kb = kk + half * 8;
+    int r4 = rank >> 2;
+
+    for (int kk4 = 0; kk4 < r4; kk4 += 4) {
+        int j4 = kk4 + k4_loc;
+        int bk = k4_loc * 4;
+        float4 g0v = wg_r0[j4], g1v = wg_r1[j4];
+        float4 f0v = wf_r0[j4], f1v = wf_r1[j4];
+        float4 hv = h_r[j4];
+        sm_wg[r_loc][bk + 0] = (_Float16)g0v.x; sm_wg[r_loc][bk + 1] = (_Float16)g0v.y;
+        sm_wg[r_loc][bk + 2] = (_Float16)g0v.z; sm_wg[r_loc][bk + 3] = (_Float16)g0v.w;
+        sm_wg[r_loc + 32][bk + 0] = (_Float16)g1v.x; sm_wg[r_loc + 32][bk + 1] = (_Float16)g1v.y;
+        sm_wg[r_loc + 32][bk + 2] = (_Float16)g1v.z; sm_wg[r_loc + 32][bk + 3] = (_Float16)g1v.w;
+        sm_wf[r_loc][bk + 0] = (_Float16)f0v.x; sm_wf[r_loc][bk + 1] = (_Float16)f0v.y;
+        sm_wf[r_loc][bk + 2] = (_Float16)f0v.z; sm_wf[r_loc][bk + 3] = (_Float16)f0v.w;
+        sm_wf[r_loc + 32][bk + 0] = (_Float16)f1v.x; sm_wf[r_loc + 32][bk + 1] = (_Float16)f1v.y;
+        sm_wf[r_loc + 32][bk + 2] = (_Float16)f1v.z; sm_wf[r_loc + 32][bk + 3] = (_Float16)f1v.w;
+        sm_h[r_loc][bk + 0] = (_Float16)hv.x; sm_h[r_loc][bk + 1] = (_Float16)hv.y;
+        sm_h[r_loc][bk + 2] = (_Float16)hv.z; sm_h[r_loc][bk + 3] = (_Float16)hv.w;
+        __syncthreads();
+
         wmma_h8_v ag, af, bh0, bh1;
+        int kb = half * 8;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            ag[j] = (_Float16)wgr[kb + j];
-            af[j] = (_Float16)wfr[kb + j];
-            bh0[j] = (_Float16)hr0[kb + j];
-            bh1[j] = has1 ? (_Float16)hr1[kb + j] : (_Float16)0.0f;
+            ag[j] = sm_wg[m0 + col][kb + j];
+            af[j] = sm_wf[m0 + col][kb + j];
+            bh0[j] = sm_h[col][kb + j];
+            bh1[j] = has1 ? sm_h[16 + col][kb + j] : (_Float16)0.0f;
         }
         cg0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ag, bh0, cg0);
         cf0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af, bh0, cf0);
@@ -1370,12 +1398,13 @@ extern "C" __global__ void loop_ctrl_up_wmma_k(const float* __restrict__ cur0,
             cg1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ag, bh1, cg1);
             cf1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af, bh1, cf1);
         }
+        __syncthreads();
     }
     if (t0 + col < B) {
         size_t base = (size_t)(t0 + col) * n_embd;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            int r = row0 + half * 8 + i;
+            int r = blk_row0 + m0 + half * 8 + i;
             if (r < n_embd) {
                 float cv = cur_base[base + r];
                 out_base[base + r] = cv - tanhf(cf0[i]) * cv + tanhf(cg0[i]) * msg_base[base + r];
@@ -1386,7 +1415,7 @@ extern "C" __global__ void loop_ctrl_up_wmma_k(const float* __restrict__ cur0,
         size_t base = (size_t)(t0 + 16 + col) * n_embd;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            int r = row0 + half * 8 + i;
+            int r = blk_row0 + m0 + half * 8 + i;
             if (r < n_embd) {
                 float cv = cur_base[base + r];
                 out_base[base + r] = cv - tanhf(cf1[i]) * cv + tanhf(cg1[i]) * msg_base[base + r];
