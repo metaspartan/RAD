@@ -43,7 +43,9 @@ pub struct DsparkDrafter {
     pub swa_window: usize,
     pub freq_base: f32,
     pub eps: f32,
+    pub max_seqs: usize,
     pub ctx_len: i32,
+    pub seq_ctx_len: Vec<i32>,
     dspark_fuse: DevBuf,
     dspark_norm: DevBuf,
     mask_embd: DevBuf,
@@ -83,12 +85,18 @@ pub struct DsparkDrafter {
     d_ctx_len: DevBuf,
     stream: HipStream,
     draft_graph: Option<(usize, CapturedGraph)>,
+    seq_draft_graphs: std::collections::HashMap<(usize, usize), CapturedGraph>,
 }
 
 unsafe impl Send for DsparkDrafter {}
 
 impl DsparkDrafter {
     pub fn load(path: &Path, max_ctx: usize) -> Result<Self> {
+        Self::load_multi(path, max_ctx, 1)
+    }
+
+    pub fn load_multi(path: &Path, max_ctx: usize, max_seqs: usize) -> Result<Self> {
+        let max_seqs = max_seqs.max(1);
         let g = GgufFile::open(path)?;
         let q4_draft = std::env::var("RAD_DSPARK_Q4").map(|v| v != "0").unwrap_or(true);
         let n_layers = g.kv_u64("dflash.block_count").unwrap_or(3) as usize;
@@ -115,8 +123,8 @@ impl DsparkDrafter {
         for i in 0..n_layers {
             let p = |s: &str| format!("blk.{i}.{s}");
             let is_swa = swa_pat.get(i).copied().unwrap_or(false);
-            let l_ctx = if is_swa { swa_window + 16 } else { max_ctx };
-            let kv_bytes = n_head_kv * l_ctx * dh * 2;
+            let l_ctx = if is_swa { (swa_window + 16).min(max_ctx) } else { max_ctx };
+            let kv_bytes = max_seqs * n_head_kv * l_ctx * dh * 2;
             let mut k_cache = DevBuf::new(kv_bytes).map_err(he)?;
             let mut v_cache = DevBuf::new(kv_bytes).map_err(he)?;
             k_cache.zero().map_err(he)?;
@@ -167,7 +175,9 @@ impl DsparkDrafter {
             swa_window,
             freq_base,
             eps,
+            max_seqs,
             ctx_len: 0,
+            seq_ctx_len: vec![0; max_seqs],
             dspark_fuse: load_raw("dspark_fuse.weight")?,
             dspark_norm: load_raw("dspark_norm.weight")?,
             mask_embd: load_raw("mask_embd.weight")?,
@@ -182,7 +192,7 @@ impl DsparkDrafter {
             ctx_normed: DevBuf::new(n_embd * 4).map_err(he)?,
             ctx_k: DevBuf::new(kv_dim * 4).map_err(he)?,
             ctx_v: DevBuf::new(kv_dim * 4).map_err(he)?,
-            ctx_m: DevBuf::new(n_embd * 4).map_err(he)?,
+            ctx_m: DevBuf::new(max_seqs * n_embd * 4).map_err(he)?,
             x: DevBuf::new(kmax * n_embd * 4).map_err(he)?,
             x_norm: DevBuf::new(kmax * n_embd * 4).map_err(he)?,
             xq: DevBuf::new(kmax * (max_k_dim / 32) * 40).map_err(he)?,
@@ -207,11 +217,65 @@ impl DsparkDrafter {
             d_ctx_len: DevBuf::new(4).map_err(he)?,
             stream,
             draft_graph: None,
+            seq_draft_graphs: std::collections::HashMap::new(),
         })
     }
 
     pub fn reset(&mut self) {
         self.ctx_len = 0;
+        self.seq_ctx_len[0] = 0;
+    }
+
+    pub fn reset_seq(&mut self, seq: usize) {
+        self.seq_ctx_len[seq] = 0;
+        if seq == 0 {
+            self.ctx_len = 0;
+        }
+    }
+
+    pub fn inject_target_feats_seq(&mut self, seq: usize, feats_ptr: *const f32, pos: i32) -> Result<()> {
+        let e = self.n_embd as i32;
+        let kv_dim = (self.n_head_kv * self.dh) as i32;
+        self.d_pos.copy_from(&pos.to_le_bytes(), Some(self.stream)).map_err(he)?;
+        unsafe {
+            ops::ink_dspark_fuse(
+                self.stream,
+                feats_ptr,
+                self.dspark_fuse.ptr as *const f32,
+                self.fused_ctx.ptr as *mut f32,
+                e,
+                1,
+            );
+            for (il, l) in self.layers.iter().enumerate() {
+                let kv_off = seq * self.n_head_kv * l.max_ctx * self.dh;
+                let f_row = (self.fused_ctx.ptr as *const f32).add(il * self.n_embd);
+                ops::ink_rmsnorm(self.stream, f_row, l.dflare_norm.ptr as *const f32, self.ctx_normed.ptr as *mut f32, e, self.eps);
+                ops::ink_gemv_q8_0(self.stream, l.wk_ctx.buf.ptr as *const u8, self.ctx_normed.ptr as *const f32, self.ctx_k.ptr as *mut f32, kv_dim, e);
+                ops::ink_gemv_q8_0(self.stream, l.wv_ctx.buf.ptr as *const u8, self.ctx_normed.ptr as *const f32, self.ctx_v.ptr as *mut f32, kv_dim, e);
+                ops::ink_dspark_rope_norm_ctx(
+                    self.stream,
+                    self.ctx_k.ptr as *const f32,
+                    self.ctx_v.ptr as *const f32,
+                    l.k_ctx_norm.ptr as *const f32,
+                    (l.k_cache.ptr as *mut u16).add(kv_off),
+                    (l.v_cache.ptr as *mut u16).add(kv_off),
+                    self.d_pos.ptr as *const i32,
+                    l.max_ctx as i32,
+                    self.n_head_kv as i32,
+                    self.dh as i32,
+                    self.freq_base,
+                    if l.is_swa { 1 } else { 0 },
+                );
+            }
+            let f_m = (self.fused_ctx.ptr as *const f32).add(3 * self.n_embd);
+            ops::ink_rmsnorm(self.stream, f_m, self.dspark_norm.ptr as *const f32, (self.ctx_m.ptr as *mut f32).add(seq * self.n_embd), e, self.eps);
+            rad_hip::hipStreamSynchronize(self.stream);
+        }
+        self.seq_ctx_len[seq] = pos + 1;
+        if seq == 0 {
+            self.ctx_len = pos + 1;
+        }
+        Ok(())
     }
 
     pub fn inject_target_feats_cfg(&mut self, feats_ptr: *const f32, pos: i32, use_softmax: bool) -> Result<()> {
@@ -270,7 +334,7 @@ impl DsparkDrafter {
         }
     }
 
-    unsafe fn enqueue_draft(&self, s: HipStream, target: &InklingEngine, k_len: usize, mode: i32, add_hidden: bool, norm_anchor: bool) {
+    unsafe fn enqueue_draft_seq(&self, s: HipStream, target: &InklingEngine, seq: usize, k_len: usize, mode: i32, add_hidden: bool, norm_anchor: bool) {
         let e = self.n_embd as i32;
         let q_dim = (self.n_head * self.dh) as i32;
         let kv_dim = (self.n_head_kv * self.dh) as i32;
@@ -313,13 +377,14 @@ impl DsparkDrafter {
                 self.dh as i32,
                 self.freq_base,
             );
+            let kv_off = seq * self.n_head_kv * l.max_ctx * self.dh;
             ops::ink_dspark_attn(
                 s,
                 self.q.ptr as *const f32,
                 self.k.ptr as *const f32,
                 self.v.ptr as *const f32,
-                l.k_cache.ptr as *const u16,
-                l.v_cache.ptr as *const u16,
+                (l.k_cache.ptr as *const u16).add(kv_off),
+                (l.v_cache.ptr as *const u16).add(kv_off),
                 self.d_ctx_len.ptr as *const i32,
                 self.attn_out.ptr as *mut f32,
                 ki,
@@ -355,7 +420,7 @@ impl DsparkDrafter {
                 self.markov_w1.ptr as *const u16,
                 d_toks.add(slot - 1) as *const i32,
                 hi,
-                self.ctx_m.ptr as *const f32,
+                (self.ctx_m.ptr as *const f32).add(seq * self.n_embd),
                 self.markov_inp.ptr as *mut f32,
                 e,
                 self.rank as i32,
@@ -437,9 +502,34 @@ impl DsparkDrafter {
 
     pub fn capture_draft_graph(&mut self, target: &InklingEngine, k_len: usize) -> Result<()> {
         let k_len = k_len.min(self.block_size);
-        let g = unsafe { CapturedGraph::capture(|s| self.enqueue_draft(s, target, k_len, 0, true, true)) }.map_err(he)?;
+        let g = unsafe { CapturedGraph::capture(|s| self.enqueue_draft_seq(s, target, 0, k_len, 0, true, true)) }.map_err(he)?;
         self.draft_graph = Some((k_len, g));
         Ok(())
+    }
+
+    pub fn draft_seq(&mut self, seq: usize, anchor_tok: i32, target: &InklingEngine, k_len: usize) -> Result<Vec<i32>> {
+        let k_len = k_len.min(self.block_size);
+        let ctx_len = self.seq_ctx_len[seq];
+        let pos0 = ctx_len;
+        let key = (seq, k_len);
+        if !self.seq_draft_graphs.contains_key(&key) {
+            let g = unsafe { CapturedGraph::capture(|s| self.enqueue_draft_seq(s, target, seq, k_len, 0, true, true)) }.map_err(he)?;
+            self.seq_draft_graphs.insert(key, g);
+        }
+        let g = self.seq_draft_graphs.get(&key).unwrap();
+        self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(g.stream)).map_err(he)?;
+        self.d_pos.copy_from(&pos0.to_le_bytes(), Some(g.stream)).map_err(he)?;
+        self.d_ctx_len.copy_from(&ctx_len.to_le_bytes(), Some(g.stream)).map_err(he)?;
+        g.launch().map_err(he)?;
+        g.sync().map_err(he)?;
+        let mut out_b = vec![0u8; k_len * 4];
+        let rc = unsafe {
+            rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.d_draft_toks.ptr, k_len * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
+        };
+        if rc != rad_hip::HIP_SUCCESS {
+            return Err(he(rc));
+        }
+        Ok(out_b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect())
     }
 
     pub fn draft_with_mode(&mut self, anchor_tok: i32, target: &InklingEngine, k_len: usize, mode: i32, add_hidden: bool, norm_anchor: bool) -> Result<Vec<i32>> {
@@ -459,7 +549,7 @@ impl DsparkDrafter {
             self.d_pos.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
             self.d_ctx_len.copy_from(&self.ctx_len.to_le_bytes(), Some(self.stream)).map_err(he)?;
             unsafe {
-                self.enqueue_draft(self.stream, target, k_len, mode, add_hidden, norm_anchor);
+                self.enqueue_draft_seq(self.stream, target, 0, k_len, mode, add_hidden, norm_anchor);
                 rad_hip::hipStreamSynchronize(self.stream);
             }
         }

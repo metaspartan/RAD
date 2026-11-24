@@ -366,6 +366,8 @@ pub struct InklingEngine {
     stream: HipStream,
     decode_graph: Option<CapturedGraph>,
     verify_graph: Option<(usize, CapturedGraph)>,
+    multi_graphs: std::collections::HashMap<usize, CapturedGraph>,
+    multi_verify_graphs: std::collections::HashMap<(usize, usize), CapturedGraph>,
     pub pos: i32,
     pub seq_pos: Vec<i32>,
     pub seq_tokens: Vec<Vec<i32>>,
@@ -467,7 +469,7 @@ impl InklingEngine {
                 cfg.core_start + ((il - cfg.n_phys) % (cfg.core_end - cfg.core_start))
             };
             let is_swa = cfg.is_swa[ip];
-            let slot_ctx = if is_swa { cfg.swa_window + 16 } else { max_ctx };
+            let slot_ctx = if is_swa { (cfg.swa_window + 16).min(max_ctx) } else { max_ctx };
             let kv_bytes = max_seqs * cfg.n_head_kv * slot_ctx * cfg.dh * 2;
             let mut k_cache = DevBuf::new(kv_bytes).map_err(he)?;
             let mut v_cache = DevBuf::new(kv_bytes).map_err(he)?;
@@ -475,10 +477,11 @@ impl InklingEngine {
             let mut v_hist = DevBuf::new(max_seqs * kv_dim * 3 * 4).map_err(he)?;
             let mut attn_post_hist = DevBuf::new(max_seqs * cfg.n_embd * 3 * 4).map_err(he)?;
             let mut ffn_post_hist = DevBuf::new(max_seqs * cfg.n_embd * 3 * 4).map_err(he)?;
-            let k_snap = DevBuf::new(8 * kv_dim * 3 * 4).map_err(he)?;
-            let v_snap = DevBuf::new(8 * kv_dim * 3 * 4).map_err(he)?;
-            let attn_post_snap = DevBuf::new(8 * cfg.n_embd * 3 * 4).map_err(he)?;
-            let ffn_post_snap = DevBuf::new(8 * cfg.n_embd * 3 * 4).map_err(he)?;
+            let snap_users = max_seqs.min(8);
+            let k_snap = DevBuf::new(snap_users * 8 * kv_dim * 3 * 4).map_err(he)?;
+            let v_snap = DevBuf::new(snap_users * 8 * kv_dim * 3 * 4).map_err(he)?;
+            let attn_post_snap = DevBuf::new(snap_users * 8 * cfg.n_embd * 3 * 4).map_err(he)?;
+            let ffn_post_snap = DevBuf::new(snap_users * 8 * cfg.n_embd * 3 * 4).map_err(he)?;
             k_cache.zero().map_err(he)?;
             v_cache.zero().map_err(he)?;
             k_hist.zero().map_err(he)?;
@@ -615,6 +618,8 @@ impl InklingEngine {
             stream,
             decode_graph: None,
             verify_graph: None,
+            multi_graphs: std::collections::HashMap::new(),
+            multi_verify_graphs: std::collections::HashMap::new(),
             pos: 0,
             seq_pos: vec![0; max_seqs],
             seq_tokens: vec![Vec::new(); max_seqs],
@@ -1375,7 +1380,7 @@ impl InklingEngine {
                     self.bsc.tok_sorted.ptr as *mut i32, self.bsc.slot_sorted.ptr as *mut i32,
                     self.bsc.wt_sorted.ptr as *mut f32, self.cfg.n_expert_used as i32, bi,
                 );
-                if b >= 12 {
+                if b >= 48 {
                     ops::ink_moe_gu_q4_0_wmma(
                         s, l.ffn_gate_up_exps.buf.ptr as *const u8, gu_sc, self.bsc.xq.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -1384,11 +1389,11 @@ impl InklingEngine {
                         self.cfg.situ_beta, self.cfg.situ_lb, bi,
                     );
                 } else {
-                    ops::ink_moe_gu_q4_0_sudot4(
+                    ops::ink_moe_gu_q4_0_sudot4_to_q8(
                         s, l.ffn_gate_up_exps.buf.ptr as *const u8, gu_sc, self.bsc.xq.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
                         self.bsc.tok_sorted.ptr as *const i32, self.bsc.slot_sorted.ptr as *const i32,
-                        moe_act, self.cfg.n_ff_exp as i32, e, self.cfg.n_expert_used as i32,
+                        self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, e, self.cfg.n_expert_used as i32,
                         self.cfg.situ_beta, self.cfg.situ_lb, bi,
                     );
                 }
@@ -1410,8 +1415,8 @@ impl InklingEngine {
                 );
             }
             WeightType::Q4_0 => {
-                ops::ink_quantize_q8_1(s, moe_act, self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, bi * self.cfg.n_expert_used as i32);
-                if b >= 12 {
+                if b >= 48 {
+                    ops::ink_quantize_q8_1(s, moe_act, self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, bi * self.cfg.n_expert_used as i32);
                     ops::ink_moe_dn_q4_0_wmma(
                         s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -1772,13 +1777,16 @@ impl InklingEngine {
         let tok_bytes = unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, b * 4) };
         let seq_bytes = unsafe { std::slice::from_raw_parts(seq_ids.as_ptr() as *const u8, b * 4) };
         let pos_bytes = unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, b * 4) };
-        self.bsc.d_toks.copy_from(tok_bytes, Some(self.stream)).map_err(he)?;
-        self.bsc.d_seq_ids.copy_from(seq_bytes, Some(self.stream)).map_err(he)?;
-        self.bsc.d_positions.copy_from(pos_bytes, Some(self.stream)).map_err(he)?;
-        unsafe {
-            self.enqueue_forward_multi(self.stream, b);
-            rad_hip::hipStreamSynchronize(self.stream);
+        if !self.multi_graphs.contains_key(&b) {
+            let g = unsafe { CapturedGraph::capture(|s| self.enqueue_forward_multi(s, b)) }.map_err(he)?;
+            self.multi_graphs.insert(b, g);
         }
+        let g = self.multi_graphs.get(&b).unwrap();
+        self.bsc.d_toks.copy_from(tok_bytes, Some(g.stream)).map_err(he)?;
+        self.bsc.d_seq_ids.copy_from(seq_bytes, Some(g.stream)).map_err(he)?;
+        self.bsc.d_positions.copy_from(pos_bytes, Some(g.stream)).map_err(he)?;
+        g.launch().map_err(he)?;
+        g.sync().map_err(he)?;
         let mut out_b = vec![0u8; b * 4];
         let rc = unsafe {
             rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
@@ -1793,7 +1801,87 @@ impl InklingEngine {
         Ok(out_b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect())
     }
 
-    unsafe fn enqueue_layer_batch_ex(&self, s: HipStream, il: usize, ip: usize, n_blocks: &mut usize, loop_idx: Option<usize>, b: usize, seq_opt: Option<usize>) {
+    pub fn verify_multi(&mut self, seq_ids: &[i32], draft_tokens: &[Vec<i32>]) -> Result<Vec<Vec<i32>>> {
+        let n_users = seq_ids.len();
+        assert_eq!(n_users, draft_tokens.len());
+        assert!(n_users >= 1 && n_users <= 16);
+        let k_len = draft_tokens[0].len();
+        assert!(k_len >= 1 && k_len <= 8);
+        let total_b = n_users * k_len;
+        let mut flat_toks = Vec::with_capacity(total_b);
+        let mut flat_seqs = Vec::with_capacity(total_b);
+        let mut flat_pos = Vec::with_capacity(total_b);
+        for u in 0..n_users {
+            assert_eq!(draft_tokens[u].len(), k_len);
+            let seq = seq_ids[u];
+            let pos0 = self.seq_pos[seq as usize];
+            for k in 0..k_len {
+                flat_toks.push(draft_tokens[u][k]);
+                flat_seqs.push(seq);
+                flat_pos.push(pos0 + k as i32);
+            }
+        }
+        let tok_bytes = unsafe { std::slice::from_raw_parts(flat_toks.as_ptr() as *const u8, total_b * 4) };
+        let seq_bytes = unsafe { std::slice::from_raw_parts(flat_seqs.as_ptr() as *const u8, total_b * 4) };
+        let pos_bytes = unsafe { std::slice::from_raw_parts(flat_pos.as_ptr() as *const u8, total_b * 4) };
+        let key = (n_users, k_len);
+        if !self.multi_verify_graphs.contains_key(&key) {
+            let g = unsafe { CapturedGraph::capture(|s| self.enqueue_forward_ex(s, total_b, true, None, k_len)) }.map_err(he)?;
+            self.multi_verify_graphs.insert(key, g);
+        }
+        let g = self.multi_verify_graphs.get(&key).unwrap();
+        self.bsc.d_toks.copy_from(tok_bytes, Some(g.stream)).map_err(he)?;
+        self.bsc.d_seq_ids.copy_from(seq_bytes, Some(g.stream)).map_err(he)?;
+        self.bsc.d_positions.copy_from(pos_bytes, Some(g.stream)).map_err(he)?;
+        g.launch().map_err(he)?;
+        g.sync().map_err(he)?;
+        let mut out_b = vec![0u8; total_b * 4];
+        let rc = unsafe {
+            rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, total_b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
+        };
+        if rc != rad_hip::HIP_SUCCESS { return Err(he(rc)); }
+        for &sid in seq_ids {
+            let su = sid as usize;
+            self.seq_pos[su] += k_len as i32;
+            if su == 0 { self.pos = self.seq_pos[0]; }
+        }
+        let flat_out: Vec<i32> = out_b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+        Ok(flat_out.chunks_exact(k_len).map(|c| c.to_vec()).collect())
+    }
+
+    pub fn rewind_verify_multi(&mut self, seq_ids: &[i32], n_acc: &[usize], k_len: usize) -> Result<()> {
+        let kv_n = (self.cfg.n_head_kv * self.cfg.dh * 3) as i32;
+        let e_n = (self.cfg.n_embd * 3) as i32;
+        let mut any = false;
+        unsafe {
+            for (u, &sid) in seq_ids.iter().enumerate() {
+                let acc = n_acc[u];
+                if acc < k_len {
+                    any = true;
+                    let su = sid as usize;
+                    let idx = acc - 1;
+                    let kv_src_off = (u * 8 + idx) * (kv_n as usize);
+                    let e_src_off = (u * 8 + idx) * (e_n as usize);
+                    let kv_dst_off = su * (kv_n as usize);
+                    let e_dst_off = su * (e_n as usize);
+                    for sl in &self.slots {
+                        ops::ink_copy_f32(self.stream, (sl.k_snap.ptr as *const f32).add(kv_src_off), (sl.k_hist.ptr as *mut f32).add(kv_dst_off), kv_n);
+                        ops::ink_copy_f32(self.stream, (sl.v_snap.ptr as *const f32).add(kv_src_off), (sl.v_hist.ptr as *mut f32).add(kv_dst_off), kv_n);
+                        ops::ink_copy_f32(self.stream, (sl.attn_post_snap.ptr as *const f32).add(e_src_off), (sl.attn_post_hist.ptr as *mut f32).add(e_dst_off), e_n);
+                        ops::ink_copy_f32(self.stream, (sl.ffn_post_snap.ptr as *const f32).add(e_src_off), (sl.ffn_post_hist.ptr as *mut f32).add(e_dst_off), e_n);
+                    }
+                    self.seq_pos[su] -= (k_len - acc) as i32;
+                    if su == 0 { self.pos = self.seq_pos[0]; }
+                }
+            }
+            if any {
+                rad_hip::hipStreamSynchronize(self.stream);
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn enqueue_layer_batch_ex(&self, s: HipStream, il: usize, ip: usize, n_blocks: &mut usize, loop_idx: Option<usize>, b: usize, seq_opt: Option<usize>, multi_k: usize) {
         let l = &self.layers[ip];
         let sl = &self.slots[il];
         let e = self.cfg.n_embd as i32;
@@ -1969,24 +2057,42 @@ impl InklingEngine {
                 );
             }
         } else {
-            ops::ink_kv_conv_qkvr_store_multi(
-                s, q, k_raw, v_raw, r,
-                l.attn_k_conv.ptr as *const f32, l.attn_v_conv.ptr as *const f32,
-                if l.is_swa { std::ptr::null() } else { k_dyn },
-                if l.is_swa { std::ptr::null() } else { v_dyn },
-                sl.k_hist.ptr as *mut f32, sl.v_hist.ptr as *mut f32,
-                l.attn_q_clip.ptr as *const f32, l.attn_rel_clip.ptr as *const f32,
-                sl.k_cache.ptr as *mut u16, sl.v_cache.ptr as *mut u16,
-                self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
-                bi, if sl.is_swa { 1 } else { 0 },
-                self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
-                sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
-            );
-            ops::ink_attn_multi_gated(
+            if multi_k > 1 {
+                let n_users = (b / multi_k) as i32;
+                ops::ink_kv_conv_qkvr_store_multi_snap(
+                    s, q, k_raw, v_raw, r,
+                    l.attn_k_conv.ptr as *const f32, l.attn_v_conv.ptr as *const f32,
+                    if l.is_swa { std::ptr::null() } else { k_dyn },
+                    if l.is_swa { std::ptr::null() } else { v_dyn },
+                    sl.k_hist.ptr as *mut f32, sl.v_hist.ptr as *mut f32,
+                    sl.k_snap.ptr as *mut f32, sl.v_snap.ptr as *mut f32,
+                    l.attn_q_clip.ptr as *const f32, l.attn_rel_clip.ptr as *const f32,
+                    sl.k_cache.ptr as *mut u16, sl.v_cache.ptr as *mut u16,
+                    self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
+                    n_users, multi_k as i32, if sl.is_swa { 1 } else { 0 },
+                    self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                    sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
+                );
+            } else {
+                ops::ink_kv_conv_qkvr_store_multi(
+                    s, q, k_raw, v_raw, r,
+                    l.attn_k_conv.ptr as *const f32, l.attn_v_conv.ptr as *const f32,
+                    if l.is_swa { std::ptr::null() } else { k_dyn },
+                    if l.is_swa { std::ptr::null() } else { v_dyn },
+                    sl.k_hist.ptr as *mut f32, sl.v_hist.ptr as *mut f32,
+                    l.attn_q_clip.ptr as *const f32, l.attn_rel_clip.ptr as *const f32,
+                    sl.k_cache.ptr as *mut u16, sl.v_cache.ptr as *mut u16,
+                    self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
+                    bi, if sl.is_swa { 1 } else { 0 },
+                    self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                    sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
+                );
+            }
+            ops::ink_attn_multi_gated_q8(
                 s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
                 sl.k_cache.ptr as *const u16, sl.v_cache.ptr as *const u16,
                 gate_out, self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
-                attn_out,
+                self.bsc.xq.ptr,
                 self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
                 self.cfg.rel_extent as i32, self.cfg.swa_window as i32, if sl.is_swa { 1 } else { 0 },
                 sl.max_ctx as i32, bi,
@@ -1994,7 +2100,9 @@ impl InklingEngine {
         }
 
         let o_raw = self.bsc.o_raw.ptr as *mut f32;
-        ops::ink_quantize_q8_1(s, attn_out, self.bsc.xq.ptr, q_dim, bi);
+        if seq_opt.is_some() {
+            ops::ink_quantize_q8_1(s, attn_out, self.bsc.xq.ptr, q_dim, bi);
+        }
         match l.wo.ty {
             WeightType::Q4_0 if b >= 12 => ops::ink_gemm_q4_0_wmma(s, l.wo.buf.ptr as *const u8, self.bsc.xq.ptr, o_raw, e, q_dim, bi),
             WeightType::Q4_0 => ops::ink_gemm_q4_0_sudot4(s, l.wo.buf.ptr as *const u8, self.bsc.xq.ptr, o_raw, e, q_dim, bi),
@@ -2011,6 +2119,8 @@ impl InklingEngine {
         if let Some(seq) = seq_opt {
             let seq_eh_off = seq * self.cfg.n_embd * 3;
             ops::ink_shortconv_res_batch(s, o_raw, l.attn_post_conv.ptr as *const f32, (sl.attn_post_hist.ptr as *mut f32).add(seq_eh_off), cur, block_dst, ffn_inp, e, bi);
+        } else if multi_k > 1 {
+            ops::ink_shortconv_res_multi_snap(s, o_raw, l.attn_post_conv.ptr as *const f32, sl.attn_post_hist.ptr as *mut f32, sl.attn_post_snap.ptr as *mut f32, cur, block_dst, ffn_inp, self.bsc.d_seq_ids.ptr as *const i32, e, (b / multi_k) as i32, multi_k as i32);
         } else {
             ops::ink_shortconv_res_multi(s, o_raw, l.attn_post_conv.ptr as *const f32, sl.attn_post_hist.ptr as *mut f32, cur, block_dst, ffn_inp, self.bsc.d_seq_ids.ptr as *const i32, e, bi);
         }
@@ -2066,7 +2176,7 @@ impl InklingEngine {
                     self.bsc.tok_sorted.ptr as *mut i32, self.bsc.slot_sorted.ptr as *mut i32,
                     self.bsc.wt_sorted.ptr as *mut f32, self.cfg.n_expert_used as i32, bi,
                 );
-                if b >= 12 {
+                if b >= 48 {
                     ops::ink_moe_gu_q4_0_wmma(
                         s, l.ffn_gate_up_exps.buf.ptr as *const u8, gu_sc, self.bsc.xq.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -2075,11 +2185,11 @@ impl InklingEngine {
                         self.cfg.situ_beta, self.cfg.situ_lb, bi,
                     );
                 } else {
-                    ops::ink_moe_gu_q4_0_sudot4(
+                    ops::ink_moe_gu_q4_0_sudot4_to_q8(
                         s, l.ffn_gate_up_exps.buf.ptr as *const u8, gu_sc, self.bsc.xq.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
                         self.bsc.tok_sorted.ptr as *const i32, self.bsc.slot_sorted.ptr as *const i32,
-                        moe_act, self.cfg.n_ff_exp as i32, e, self.cfg.n_expert_used as i32,
+                        self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, e, self.cfg.n_expert_used as i32,
                         self.cfg.situ_beta, self.cfg.situ_lb, bi,
                     );
                 }
@@ -2101,8 +2211,8 @@ impl InklingEngine {
                 );
             }
             WeightType::Q4_0 => {
-                ops::ink_quantize_q8_1(s, moe_act, self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, bi * self.cfg.n_expert_used as i32);
-                if b >= 12 {
+                if b >= 48 {
+                    ops::ink_quantize_q8_1(s, moe_act, self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, bi * self.cfg.n_expert_used as i32);
                     ops::ink_moe_dn_q4_0_wmma(
                         s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -2128,20 +2238,22 @@ impl InklingEngine {
         if let Some(seq) = seq_opt {
             let seq_eh_off = seq * self.cfg.n_embd * 3;
             ops::ink_shortconv_res_batch(s, moe_raw, l.ffn_post_conv.ptr as *const f32, (sl.ffn_post_hist.ptr as *mut f32).add(seq_eh_off), ffn_inp, std::ptr::null_mut(), cur, e, bi);
+        } else if multi_k > 1 {
+            ops::ink_shortconv_res_multi_snap(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, sl.ffn_post_snap.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, self.bsc.d_seq_ids.ptr as *const i32, e, (b / multi_k) as i32, multi_k as i32);
         } else {
             ops::ink_shortconv_res_multi(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, self.bsc.d_seq_ids.ptr as *const i32, e, bi);
         }
     }
 
     pub unsafe fn enqueue_forward_batch_seq(&self, s: HipStream, seq: usize, b: usize, all_logits: bool) {
-        self.enqueue_forward_ex(s, b, all_logits, Some(seq));
+        self.enqueue_forward_ex(s, b, all_logits, Some(seq), 1);
     }
 
     pub unsafe fn enqueue_forward_multi(&self, s: HipStream, b: usize) {
-        self.enqueue_forward_ex(s, b, true, None);
+        self.enqueue_forward_ex(s, b, true, None, 1);
     }
 
-    unsafe fn enqueue_forward_ex(&self, s: HipStream, b: usize, all_logits: bool, seq_opt: Option<usize>) {
+    unsafe fn enqueue_forward_ex(&self, s: HipStream, b: usize, all_logits: bool, seq_opt: Option<usize>, multi_k: usize) {
         let e = self.cfg.n_embd as i32;
         let mb = MAX_BATCH as i32;
         let bi = b as i32;
@@ -2159,7 +2271,7 @@ impl InklingEngine {
         let mut n_blocks = 0usize;
         let mut visit = 0usize;
         for il in 0..self.cfg.core_start {
-            self.enqueue_layer_batch_ex(s, il, il, &mut n_blocks, None, b, seq_opt);
+            self.enqueue_layer_batch_ex(s, il, il, &mut n_blocks, None, b, seq_opt, multi_k);
             visit += 1;
             if visit == 5 { ops::ink_copy_f32(s, cur, feats, be); }
         }
@@ -2185,12 +2297,12 @@ impl InklingEngine {
                     self.cfg.n_phys + (pass - 1) * (self.cfg.core_end - self.cfg.core_start) + (ip - self.cfg.core_start)
                 };
                 if pass == 0 {
-                    self.enqueue_layer_batch_ex(s, il, ip, &mut n_blocks, None, b, seq_opt);
+                    self.enqueue_layer_batch_ex(s, il, ip, &mut n_blocks, None, b, seq_opt, multi_k);
                 } else {
                     let li = ip - self.cfg.core_start;
                     let ll = &self.loop_layers[li];
                     ops::ink_mix_batch(s, bank, bank_len as i32, mb, bank_out, ll.msg_query.ptr as *const f32, std::ptr::null(), std::ptr::null(), std::ptr::null(), msgs, e, 4, bi, self.cfg.eps);
-                    self.enqueue_layer_batch_ex(s, il, ip, &mut n_blocks, Some(li), b, seq_opt);
+                    self.enqueue_layer_batch_ex(s, il, ip, &mut n_blocks, Some(li), b, seq_opt, multi_k);
                 }
                 visit += 1;
                 if visit == 23 { ops::ink_copy_f32(s, cur, feats.add(MAX_BATCH * self.cfg.n_embd), be); }
@@ -2198,7 +2310,7 @@ impl InklingEngine {
             }
         }
         for il in self.cfg.core_end..self.cfg.n_phys {
-            self.enqueue_layer_batch_ex(s, il, il, &mut n_blocks, None, b, seq_opt);
+            self.enqueue_layer_batch_ex(s, il, il, &mut n_blocks, None, b, seq_opt, multi_k);
             visit += 1;
             if visit == 48 { ops::ink_copy_f32(s, cur, feats.add(3 * MAX_BATCH * self.cfg.n_embd), be); }
         }

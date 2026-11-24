@@ -521,46 +521,41 @@ extern "C" __global__ void gemm_f32_wmma_k(const float* __restrict__ W,
     int lane = threadIdx.x & 31;
     int col = lane & 15;
     int half = lane >> 4;
-    int row0 = (blockIdx.x * 4 + warp) * 16;
-    int t0 = blockIdx.y * 32;
+    int row0 = blockIdx.x * 16;
+    int t0 = blockIdx.y * 16;
     if (row0 >= n || t0 >= B) return;
-    bool has1 = (t0 + 16 < B);
 
     int r_load = min(row0 + col, n - 1);
-    int t_load0 = min(t0 + col, B - 1);
-    int t_load1 = min(t0 + 16 + col, B - 1);
+    int t_load = min(t0 + col, B - 1);
     const float* wrow = W + (size_t)r_load * k;
-    const float* xrow0 = X + (size_t)t_load0 * k;
-    const float* xrow1 = X + (size_t)t_load1 * k;
+    const float* xrow = X + (size_t)t_load * k;
 
-    wmma_f8_v cv0 = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    wmma_f8_v cv1 = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    for (int kk = 0; kk < k; kk += 16) {
+    wmma_f8_v cv = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int kk = warp * 16; kk < k; kk += 64) {
         int kb = kk + half * 8;
-        wmma_h8_v av, bv0, bv1;
+        wmma_h8_v av, bv;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             av[j] = (_Float16)wrow[kb + j];
-            bv0[j] = (_Float16)xrow0[kb + j];
-            bv1[j] = has1 ? (_Float16)xrow1[kb + j] : (_Float16)0.0f;
+            bv[j] = (_Float16)xrow[kb + j];
         }
-        cv0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av, bv0, cv0);
-        if (has1) cv1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av, bv1, cv1);
+        cv = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av, bv, cv);
     }
-    if (t0 + col < B) {
+    __shared__ float sm[4][16][16];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sm[warp][half * 8 + i][col] = cv[i];
+    }
+    __syncthreads();
+    if (warp == 0 && t0 + col < B) {
         float* yt = Y + (size_t)(t0 + col) * n;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             int r = row0 + half * 8 + i;
-            if (r < n) yt[r] = cv0[i];
-        }
-    }
-    if (has1 && t0 + 16 + col < B) {
-        float* yt = Y + (size_t)(t0 + 16 + col) * n;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            int r = row0 + half * 8 + i;
-            if (r < n) yt[r] = cv1[i];
+            if (r < n) {
+                int rr = half * 8 + i;
+                yt[r] = sm[0][rr][col] + sm[1][rr][col] + sm[2][rr][col] + sm[3][rr][col];
+            }
         }
     }
 }
@@ -920,7 +915,7 @@ extern "C" int ink_attn_batch_gated_flash(hipStream_t s, const float* Q, const f
 }
 
 extern "C" int ink_gemm_f32_wmma(hipStream_t s, const float* W, const float* X, float* Y, int n, int k, int B) {
-    gemm_f32_wmma_k<<<dim3((n + 63) / 64, (B + 31) / 32), dim3(128), 0, s>>>(W, X, Y, n, k, B);
+    gemm_f32_wmma_k<<<dim3((n + 15) / 16, (B + 15) / 16), dim3(128), 0, s>>>(W, X, Y, n, k, B);
     return 0;
 }
 

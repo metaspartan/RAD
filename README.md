@@ -13,10 +13,10 @@ The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybri
   - Custom `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` **FlashAttention-2** (64 query tokens sharing an 8 KB LDS KV tile), WMMA FP16 loop controllers, and WMMA FP16 MoE router.
 - **On-GPU `Q4_0_SOA` Weight Repacking**
   - Converts `Q8_0` and `NVFP4` tensors directly on GPU at load time (~10 ms, **~1.2 s** total cold load) into 16-byte-aligned structure-of-arrays blocks for coalesced `uint4` loads and `sudot4` / WMMA execution.
-- **`hipGraph`-Captured Decode & DSpark Speculative Decoding**
-  - Full 48-visit decode step and multi-step `K`-token DSpark draft loop captured into `hipGraph`s (zero mid-loop host syncs), paired with exact O(1) shortconv & ring-buffer KV rewind.
+- **`hipGraph`-Captured Decode, Continuous Batching & Multi-User DSpark Speculative Decoding**
+  - Full 48-visit decode step (`B=1`), multi-user decode steps (`B=2..128`), multi-user speculative verification (`verify_multi`), and multi-step `K`-token DSpark draft loops are all captured into `hipGraph`s (zero mid-loop host syncs), paired with exact O(1) per-user shortconv & ring-buffer KV rewind.
 - **vLLM-Style Continuous Batching & Prefix Caching**
-  - Dedicated GPU scheduler thread with prefix-cache affinity, automatic DSpark speculative decoding at `B=1`, and continuous batched decode (`step_multi`) up to `B=32+` concurrent sequences.
+  - Dedicated GPU scheduler thread with prefix-cache affinity, automatic DSpark speculative decoding, and continuous batched decode (`step_multi`) scaling up to `B=128` concurrent sequences.
 - **Full OpenAI-Compatible Serving API (`rad-serve`)**
   - `GET /health`
   - `GET /v1/models`
@@ -33,14 +33,19 @@ Measured end-to-end on **Inkling-2-Mini** (`Inkling-2-Mini-UD-Q4_K_XL-v2.gguf` +
 
 | Workload | Throughput / Latency | Notes |
 | --- | --- | --- |
-| **Cold Load (`max_seqs=32`)** | **1.16 s** | On-GPU `Q4_0_SOA` conversion + `hipGraph` capture (`51.9 ms`) |
-| **Long Prefill (`1,639 tok`)** | **1,643.9 tok/s** | WMMA INT8 + WMMA FlashAttention-2 (`MAX_BATCH=1024`) |
-| **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **32.9 ms** | Prefix-cache affinity hit |
-| **Single-User Decode (`B=1`, no-spec)** | **93.2 tok/s** | `hipGraph`-captured 48-visit loop |
-| **Single-User Decode (DSpark `K=6`, code)** | **138.2 tok/s** | `hipGraph` draft + verify (`emit=4.41 tok/round`) |
-| **Multi-User Decode (`B=8`)** | **229.5 agg tok/s** | `28.7 tok/s/user` |
-| **Multi-User Decode (`B=16`)** | **366.1 agg tok/s** | `22.9 tok/s/user` |
-| **Multi-User Decode (`B=32`)** | **622.2 agg tok/s** | `19.4 tok/s/user` |
+| **Cold Load (`max_seqs=128`)** | **1.17 s** | On-GPU `Q4_0_SOA` conversion + `hipGraph` capture (`48.1 ms`) |
+| **Long Prefill (`1,639 tok`)** | **1,651.7 tok/s** | RDNA4 WMMA INT8 (`16×32`) + WMMA FP16 FlashAttention-2 |
+| **Short Prompt TTFT (`27 tok`)** | **51.2 ms** | Split-K WMMA router + `Q4_0_SOA` |
+| **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **32.5 ms** | Prefix-cache affinity hit |
+| **Single-User Decode (`B=1`, no-spec)** | **93.5 tok/s** | `hipGraph`-captured 48-visit loop + `half2` KV attention |
+| **Single-User Decode (DSpark `K=4..6`, code)** | **137.1 – 138.9 tok/s** | `hipGraph` draft (`2.76 ms`) + verify (`21.87 ms`, `emit=3.46`) |
+| **Multi-User Decode (`B=8`, no-spec)** | **238.2 agg tok/s** | `29.8 tok/s/user` (`hipGraph` + fused `moe_gu_sudot4_to_q8`) |
+| **Multi-User Decode (`B=4`, DSpark `K=4`)** | **261.1 agg tok/s** | **`65.3 tok/s/user`** (`verify_multi` `hipGraph`, `emit=3.24/user`) |
+| **Multi-User Decode (`B=8`, DSpark `K=4`)** | **351.6 agg tok/s** | **`44.0 tok/s/user`** (`+48%` over `B=8` no-spec, `emit=3.30/user`) |
+| **Multi-User Decode (`B=16`, no-spec)** | **448.5 agg tok/s** | `28.0 tok/s/user` |
+| **Multi-User Decode (`B=32`, no-spec)** | **688.0 agg tok/s** | `21.5 tok/s/user` (~83% of peak R9700 HBM bandwidth) |
+| **Multi-User Decode (`B=64`, no-spec)** | **963.5 agg tok/s** | `15.1 tok/s/user` (WMMA INT8 MoE active at `B >= 48`) |
+| **Multi-User Decode (`B=128`, no-spec)** | **1,266.3 agg tok/s** | `9.9 tok/s/user` |
 
 ---
 

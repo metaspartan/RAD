@@ -84,9 +84,9 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| "./models/tokenizer.json".into());
     let tok = Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut eng = InklingEngine::load(Path::new(&model_path), 4096)?;
+    let mut eng = InklingEngine::load_multi(Path::new(&model_path), 2048, 8)?;
     eng.capture_decode_graph()?;
-    let mut drafter = DsparkDrafter::load(Path::new(&draft_path), 4096)?;
+    let mut drafter = DsparkDrafter::load_multi(Path::new(&draft_path), 2048, 8)?;
 
     let prompts = [
         ("code", "Write a complete Python implementation of an LRU cache using OrderedDict with get and put methods, plus a short usage example."),
@@ -114,6 +114,86 @@ fn main() -> Result<()> {
                 println!("  FIRST DIFF at {diff}: ref={:?} spec={:?}", ref_out.get(diff), spec_out.get(diff));
             }
         }
+    }
+    for (n_users, k_len) in [(4usize, 4usize), (8usize, 4usize)] {
+        let code_prompt = "Write a complete Python implementation of an LRU cache using OrderedDict with get and put methods, plus a short usage example.";
+        let ids: Vec<i32> = tok.encode(fmt_prompt(code_prompt), false).unwrap().get_ids().iter().map(|&x| x as i32).collect();
+        let seq_ids: Vec<i32> = (0..n_users as i32).collect();
+        let mut cur_toks = vec![0i32; n_users];
+        for u in 0..n_users {
+            eng.reset_seq(u)?;
+            drafter.reset_seq(u);
+            let (first, _) = eng.prefill_seq(u, &ids)?;
+            for j in 0..ids.len() {
+                let fptr = eng.gather_batch_dspark_feats(j);
+                drafter.inject_target_feats_seq(u, fptr, j as i32)?;
+            }
+            cur_toks[u] = first;
+            let _ = drafter.draft_seq(u, first, &eng, k_len)?;
+        }
+        let dummy_drafts: Vec<Vec<i32>> = (0..n_users).map(|u| vec![cur_toks[u]; k_len]).collect();
+        let _ = eng.verify_multi(&seq_ids, &dummy_drafts)?;
+        for u in 0..n_users {
+            eng.reset_seq(u)?;
+            drafter.reset_seq(u);
+            let (first, _) = eng.prefill_seq(u, &ids)?;
+            for j in 0..ids.len() {
+                let fptr = eng.gather_batch_dspark_feats(j);
+                drafter.inject_target_feats_seq(u, fptr, j as i32)?;
+            }
+            cur_toks[u] = first;
+        }
+        let mut outs: Vec<Vec<u32>> = vec![Vec::new(); n_users];
+        let mut total_emitted = 0usize;
+        let mut rounds = 0usize;
+        let mut draft_ms = 0.0f64;
+        let mut verify_ms = 0.0f64;
+        let t0 = Instant::now();
+        for _ in 0..24 {
+            let td = Instant::now();
+            let mut drafts = Vec::with_capacity(n_users);
+            for u in 0..n_users {
+                drafts.push(drafter.draft_seq(u, cur_toks[u], &eng, k_len)?);
+            }
+            draft_ms += td.elapsed().as_secs_f64() * 1000.0;
+
+            let pos_before: Vec<i32> = (0..n_users).map(|u| eng.seq_pos[u]).collect();
+            let tv = Instant::now();
+            let preds = eng.verify_multi(&seq_ids, &drafts)?;
+            verify_ms += tv.elapsed().as_secs_f64() * 1000.0;
+
+            let mut n_acc = vec![1usize; n_users];
+            for u in 0..n_users {
+                let mut acc = 1usize;
+                for j in 0..(k_len - 1) {
+                    if preds[u][j] == drafts[u][j + 1] {
+                        acc += 1;
+                    } else {
+                        break;
+                    }
+                }
+                n_acc[u] = acc;
+                for j in 0..acc {
+                    outs[u].push(drafts[u][j] as u32);
+                    let fptr = eng.gather_batch_dspark_feats(u * k_len + j);
+                    drafter.inject_target_feats_seq(u, fptr, pos_before[u] + j as i32)?;
+                }
+                cur_toks[u] = preds[u][acc - 1];
+                total_emitted += acc;
+            }
+            eng.rewind_verify_multi(&seq_ids, &n_acc, k_len)?;
+            rounds += 1;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let agg = total_emitted as f64 / dt;
+        let per_user = agg / n_users as f64;
+        let avg_emit = total_emitted as f64 / (rounds * n_users) as f64;
+        println!(
+            "[multi_spec B={n_users} K={k_len}]: {total_emitted} tok in {dt:.3}s = {agg:.1} agg tok/s ({per_user:.1} tok/s/user) | emit={avg_emit:.2}/user draft={:.2}ms verify={:.2}ms",
+            draft_ms / rounds as f64, verify_ms / rounds as f64
+        );
+        let sample = tok.decode(&outs[0], true).unwrap_or_default();
+        println!("  user[0]: {:?}", sample.chars().take(100).collect::<String>());
     }
     Ok(())
 }
