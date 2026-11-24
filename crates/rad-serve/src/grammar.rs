@@ -426,6 +426,10 @@ pub fn parse_single_tool_call(
         }
         let arguments = if val.get("arguments").is_some() || val.get("args").is_some() {
             extract_args_str(&val)
+        } else if let Some(obj) = val.as_object() {
+            let mut cleaned = obj.clone();
+            cleaned.remove("name");
+            serde_json::to_string(&Value::Object(cleaned)).unwrap_or_else(|_| "{}".into())
         } else {
             serde_json::to_string(&val).unwrap_or_else(|_| "{}".into())
         };
@@ -825,7 +829,16 @@ mod tests {
         .unwrap();
         assert_eq!(tc2.arguments, r#"{"command":"ls"}"#);
 
-        assert!(parse_single_tool_call("not valid json at all", "exec", &allowed, "c2".into()).is_none());
+        let tc3 = parse_single_tool_call(
+            r#"{"name":"exec","command":"git log -1"}"#,
+            "exec",
+            &allowed,
+            "c2".into(),
+        )
+        .unwrap();
+        assert_eq!(tc3.arguments, r#"{"command":"git log -1"}"#);
+
+        assert!(parse_single_tool_call("not valid json at all", "exec", &allowed, "c3".into()).is_none());
     }
 
     #[test]

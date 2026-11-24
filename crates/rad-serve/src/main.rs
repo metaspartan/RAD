@@ -581,8 +581,9 @@ fn format_prompt_with_tools(
                                 Some(v) if v.is_object() => v.clone(),
                                 _ => json!({}),
                             };
-                            let call_json = serde_json::to_string(&json!({"name": name, "args": args_val}))
-                                .unwrap_or_else(|_| format!("{{\"name\":\"{name}\",\"args\":{{}}}}"));
+                            let name_json = serde_json::to_string(name).unwrap_or_else(|_| format!("\"{name}\""));
+                            let args_json = serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".into());
+                            let call_json = format!("{{\"name\":{name_json},\"args\":{args_json}}}");
                             s.push_str("<|message_model|>");
                             s.push_str(name);
                             s.push_str("<|content_invoke_tool_json|>");
@@ -630,7 +631,7 @@ fn format_prompt_with_tools(
     if enable_thinking {
         s.push_str("<|message_model|><|content_thinking|>");
     } else {
-        s.push_str("<|message_model|><|content_thinking|><|content_text|>");
+        s.push_str("<|message_model|><|content_text|>");
     }
     (s, images, allowed_tools)
 }
@@ -1659,10 +1660,12 @@ async fn chat_completions(
             let mut sent_role = false;
             let mut tc_index = 0usize;
             let mut prompt_n_sse = 0usize;
+            let mut cached_n_sse = 0usize;
             while let Some(ev) = rx.recv().await {
                 match ev {
-                    GenEvent::Prefill { prompt_n, .. } => {
+                    GenEvent::Prefill { prompt_n, cached_n, .. } => {
                         prompt_n_sse = prompt_n;
+                        cached_n_sse = cached_n;
                     }
                     GenEvent::Token(t) => {
                         let deltas = parser.push_token(t, &tok);
@@ -1763,7 +1766,8 @@ async fn chat_completions(
                                 "usage": {
                                     "prompt_tokens": prompt_n_sse,
                                     "completion_tokens": pred_n,
-                                    "total_tokens": prompt_n_sse + pred_n
+                                    "total_tokens": prompt_n_sse + pred_n,
+                                    "prompt_tokens_details": {"cached_tokens": cached_n_sse}
                                 }
                             });
                             let _ = sse_tx.send(Ok(Event::default().data(usage_chunk.to_string())));
