@@ -4,9 +4,10 @@ mod metrics;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        Path as AxumPath, Query, Request, State,
     },
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -47,6 +48,7 @@ struct GenJob {
     #[allow(dead_code)]
     enable_thinking: bool,
     json_grammar: bool,
+    sampling: grammar::SamplingParams,
     tx: mpsc::UnboundedSender<GenEvent>,
 }
 
@@ -169,6 +171,7 @@ struct ActiveSlot {
     #[allow(dead_code)]
     enable_thinking: bool,
     grammar: Option<grammar::JsonGrammarState>,
+    sampling: grammar::SamplingParams,
     started_at: Instant,
     last_tok_at: Instant,
     tx: mpsc::UnboundedSender<GenEvent>,
@@ -305,6 +308,12 @@ struct ChatTemplateKwargs {
     enable_thinking: Option<bool>,
 }
 
+#[derive(Deserialize, Default)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: Option<bool>,
+}
+
 #[derive(Deserialize)]
 struct ChatRequest {
     #[serde(default)]
@@ -316,6 +325,14 @@ struct ChatRequest {
     max_completion_tokens: Option<usize>,
     #[serde(default)]
     stream: Option<bool>,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
     #[serde(default)]
     tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
@@ -460,6 +477,41 @@ fn normalize_tool_specs(tools: &[serde_json::Value]) -> (Vec<serde_json::Value>,
         }
     }
     (specs, names)
+}
+
+fn detect_repeated_tool_loop(messages: &[ChatMessage]) -> bool {
+    let mut recent_sigs: Vec<String> = Vec::new();
+    for m in messages.iter().rev() {
+        if m.role == "assistant" {
+            if let Some(ref tcs) = m.tool_calls {
+                if !tcs.is_empty() {
+                    let mut parts = Vec::new();
+                    for tc in tcs {
+                        let fn_obj = tc.get("function").unwrap_or(tc);
+                        let name = fn_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let args = fn_obj
+                            .get("arguments")
+                            .or_else(|| fn_obj.get("args"))
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.trim().to_string(),
+                                other => serde_json::to_string(other).unwrap_or_default(),
+                            })
+                            .unwrap_or_default();
+                        parts.push(format!("{name}:{args}"));
+                    }
+                    recent_sigs.push(parts.join("|"));
+                    if recent_sigs.len() >= 4 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if recent_sigs.len() < 2 {
+        return false;
+    }
+    let last = &recent_sigs[0];
+    recent_sigs[1..].iter().any(|prev| prev == last)
 }
 
 fn format_prompt_with_tools(
@@ -937,9 +989,14 @@ fn run_scheduler(
                         let _ = engine.paged_kv.ensure_tokens(seq, engine.seq_pos[seq] as usize, &engine.seq_tokens[seq]);
                         sync_kv_metrics(&engine, &metrics);
                         let mut gram = if job.json_grammar { Some(grammar::JsonGrammarState::new_json()) } else { None };
+                        let mut sampling = job.sampling;
                         if let Some(ref mut g) = gram {
                             if let Ok(logits) = engine.read_batch_logits(0) {
                                 first_tok = vocab_grammar.select_best_token(&logits, g);
+                            }
+                        } else if !sampling.is_greedy() {
+                            if let Ok(logits) = engine.read_batch_logits(0) {
+                                first_tok = grammar::sample_from_logits(&logits, &engine.seq_tokens[seq], &mut sampling);
                             }
                         }
                         let _ = job.tx.send(GenEvent::Prefill { prompt_n: job.prompt_ids.len(), cached_n, pp_ms });
@@ -956,7 +1013,7 @@ fn run_scheduler(
                                 let now = Instant::now();
                                 active.push(ActiveSlot {
                                     seq, next_tok: first_tok, max_tokens: job.max_tokens, emitted: 1,
-                                    enable_thinking: job.enable_thinking, grammar: gram,
+                                    enable_thinking: job.enable_thinking, grammar: gram, sampling,
                                     started_at: now, last_tok_at: now, tx: job.tx,
                                 });
                             }
@@ -1041,9 +1098,14 @@ fn run_scheduler(
                         metrics.prefill_us_total.fetch_add((pp_s * 1e6) as u64, Ordering::Relaxed);
                         metrics.observe_ttft(pp_s);
                         let mut gram = if pf.job.json_grammar { Some(grammar::JsonGrammarState::new_json()) } else { None };
+                        let mut sampling = pf.job.sampling;
                         if let Some(ref mut g) = gram {
                             if let Ok(logits) = engine.read_batch_logits(0) {
                                 last_tok = vocab_grammar.select_best_token(&logits, g);
+                            }
+                        } else if !sampling.is_greedy() {
+                            if let Ok(logits) = engine.read_batch_logits(0) {
+                                last_tok = grammar::sample_from_logits(&logits, &engine.seq_tokens[pf.seq], &mut sampling);
                             }
                         }
                         let _ = pf.job.tx.send(GenEvent::Prefill {
@@ -1073,6 +1135,7 @@ fn run_scheduler(
                                     emitted: 1,
                                     enable_thinking: pf.job.enable_thinking,
                                     grammar: gram,
+                                    sampling,
                                     started_at: now,
                                     last_tok_at: now,
                                     tx: pf.job.tx,
@@ -1096,7 +1159,7 @@ fn run_scheduler(
             continue;
         }
 
-        let any_grammar = active.iter().any(|a| a.grammar.is_some());
+        let any_grammar = active.iter().any(|a| a.grammar.is_some() || !a.sampling.is_greedy());
 
         if active.len() == 1 && !any_grammar {
             if let Some(ref mut d) = drafter {
@@ -1302,6 +1365,10 @@ fn run_scheduler(
                         if let Ok(logits) = engine.read_batch_logits(u) {
                             nxt = vocab_grammar.select_best_token(&logits, g);
                         }
+                    } else if !slot.sampling.is_greedy() {
+                        if let Ok(logits) = engine.read_batch_logits(u) {
+                            nxt = grammar::sample_from_logits(&logits, &engine.seq_tokens[slot.seq], &mut slot.sampling);
+                        }
                     }
                     let _ = engine.paged_kv.ensure_tokens(slot.seq, engine.seq_pos[slot.seq] as usize, &engine.seq_tokens[slot.seq]);
                     let is_stop = nxt == 200006 || nxt == 199999;
@@ -1354,10 +1421,11 @@ async fn collect_job(
     #[allow(dead_code)]
     enable_thinking: bool,
     json_grammar: bool,
+    sampling: grammar::SamplingParams,
 ) -> Result<(Vec<u32>, usize, usize, f64, f64, &'static str), String> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let in_flight = st
-        .dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking, json_grammar, tx })
+        .dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking, json_grammar, sampling, tx })
         .map_err(|_| "scheduler closed".to_string())?;
     let mut out_ids = Vec::with_capacity(max_tokens.min(4096));
     let mut prompt_n = 0usize;
@@ -1425,6 +1493,48 @@ async fn metrics_endpoint(State(st): State<Arc<AppState>>, headers: HeaderMap) -
         .into_response()
 }
 
+async fn cors_and_req_id(req: Request, next: Next) -> Response {
+    let rid = next_id("req");
+    if req.method() == Method::OPTIONS {
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        let h = resp.headers_mut();
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
+        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Authorization, Content-Type, X-API-Key"));
+        if let Ok(v) = HeaderValue::from_str(&rid) {
+            h.insert("x-request-id", v);
+        }
+        return resp;
+    }
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    if let Ok(v) = HeaderValue::from_str(&rid) {
+        h.insert("x-request-id", v);
+    }
+    resp
+}
+
+async fn model_by_id(State(st): State<Arc<AppState>>, headers: HeaderMap, AxumPath(id): AxumPath<String>) -> Response {
+    if !check_auth_keys(&headers, &st.api_keys) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
+    }
+    let now = now_unix();
+    Json(json!({
+        "id": id,
+        "object": "model",
+        "created": now,
+        "owned_by": "rad",
+        "capabilities": {
+            "speculative_decoding": st.spec_enabled,
+            "spec_mode": st.spec_mode,
+            "vision": st.vision_enabled,
+            "mmproj_detected": st.mmproj_path.is_some()
+        }
+    }))
+    .into_response()
+}
+
 async fn models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !check_auth_keys(&headers, &st.api_keys) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
@@ -1475,8 +1585,34 @@ async fn chat_completions(
     let response_json = req.response_format.as_ref().and_then(|rf| rf.get("type")).and_then(|t| t.as_str()).map(|t| t == "json_object" || t == "json_schema").unwrap_or(false);
     let json_grammar = force_tool_json || response_json;
     let initial_thinking = enable_thinking && !json_grammar;
+    let include_usage = req.stream_options.as_ref().and_then(|o| o.include_usage).unwrap_or(false);
+    let loop_detected = detect_repeated_tool_loop(&req.messages);
+    let mut sampling = grammar::SamplingParams::greedy();
+    if loop_detected {
+        sampling = grammar::SamplingParams {
+            temperature: req.temperature.unwrap_or(0.7).max(0.5),
+            top_p: req.top_p.unwrap_or(0.95),
+            repetition_penalty: req.repetition_penalty.unwrap_or(1.18).max(1.15),
+            seed: now_unix() ^ REQ_SEQ.load(Ordering::Relaxed),
+        };
+    } else if let Some(rep) = req.repetition_penalty {
+        if (rep - 1.0).abs() > 1e-4 {
+            sampling = grammar::SamplingParams {
+                temperature: req.temperature.unwrap_or(0.0),
+                top_p: req.top_p.unwrap_or(0.95),
+                repetition_penalty: rep,
+                seed: now_unix() ^ REQ_SEQ.load(Ordering::Relaxed),
+            };
+        }
+    }
 
     let (mut prompt, images, allowed_tools) = format_prompt_with_tools(&req.messages, req.tools.as_deref(), initial_thinking);
+    if loop_detected {
+        let nudge = "<|message_system|><|content_text|>You already ran that exact tool call and received its output above. Do NOT repeat the same command again — inspect something new or summarize your findings now.<|end_message|>";
+        if let Some(pos) = prompt.rfind("<|message_model|>") {
+            prompt.insert_str(pos, nudge);
+        }
+    }
     if force_tool_json {
         let extra = if let Some(ref fn_name) = forced_tool_name {
             format!("<|message_system|><|content_text|>You MUST call tool `{fn_name}` by responding ONLY with valid JSON: {{\"name\": \"{fn_name}\", \"arguments\": {{...}}}}.<|end_message|>")
@@ -1507,7 +1643,7 @@ async fn chat_completions(
 
     if stream {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let in_flight = match st.dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking: initial_thinking, json_grammar, tx }) {
+        let in_flight = match st.dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking: initial_thinking, json_grammar, sampling, tx }) {
             Ok(g) => InFlightGuard(g),
             Err(_) => {
                 st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
@@ -1522,9 +1658,12 @@ async fn chat_completions(
             let mut parser = grammar::InklingStreamParser::new(initial_thinking, call_prefix, allowed_tools);
             let mut sent_role = false;
             let mut tc_index = 0usize;
+            let mut prompt_n_sse = 0usize;
             while let Some(ev) = rx.recv().await {
                 match ev {
-                    GenEvent::Prefill { .. } => {}
+                    GenEvent::Prefill { prompt_n, .. } => {
+                        prompt_n_sse = prompt_n;
+                    }
                     GenEvent::Token(t) => {
                         let deltas = parser.push_token(t, &tok);
                         for d in deltas {
@@ -1575,7 +1714,7 @@ async fn chat_completions(
                             let _ = sse_tx.send(Ok(Event::default().data(chunk.to_string())));
                         }
                     }
-                    GenEvent::Done { finish_reason, .. } => {
+                    GenEvent::Done { finish_reason, pred_n, .. } => {
                         for d in parser.finish(&tok) {
                             if let grammar::StreamDelta::ToolCall(tc) = d {
                                 let idx = tc_index;
@@ -1614,6 +1753,21 @@ async fn chat_completions(
                             "choices": [{"index": 0, "delta": {}, "finish_reason": final_fr}]
                         });
                         let _ = sse_tx.send(Ok(Event::default().data(done_chunk.to_string())));
+                        if include_usage {
+                            let usage_chunk = json!({
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": prompt_n_sse,
+                                    "completion_tokens": pred_n,
+                                    "total_tokens": prompt_n_sse + pred_n
+                                }
+                            });
+                            let _ = sse_tx.send(Ok(Event::default().data(usage_chunk.to_string())));
+                        }
                         let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
                         break;
                     }
@@ -1630,7 +1784,7 @@ async fn chat_completions(
     }
 
     let (out_ids, prompt_n, cached_n, pp_ms, dec_ms, mut finish_reason) =
-        match collect_job(&st, prompt_ids, images, max_tokens, initial_thinking, json_grammar).await {
+        match collect_job(&st, prompt_ids, images, max_tokens, initial_thinking, json_grammar, sampling).await {
             Ok(v) => v,
             Err(e) => {
                 st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
@@ -1711,7 +1865,7 @@ async fn completions(
         let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
         let st_c = st.clone();
         handles.push(tokio::spawn(async move {
-            collect_job(&st_c, prompt_ids, Vec::new(), max_tokens, false, false).await
+            collect_job(&st_c, prompt_ids, Vec::new(), max_tokens, false, false, grammar::SamplingParams::greedy()).await
         }));
     }
 
@@ -1796,7 +1950,7 @@ async fn responses_http(
 
     if stream {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let in_flight = match st.dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking, json_grammar: false, tx }) {
+        let in_flight = match st.dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking, json_grammar: false, sampling: grammar::SamplingParams::greedy(), tx }) {
             Ok(g) => InFlightGuard(g),
             Err(_) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response();
@@ -1980,7 +2134,7 @@ async fn responses_http(
     }
 
     let (out_ids, prompt_n, cached_n, pp_ms, dec_ms, _) =
-        match collect_job(&st, prompt_ids, images, max_tokens, enable_thinking, false).await {
+        match collect_job(&st, prompt_ids, images, max_tokens, enable_thinking, false, grammar::SamplingParams::greedy()).await {
             Ok(v) => v,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
         };
@@ -2080,7 +2234,7 @@ async fn handle_ws(mut socket: WebSocket, st: Arc<AppState>) {
         let call_prefix = next_id("call");
         let msg_id = next_id("msg");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _guard = match st.dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking: false, json_grammar: false, tx }) {
+        let _guard = match st.dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking: false, json_grammar: false, sampling: grammar::SamplingParams::greedy(), tx }) {
             Ok(g) => InFlightGuard(g),
             Err(_) => {
                 let _ = socket.send(Message::Text(json!({"type":"error","error":"scheduler closed"}).to_string())).await;
@@ -2981,9 +3135,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(models))
+        .route("/v1/models/:id", get(model_by_id))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/responses", post(responses_http).get(responses_ws))
+        .layer(middleware::from_fn(cors_and_req_id))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", opts.port)).await?;

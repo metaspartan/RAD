@@ -368,6 +368,39 @@ fn extract_args_str(item: &Value) -> String {
     }
 }
 
+fn extract_balanced_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for i in start..bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else {
+            match b {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&s[start..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 pub fn parse_single_tool_call(
     payload: &str,
     fallback_name: &str,
@@ -379,61 +412,148 @@ pub fn parse_single_tool_call(
         return None;
     }
     let fb = fallback_name.trim();
-    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-        if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
-            if !allowed_tools.is_empty() && !allowed_tools.iter().any(|a| a == name) {
-                return None;
-            }
-            return Some(ParsedToolCall {
-                id: call_id,
-                name: name.to_string(),
-                arguments: extract_args_str(&val),
-            });
+    let try_parse = |json_str: &str, cand_name: &str| -> Option<ParsedToolCall> {
+        let val = serde_json::from_str::<Value>(json_str).ok()?;
+        if !val.is_object() {
+            return None;
         }
-        if !fb.is_empty() {
-            if !allowed_tools.is_empty() && !allowed_tools.iter().any(|a| a == fb) {
-                return None;
-            }
-            let args_str = serde_json::to_string(&val).unwrap_or_else(|_| "{}".into());
-            return Some(ParsedToolCall {
-                id: call_id,
-                name: fb.to_string(),
-                arguments: args_str,
-            });
+        let name = val
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(cand_name);
+        if name.is_empty() || (!allowed_tools.is_empty() && !allowed_tools.iter().any(|a| a == name)) {
+            return None;
         }
+        let arguments = if val.get("arguments").is_some() || val.get("args").is_some() {
+            extract_args_str(&val)
+        } else {
+            serde_json::to_string(&val).unwrap_or_else(|_| "{}".into())
+        };
+        Some(ParsedToolCall {
+            id: call_id.clone(),
+            name: name.to_string(),
+            arguments,
+        })
+    };
+    if let Some(tc) = try_parse(trimmed, fb) {
+        return Some(tc);
     }
     if let Some(brace) = trimmed.find('{') {
         let prefix = trimmed[..brace].trim();
-        let json_part = trimmed[brace..].trim();
         let cand_name = if !prefix.is_empty() { prefix } else { fb };
-        if let Ok(val) = serde_json::from_str::<Value>(json_part) {
-            let name = val
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or(cand_name);
-            if !name.is_empty() && (allowed_tools.is_empty() || allowed_tools.iter().any(|a| a == name)) {
-                let arguments = if val.get("arguments").is_some() || val.get("args").is_some() {
-                    extract_args_str(&val)
-                } else {
-                    serde_json::to_string(&val).unwrap_or_else(|_| "{}".into())
-                };
-                return Some(ParsedToolCall {
-                    id: call_id,
-                    name: name.to_string(),
-                    arguments,
-                });
+        if let Some(tc) = try_parse(trimmed[brace..].trim(), cand_name) {
+            return Some(tc);
+        }
+        if let Some(bal) = extract_balanced_json_object(trimmed) {
+            if let Some(tc) = try_parse(bal, cand_name) {
+                return Some(tc);
             }
         }
     }
-    if !fb.is_empty() && (allowed_tools.is_empty() || allowed_tools.iter().any(|a| a == fb)) {
-        let args_str = serde_json::json!({"input": trimmed}).to_string();
-        return Some(ParsedToolCall {
-            id: call_id,
-            name: fb.to_string(),
-            arguments: args_str,
-        });
-    }
     None
+}
+
+#[derive(Clone, Copy)]
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub repetition_penalty: f32,
+    pub seed: u64,
+}
+
+impl SamplingParams {
+    pub fn greedy() -> Self {
+        Self {
+            temperature: 0.0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            seed: 0,
+        }
+    }
+
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= 1e-5 && (self.repetition_penalty - 1.0).abs() <= 1e-4
+    }
+}
+
+pub fn sample_from_logits(logits: &[f32], recent_tokens: &[i32], params: &mut SamplingParams) -> i32 {
+    let n = logits.len();
+    if n == 0 {
+        return 0;
+    }
+    let rep = params.repetition_penalty;
+    let temp = params.temperature.max(1e-4);
+    let mut top: Vec<(f32, usize)> = Vec::with_capacity(64);
+    let mut min_top = f32::NEG_INFINITY;
+    let mut recent_set: Vec<usize> = Vec::new();
+    if (rep - 1.0).abs() > 1e-4 {
+        let start = recent_tokens.len().saturating_sub(128);
+        for &t in &recent_tokens[start..] {
+            if t >= 0 && (t as usize) < n {
+                recent_set.push(t as usize);
+            }
+        }
+        recent_set.sort_unstable();
+        recent_set.dedup();
+    }
+    for (i, &raw) in logits.iter().enumerate() {
+        let mut v = raw;
+        if !recent_set.is_empty() && recent_set.binary_search(&i).is_ok() {
+            v = if v > 0.0 { v / rep } else { v * rep };
+        }
+        if top.len() < 64 {
+            top.push((v, i));
+            if top.len() == 64 {
+                top.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+                min_top = top[63].0;
+            }
+        } else if v > min_top {
+            top[63] = (v, i);
+            let mut k = 63;
+            while k > 0 && top[k].0 > top[k - 1].0 {
+                top.swap(k, k - 1);
+                k -= 1;
+            }
+            min_top = top[63].0;
+        }
+    }
+    top.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    if params.temperature <= 1e-5 {
+        return top[0].1 as i32;
+    }
+    let max_l = top[0].0;
+    let mut probs: Vec<(f32, usize)> = Vec::with_capacity(top.len());
+    let mut sum = 0.0f32;
+    for &(v, idx) in &top {
+        let p = ((v - max_l) / temp).exp();
+        probs.push((p, idx));
+        sum += p;
+    }
+    if sum <= 0.0 || !sum.is_finite() {
+        return top[0].1 as i32;
+    }
+    let top_p = params.top_p.clamp(0.05, 1.0);
+    let mut cum = 0.0f32;
+    let mut keep = probs.len();
+    for (k, &(p, _)) in probs.iter().enumerate() {
+        cum += p / sum;
+        if cum >= top_p {
+            keep = (k + 1).max(1);
+            break;
+        }
+    }
+    probs.truncate(keep);
+    let kept_sum: f32 = probs.iter().map(|x| x.0).sum();
+    params.seed = params.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let r = (((params.seed >> 33) as u32) as f32 / (u32::MAX as f32)) * kept_sum;
+    let mut acc = 0.0f32;
+    for &(p, idx) in &probs {
+        acc += p;
+        if acc >= r {
+            return idx as i32;
+        }
+    }
+    probs[0].1 as i32
 }
 
 pub fn parse_tool_calls(text: &str, allowed_tools: &[String]) -> Option<Vec<Value>> {
@@ -676,5 +796,47 @@ pub fn parse_inkling_tokens(
         reasoning,
         content,
         tool_calls,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_native_args_and_balanced_json() {
+        let allowed = vec!["exec".to_string()];
+        let tc = parse_single_tool_call(
+            r#"{"name":"exec","args":{"command":"git status"}}"#,
+            "exec",
+            &allowed,
+            "c0".into(),
+        )
+        .unwrap();
+        assert_eq!(tc.name, "exec");
+        assert_eq!(tc.arguments, r#"{"command":"git status"}"#);
+
+        let tc2 = parse_single_tool_call(
+            r#"exec{"name":"exec","args":{"command":"ls"}} trailing junk"#,
+            "exec",
+            &allowed,
+            "c1".into(),
+        )
+        .unwrap();
+        assert_eq!(tc2.arguments, r#"{"command":"ls"}"#);
+
+        assert!(parse_single_tool_call("not valid json at all", "exec", &allowed, "c2".into()).is_none());
+    }
+
+    #[test]
+    fn sampling_repetition_penalty_shifts_top_token() {
+        let logits = vec![5.0f32, 4.5f32, 1.0f32];
+        let mut p = SamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            repetition_penalty: 1.2,
+            seed: 42,
+        };
+        assert_eq!(sample_from_logits(&logits, &[0], &mut p), 1);
     }
 }
