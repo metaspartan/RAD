@@ -607,7 +607,7 @@ impl InklingEngine {
             moe_act: DevBuf::new(mb * cfg.n_expert_used * cfg.n_ff_exp * 4).map_err(he)?,
             moe_dn_slots: DevBuf::new(mb * cfg.n_expert_used * e * 4).map_err(he)?,
             moe_raw: DevBuf::new(mb * e * 4).map_err(he)?,
-            logits: DevBuf::new((max_seqs.min(8) * 8).max(max_seqs).max(32) * cfg.vocab_padded * 4).map_err(he)?,
+            logits: DevBuf::new((max_seqs.min(8) * 8).max(max_seqs).max(64) * cfg.vocab_padded * 4).map_err(he)?,
             dspark_feats: DevBuf::new(4 * mb * e * 4).map_err(he)?,
             xq: DevBuf::new(3 * mb * (q_dim / 32) * 40).map_err(he)?,
             act_q: DevBuf::new(mb * cfg.n_expert_used * (cfg.n_ff_exp / 32) * 40).map_err(he)?,

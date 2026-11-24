@@ -224,6 +224,7 @@ struct AppState {
     mmproj_path: Option<String>,
     prefill_chunk_size: usize,
     kv_block_size: usize,
+    max_ctx: usize,
     port: u16,
 }
 
@@ -284,6 +285,7 @@ struct Health {
     prefill_chunk_size: usize,
     grammar_constraints: bool,
     metrics_enabled: bool,
+    max_ctx: usize,
     port: u16,
 }
 
@@ -315,6 +317,35 @@ struct StreamOptions {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum StopInput {
+    Single(String),
+    Multi(Vec<String>),
+}
+
+impl StopInput {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            StopInput::Single(s) => if s.is_empty() { Vec::new() } else { vec![s] },
+            StopInput::Multi(v) => v.into_iter().filter(|s| !s.is_empty()).collect(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TokenizeRequest {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DetokenizeRequest {
+    tokens: Vec<u32>,
+}
+
+#[derive(Deserialize)]
 struct ChatRequest {
     #[serde(default)]
     model: Option<String>,
@@ -333,6 +364,14 @@ struct ChatRequest {
     top_p: Option<f32>,
     #[serde(default)]
     repetition_penalty: Option<f32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    stop: Option<StopInput>,
     #[serde(default)]
     tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
@@ -1477,8 +1516,41 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<Health> {
         prefill_chunk_size: st.prefill_chunk_size,
         grammar_constraints: true,
         metrics_enabled: true,
+        max_ctx: st.max_ctx,
         port: st.port,
     })
+}
+
+async fn tokenize_endpoint(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TokenizeRequest>,
+) -> Response {
+    if !check_auth_keys(&headers, &st.api_keys) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
+    }
+    let text = req.prompt.or(req.text).unwrap_or_default();
+    match st.tokenizer.encode(text, false) {
+        Ok(enc) => {
+            let ids = enc.get_ids();
+            Json(json!({"tokens": ids, "count": ids.len(), "max_model_len": st.max_ctx})).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e}")}))).into_response(),
+    }
+}
+
+async fn detokenize_endpoint(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<DetokenizeRequest>,
+) -> Response {
+    if !check_auth_keys(&headers, &st.api_keys) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
+    }
+    match st.tokenizer.decode(&req.tokens, false) {
+        Ok(text) => Json(json!({"text": text})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e}")}))).into_response(),
+    }
 }
 
 async fn metrics_endpoint(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1587,24 +1659,26 @@ async fn chat_completions(
     let json_grammar = force_tool_json || response_json;
     let initial_thinking = enable_thinking && !json_grammar;
     let include_usage = req.stream_options.as_ref().and_then(|o| o.include_usage).unwrap_or(false);
+    let stop_seqs: Vec<String> = req.stop.map(|s| s.into_vec()).unwrap_or_default();
+    let base_seed = req.seed.unwrap_or_else(|| now_unix() ^ REQ_SEQ.load(Ordering::Relaxed));
+    let extra_pen = req.presence_penalty.unwrap_or(0.0).max(req.frequency_penalty.unwrap_or(0.0)).clamp(0.0, 2.0);
+    let eff_rep = req.repetition_penalty.unwrap_or_else(|| if extra_pen > 1e-4 { 1.0 + 0.15 * extra_pen } else { 1.0 });
     let loop_detected = detect_repeated_tool_loop(&req.messages);
     let mut sampling = grammar::SamplingParams::greedy();
     if loop_detected {
         sampling = grammar::SamplingParams {
             temperature: req.temperature.unwrap_or(0.7).max(0.5),
             top_p: req.top_p.unwrap_or(0.95),
-            repetition_penalty: req.repetition_penalty.unwrap_or(1.18).max(1.15),
-            seed: now_unix() ^ REQ_SEQ.load(Ordering::Relaxed),
+            repetition_penalty: eff_rep.max(1.15),
+            seed: base_seed,
         };
-    } else if let Some(rep) = req.repetition_penalty {
-        if (rep - 1.0).abs() > 1e-4 {
-            sampling = grammar::SamplingParams {
-                temperature: req.temperature.unwrap_or(0.0),
-                top_p: req.top_p.unwrap_or(0.95),
-                repetition_penalty: rep,
-                seed: now_unix() ^ REQ_SEQ.load(Ordering::Relaxed),
-            };
-        }
+    } else if (eff_rep - 1.0).abs() > 1e-4 {
+        sampling = grammar::SamplingParams {
+            temperature: req.temperature.unwrap_or(0.0),
+            top_p: req.top_p.unwrap_or(0.95),
+            repetition_penalty: eff_rep,
+            seed: base_seed,
+        };
     }
 
     let (mut prompt, images, allowed_tools) = format_prompt_with_tools(&req.messages, req.tools.as_deref(), initial_thinking);
@@ -1638,6 +1712,21 @@ async fn chat_completions(
         }
     };
     let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
+    if prompt_ids.len() >= st.max_ctx {
+        st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": format!("prompt has {} tokens which exceeds max_ctx {}", prompt_ids.len(), st.max_ctx),
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded"
+                }
+            })),
+        )
+            .into_response();
+    }
+    let max_tokens = max_tokens.min(st.max_ctx.saturating_sub(prompt_ids.len() + 1).max(1));
     let created = now_unix();
     let req_id = next_id("chatcmpl");
     let call_prefix = next_id("call");
@@ -1797,7 +1886,22 @@ async fn chat_completions(
         };
     st.metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
     let pred_n = out_ids.len();
-    let parsed = grammar::parse_inkling_tokens(&out_ids, &st.tokenizer, initial_thinking, &allowed_tools, &call_prefix);
+    let mut parsed = grammar::parse_inkling_tokens(&out_ids, &st.tokenizer, initial_thinking, &allowed_tools, &call_prefix);
+    if !stop_seqs.is_empty() && parsed.tool_calls.is_empty() {
+        let mut earliest: Option<usize> = None;
+        for ss in &stop_seqs {
+            if let Some(pos) = parsed.content.find(ss.as_str()) {
+                earliest = Some(match earliest {
+                    Some(cur) => cur.min(pos),
+                    None => pos,
+                });
+            }
+        }
+        if let Some(cut) = earliest {
+            parsed.content.truncate(cut);
+            finish_reason = "stop";
+        }
+    }
     let mut msg_obj = if !parsed.tool_calls.is_empty() {
         finish_reason = "tool_calls";
         let tcs: Vec<serde_json::Value> = parsed.tool_calls.iter().map(|tc| tc.to_chat_json()).collect();
@@ -2655,7 +2759,13 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
     println!("RAD Benchmark Suite (v{})", env!("CARGO_PKG_VERSION"));
     let t0 = Instant::now();
     let tokenizer = Tokenizer::from_file(tok_path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    let max_seqs = opts.max_seqs.max(16);
+    let max_seqs = if opts.ctx > 32768 {
+        opts.max_seqs.max(1)
+    } else if opts.ctx > 8192 {
+        opts.max_seqs.max(4)
+    } else {
+        opts.max_seqs.max(16)
+    };
     let mut engine = InklingEngine::load_multi(Path::new(&opts.model), opts.ctx.max(4096), max_seqs)?;
     engine.capture_decode_graph()?;
     let mut drafter = load_drafter(opts, &mut engine, max_seqs.min(8))?;
@@ -2890,6 +3000,67 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
             let agg = (b * steps) as f64 / t1.elapsed().as_secs_f64();
             let per_u = agg / b as f64;
             println!("| Multi-User B={b} (No-Spec) | {:.1} agg tok/s | {:.1} tok/s/user (ITL {:.1}ms) |", agg, per_u, 1000.0 / per_u);
+        }
+    }
+
+    if let Some(ref mut d) = drafter {
+        let k_len = d.spec_k();
+        let targets: &[usize] = &[2048, 4096, 8192, 16384, 32768, 65536, 131072];
+        let mut long_targets: Vec<usize> = targets
+            .iter()
+            .copied()
+            .filter(|&t| t <= opts.ctx)
+            .map(|t| t.min(opts.ctx.saturating_sub(256)))
+            .collect();
+        if long_targets.len() >= 2 {
+            println!();
+            println!("Long-Context Scaling (prefill + hybrid {spec_mode}/ngram K=48 decode):");
+            let block_txt = "function computeAttention(q, k, v, scale) { let acc = 0.0; for (let i = 0; i < q.length; i++) { acc += q[i] * k[i] * scale; } return acc; }\n";
+            let block_ids: Vec<i32> = tokenizer.encode(block_txt, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+            let prefix_p = format_prompt(&[ChatMessage { role: "user".into(), content: json!("Repeat the exact computeAttention helper functions below verbatim:\n"), tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }], false);
+            let mut prefix_ids: Vec<i32> = tokenizer.encode(prefix_p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+            let tail_ids = if prefix_ids.len() >= 2 { prefix_ids.split_off(prefix_ids.len() - 2) } else { Vec::new() };
+            for tgt in long_targets.drain(..) {
+                let mut ids = Vec::with_capacity(tgt + 64);
+                ids.extend_from_slice(&prefix_ids);
+                while ids.len() + block_ids.len() + tail_ids.len() <= tgt {
+                    ids.extend_from_slice(&block_ids);
+                }
+                ids.extend_from_slice(&tail_ids);
+                engine.reset_seq(0)?;
+                d.reset_seq(0);
+                let tp = Instant::now();
+                let (mut ct, _) = prefill_with_drafter(&mut engine, 0, &ids, &[], None, Some(d), None)?;
+                let pp_s = tp.elapsed().as_secs_f64();
+                let pp_tps = ids.len() as f64 / pp_s.max(1e-6);
+                let mut gen = 0usize;
+                let td = Instant::now();
+                while gen < 128 {
+                    let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[0], ct, 48) {
+                        ng
+                    } else {
+                        d.draft(ct, &engine, k_len)?
+                    };
+                    let dk = draft.len();
+                    let pos0 = engine.pos;
+                    let preds = engine.verify_batch(&draft)?;
+                    let mut n_acc = 1usize;
+                    for j in 0..(dk - 1) {
+                        if preds[j] == draft[j + 1] { n_acc += 1; } else { break; }
+                    }
+                    engine.rewind_verify_to(n_acc, dk)?;
+                    engine.seq_pos[0] = engine.pos;
+                    d.inject_batch_seq_async(0, &engine, 0, pos0, n_acc)?;
+                    for j in 0..n_acc {
+                        engine.seq_tokens[0].push(draft[j]);
+                    }
+                    ct = preds[n_acc - 1];
+                    gen += n_acc;
+                    if ct == 200006 || ct == 199999 { break; }
+                }
+                let dec_tps = gen as f64 / td.elapsed().as_secs_f64().max(1e-6);
+                println!("| Long-Ctx {:>6} tok | prefill {:>6.1} tok/s ({:.2}s) | decode {:>6.1} tok/s ({gen} tok) |", ids.len(), pp_tps, pp_s, dec_tps);
+            }
         }
     }
 
@@ -3133,6 +3304,7 @@ async fn main() -> anyhow::Result<()> {
         mmproj_path: opts.mmproj,
         prefill_chunk_size: opts.prefill_chunk_size,
         kv_block_size: opts.kv_block_size,
+        max_ctx: opts.ctx,
         port: opts.port,
     });
     let app = Router::new()
@@ -3140,6 +3312,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(models))
         .route("/v1/models/:id", get(model_by_id))
+        .route("/v1/tokenize", post(tokenize_endpoint))
+        .route("/v1/detokenize", post(detokenize_endpoint))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/responses", post(responses_http).get(responses_ws))
