@@ -1,0 +1,10 @@
+/target/
+**/*.rs.bk
+*.so
+*.o
+*.a
+*.b64
+*.pipe
+__pycache__/
+*.pyc
+.DS_Store

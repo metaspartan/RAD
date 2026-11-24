@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rad-hip",
+    "crates/rad-gguf",
+    "crates/rad-core",
+    "crates/rad-serve",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
