@@ -204,17 +204,25 @@ extern "C" __global__ void gemv_f32_k(const float* __restrict__ W,
                                       const float* __restrict__ x,
                                       float* __restrict__ y,
                                       int n, int k) {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * 2 + warp;
-    if (row >= n) return;
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int row = blockIdx.x * 8 + warp;
     int k4 = k >> 2;
-    const float4* w4 = reinterpret_cast<const float4*>(W + (size_t)row * k);
+    __shared__ float4 sx[576];
     const float4* x4 = reinterpret_cast<const float4*>(x);
+    bool use_sm = (k4 <= 576);
+    if (use_sm) {
+        for (int j = tid; j < k4; j += 256) sx[j] = x4[j];
+        __syncthreads();
+    }
+    if (row >= n) return;
+    const float4* w4 = reinterpret_cast<const float4*>(W + (size_t)row * k);
+    const float4* xsrc = use_sm ? sx : x4;
     float acc = 0.0f;
     for (int j = lane; j < k4; j += 32) {
         float4 wv = w4[j];
-        float4 xv = x4[j];
+        float4 xv = xsrc[j];
         acc = fmaf(wv.x, xv.x, acc);
         acc = fmaf(wv.y, xv.y, acc);
         acc = fmaf(wv.z, xv.z, acc);
@@ -1029,7 +1037,7 @@ extern "C" int ink_gemv_bf16(hipStream_t s, const uint16_t* W, const float* x, f
 }
 
 extern "C" int ink_gemv_f32(hipStream_t s, const float* W, const float* x, float* y, int n, int k) {
-    gemv_f32_k<<<dim3((n + 1) / 2), dim3(64), 0, s>>>(W, x, y, n, k);
+    gemv_f32_k<<<dim3((n + 7) / 8), dim3(256), 0, s>>>(W, x, y, n, k);
     return 0;
 }
 

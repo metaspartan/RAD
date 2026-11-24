@@ -1614,6 +1614,177 @@ extern "C" __global__ void loop_ctrl_up_wmma_k(const float* __restrict__ cur0,
     }
 }
 
+extern "C" __global__ void attn_batch_gqa3_flash_fp16_k(const float* __restrict__ Q,
+                                                        const float* __restrict__ R,
+                                                        const float* __restrict__ sinks,
+                                                        const float* __restrict__ rel_bias,
+                                                        const __half* __restrict__ k_cache,
+                                                        const __half* __restrict__ v_cache,
+                                                        const float* __restrict__ gate,
+                                                        const int* __restrict__ d_pos0,
+                                                        float* __restrict__ out,
+                                                        int n_head, int n_head_kv,
+                                                        int dh, int d_rel,
+                                                        int rel_extent, int swa_window,
+                                                        int is_swa, int max_ctx, int B) {
+    int kv_h = blockIdx.x;
+    int bt_blk = (gridDim.y - 1 - blockIdx.y) * 64;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    int col = lane & 15;
+    int half = lane >> 4;
+    int qsub = wid / 3;
+    int g = wid % 3;
+    int h = kv_h * 3 + g;
+    int pos0 = *d_pos0;
+    int q_dim = n_head * dh;
+    int r_dim = n_head * d_rel;
+
+    int bt_q = bt_blk + qsub * 16 + col;
+    bool vq = (bt_q < B);
+    int pos_q = pos0 + bt_q;
+    int t_start_q = is_swa ? max(0, pos_q - swa_window + 1) : 0;
+
+    int t_min = is_swa ? max(0, pos0 + bt_blk - swa_window + 1) : 0;
+    int t_max = pos0 + min(bt_blk + 64, B);
+
+    float q_scale = rsqrtf((float)dh);
+    wmma_h8_v q_reg[8];
+    float4 r_reg0 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 r_reg1 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 r_reg2 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 r_reg3 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float sink_q = 0.0f;
+    if (vq) {
+        const float* qh = Q + (size_t)bt_q * q_dim + (size_t)h * dh;
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+            int dbase = db * 16 + half * 8;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)(qh[dbase + j] * q_scale);
+        }
+        const float4* rh4 = reinterpret_cast<const float4*>(R + (size_t)bt_q * r_dim + (size_t)h * d_rel);
+        r_reg0 = rh4[0]; r_reg1 = rh4[1]; r_reg2 = rh4[2]; r_reg3 = rh4[3];
+        sink_q = sinks[(size_t)bt_q * n_head + h];
+    } else {
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)0.0f;
+        }
+    }
+
+    float m_q = 0.0f;
+    float l_q = 1.0f;
+    wmma_f8_v o_acc[8];
+#pragma unroll
+    for (int db = 0; db < 8; ++db) o_acc[db] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const _Float16* kc_h = reinterpret_cast<const _Float16*>(k_cache) + (size_t)kv_h * max_ctx * dh;
+    const _Float16* vc_h = reinterpret_cast<const _Float16*>(v_cache) + (size_t)kv_h * max_ctx * dh;
+
+    __shared__ _Float16 sm_k[16][136];
+    __shared__ _Float16 sm_vt[128][24];
+
+    for (int tile = t_min; tile < t_max; tile += 16) {
+        int n_kv = min(16, t_max - tile);
+        if (tid < 128) {
+            int tk_l = tid >> 3;
+            int d8_l = (tid & 7) * 16;
+            if (tk_l < n_kv) {
+                int kv_slot = is_swa ? ((tile + tk_l) % max_ctx) : (tile + tk_l);
+                const _Float16* kp = kc_h + (size_t)kv_slot * dh + d8_l;
+                const _Float16* vp = vc_h + (size_t)kv_slot * dh + d8_l;
+                *reinterpret_cast<uint4*>(&sm_k[tk_l][d8_l]) = *reinterpret_cast<const uint4*>(kp);
+                *reinterpret_cast<uint4*>(&sm_k[tk_l][d8_l + 8]) = *reinterpret_cast<const uint4*>(kp + 8);
+#pragma unroll
+                for (int j = 0; j < 16; ++j) sm_vt[d8_l + j][tk_l] = vp[j];
+            } else {
+                *reinterpret_cast<uint4*>(&sm_k[tk_l][d8_l]) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(&sm_k[tk_l][d8_l + 8]) = make_uint4(0, 0, 0, 0);
+#pragma unroll
+                for (int j = 0; j < 16; ++j) sm_vt[d8_l + j][tk_l] = (_Float16)0.0f;
+            }
+        }
+        __syncthreads();
+
+        wmma_f8_v s_v = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+            wmma_h8_v kv_v;
+            int dbase = db * 16 + half * 8;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) kv_v[j] = sm_k[col][dbase + j];
+            s_v = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(kv_v, q_reg[db], s_v);
+        }
+
+        float local_max = -1e30f;
+        float sc_arr[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int tk = half * 8 + i;
+            int t = tile + tk;
+            if (vq && tk < n_kv && t >= t_start_q && t <= pos_q) {
+                float sc = s_v[i] - sink_q;
+                int dist = pos_q - t;
+                if (dist < rel_extent) {
+                    const float4* rbp4 = reinterpret_cast<const float4*>(rel_bias + (size_t)dist * d_rel);
+                    float4 b0 = rbp4[0], b1 = rbp4[1], b2 = rbp4[2], b3 = rbp4[3];
+                    float rp = fmaf(b0.x, r_reg0.x, fmaf(b0.y, r_reg0.y, fmaf(b0.z, r_reg0.z, b0.w * r_reg0.w)));
+                    rp = fmaf(b1.x, r_reg1.x, fmaf(b1.y, r_reg1.y, fmaf(b1.z, r_reg1.z, fmaf(b1.w, r_reg1.w, rp))));
+                    rp = fmaf(b2.x, r_reg2.x, fmaf(b2.y, r_reg2.y, fmaf(b2.z, r_reg2.z, fmaf(b2.w, r_reg2.w, rp))));
+                    rp = fmaf(b3.x, r_reg3.x, fmaf(b3.y, r_reg3.y, fmaf(b3.z, r_reg3.z, fmaf(b3.w, r_reg3.w, rp))));
+                    sc += rp;
+                }
+                sc_arr[i] = sc;
+                local_max = fmaxf(local_max, sc);
+            } else {
+                sc_arr[i] = -1e30f;
+            }
+        }
+        float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+        float m_new = fmaxf(m_q, tile_max);
+        float alpha = expf(m_q - m_new);
+
+        wmma_h8_v p_reg;
+        float local_sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float p = (sc_arr[i] > -1e20f) ? expf(sc_arr[i] - m_new) : 0.0f;
+            p_reg[i] = (_Float16)p;
+            local_sum += p;
+        }
+        l_q = l_q * alpha + local_sum + __shfl_xor(local_sum, 16, 32);
+        m_q = m_new;
+
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+            wmma_h8_v vt_v;
+            int d_row = db * 16 + col;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) vt_v[j] = sm_vt[d_row][half * 8 + j];
+            o_acc[db] *= alpha;
+            o_acc[db] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vt_v, p_reg, o_acc[db]);
+        }
+        __syncthreads();
+    }
+
+    if (vq) {
+        float inv_l = 1.0f / l_q;
+        float* oh = out + (size_t)bt_q * q_dim + (size_t)h * dh;
+        const float* gh = gate + (size_t)bt_q * q_dim + (size_t)h * dh;
+#pragma unroll
+        for (int db = 0; db < 8; ++db) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int d = db * 16 + half * 8 + i;
+                oh[d] = (o_acc[db][i] * inv_l) / (1.0f + expf(-gh[d]));
+            }
+        }
+    }
+}
+
 extern "C" __global__ void attn_batch_gated_flash_k(const float* __restrict__ Q,
                                                     const float* __restrict__ R,
                                                     const float* __restrict__ sinks,
@@ -2548,6 +2719,10 @@ extern "C" int ink_attn_b8_flash_q8(hipStream_t s, const float* Q, const float* 
 }
 
 extern "C" int ink_attn_batch_gated_flash(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const __half* kc, const __half* vc, const float* gate, const int* d_pos0, float* out, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int swa_window, int is_swa, int max_ctx, int B) {
+    if (n_head == n_head_kv * 3 && dh == 128) {
+        attn_batch_gqa3_flash_fp16_k<<<dim3(n_head_kv, (B + 63) / 64), dim3(384), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, out, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B);
+        return 0;
+    }
     attn_batch_gated_flash_k<<<dim3(n_head, (B + 63) / 64), dim3(128), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, out, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B);
     return 0;
 }

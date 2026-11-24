@@ -3762,14 +3762,22 @@ extern "C" __global__ void moe_gu_q4_0_sudot4_to_q8_k(const uint8_t* __restrict_
 
     __shared__ float sm_v[8][32];
     __shared__ int8_t sm_q[8][32];
+    __shared__ q8_1_blk sm_x0[96];
+    __shared__ q8_1_blk sm_x1[96];
 
     if (cnt == 1) {
         int tid0 = tok_sorted[off0];
         int sid0 = slot_sorted[off0];
+        const q8_1_blk* xsrc0 = Xq + (size_t)tid0 * nblk;
+        if (nblk <= 96) {
+            if (threadIdx.x < nblk) sm_x0[threadIdx.x] = xsrc0[threadIdx.x];
+            __syncthreads();
+            xsrc0 = sm_x0;
+        }
         float ag0 = 0.0f, au0 = 0.0f;
         if (row < n_ff) {
             for (int b = lane8; b < nblk; b += 8) {
-                const q8_1_blk xb = Xq[(size_t)tid0 * nblk + b];
+                const q8_1_blk xb = xsrc0[b];
                 ag0 += dot_q4_soa_q8_1_blk(qg_row[b], __half2float(dg_row[b]), xb);
                 au0 += dot_q4_soa_q8_1_blk(qu_row[b], __half2float(du_row[b]), xb);
             }
@@ -3796,6 +3804,15 @@ extern "C" __global__ void moe_gu_q4_0_sudot4_to_q8_k(const uint8_t* __restrict_
     if (cnt == 2) {
         int tid0 = tok_sorted[off0], sid0 = slot_sorted[off0];
         int tid1 = tok_sorted[off0 + 1], sid1 = slot_sorted[off0 + 1];
+        const q8_1_blk* xsrc0 = Xq + (size_t)tid0 * nblk;
+        const q8_1_blk* xsrc1 = Xq + (size_t)tid1 * nblk;
+        if (nblk <= 96) {
+            if (threadIdx.x < nblk) sm_x0[threadIdx.x] = xsrc0[threadIdx.x];
+            else if (threadIdx.x >= 128 && (threadIdx.x - 128) < nblk) sm_x1[threadIdx.x - 128] = xsrc1[threadIdx.x - 128];
+            __syncthreads();
+            xsrc0 = sm_x0;
+            xsrc1 = sm_x1;
+        }
         float ag0 = 0.0f, au0 = 0.0f, ag1 = 0.0f, au1 = 0.0f;
         if (row < n_ff) {
             for (int b = lane8; b < nblk; b += 8) {
@@ -3811,8 +3828,8 @@ extern "C" __global__ void moe_gu_q4_0_sudot4_to_q8_k(const uint8_t* __restrict_
                 int32_t u2 = (int32_t)(qu.z & 0x0F0F0F0Fu), u3 = (int32_t)(qu.w & 0x0F0F0F0Fu);
                 int32_t u4 = (int32_t)((qu.x >> 4) & 0x0F0F0F0Fu), u5 = (int32_t)((qu.y >> 4) & 0x0F0F0F0Fu);
                 int32_t u6 = (int32_t)((qu.z >> 4) & 0x0F0F0F0Fu), u7 = (int32_t)((qu.w >> 4) & 0x0F0F0F0Fu);
-                const q8_1_blk xb0 = Xq[(size_t)tid0 * nblk + b];
-                const q8_1_blk xb1 = Xq[(size_t)tid1 * nblk + b];
+                const q8_1_blk xb0 = xsrc0[b];
+                const q8_1_blk xb1 = xsrc1[b];
                 int32_t sg0 = 0, su0 = 0, sg1 = 0, su1 = 0;
                 sg0 = __builtin_amdgcn_sudot4(false, g0, true, xb0.q[0], sg0, false);
                 sg0 = __builtin_amdgcn_sudot4(false, g1, true, xb0.q[1], sg0, false);
