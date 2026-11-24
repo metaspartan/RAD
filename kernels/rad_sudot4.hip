@@ -3103,7 +3103,11 @@ extern "C" __global__ void inkling_attn_batch_gated_q8_k(const float* __restrict
     }
 }
 
+extern "C" int ink_attn_b8_flash_q8(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const __half* kc, const __half* vc, const float* gate, const int* d_pos0, void* out_q8, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int swa_window, int is_swa, int max_ctx, int B);
 extern "C" int ink_attn_batch_gated_q8(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const __half* kc, const __half* vc, const float* gate, const int* d_pos0, void* out_q8, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int swa_window, int is_swa, int max_ctx, int B) {
+    if (B >= 4 && B <= 16 && dh == 128 && d_rel == 16) {
+        return ink_attn_b8_flash_q8(s, Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, out_q8, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B);
+    }
     inkling_attn_batch_gated_q8_k<<<dim3(n_head, B), dim3(256), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, (q8_1_blk*)out_q8, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx);
     return 0;
 }

@@ -51,7 +51,6 @@ jobs:
       - name: Build .deb package
         run: |
           bash packaging/deb/build_deb.sh "${{ steps.ver.outputs.version }}"
-          cp dist/rad_${{ steps.ver.outputs.version }}_amd64.deb dist/
           sha256sum dist/rad_${{ steps.ver.outputs.version }}_amd64.deb >> dist/SHA256SUMS.txt
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

@@ -1501,6 +1501,13 @@ fn load_vision(opts: &CliOpts) -> anyhow::Result<Option<VisionEncoder>> {
     Ok(None)
 }
 
+fn mean_std(vals: &[f64]) -> (f64, f64) {
+    let n = vals.len().max(1) as f64;
+    let m = vals.iter().sum::<f64>() / n;
+    let v = vals.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n;
+    (m, v.sqrt())
+}
+
 fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
     println!("RAD Benchmark Suite (v{})", env!("CARGO_PKG_VERSION"));
     let t0 = Instant::now();
@@ -1521,52 +1528,105 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
     let short_ids: Vec<i32> = tokenizer.encode(short_p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
     engine.reset_seq(0)?;
     let _ = engine.prefill_tokens_seq(0, &short_ids)?;
-    engine.reset_seq(0)?;
-    let ts = Instant::now();
-    let mut cur_tok = engine.prefill_tokens_seq(0, &short_ids)?;
-    let ttft_ms = ts.elapsed().as_secs_f64() * 1000.0;
-
-    let td = Instant::now();
-    let dec_n = 128usize;
-    for _ in 0..dec_n {
-        cur_tok = engine.step(cur_tok)?;
+    let mut ttft_runs = Vec::new();
+    let mut cur_tok = 0i32;
+    for _ in 0..3 {
+        engine.reset_seq(0)?;
+        let ts = Instant::now();
+        cur_tok = engine.prefill_tokens_seq(0, &short_ids)?;
+        ttft_runs.push(ts.elapsed().as_secs_f64() * 1000.0);
     }
-    let b1_nospec_tps = dec_n as f64 / td.elapsed().as_secs_f64();
+    let (ttft_ms, ttft_sd) = mean_std(&ttft_runs);
+
+    let dec_n = 128usize;
+    let mut tg128_runs = Vec::new();
+    for _ in 0..3 {
+        engine.reset_seq(0)?;
+        let mut ct = engine.prefill_tokens_seq(0, &short_ids)?;
+        let td = Instant::now();
+        for _ in 0..dec_n {
+            ct = engine.step(ct)?;
+        }
+        let _ = ct;
+        tg128_runs.push(dec_n as f64 / td.elapsed().as_secs_f64());
+    }
+    let (tg128_tps, tg128_sd) = mean_std(&tg128_runs);
 
     let long_chunk = "Modern GPU architectures execute thousands of lightweight threads in parallel across SIMD wavefronts while hiding global HBM latency with large register files, shared local data store memory, and multi-level caches. ";
     let mut long_text = String::from("Summarize the following technical notes:\n");
-    for _ in 0..45 {
+    for _ in 0..80 {
         long_text.push_str(long_chunk);
     }
     let long_p = format_prompt(
         &[ChatMessage { role: "user".into(), content: json!(long_text), tool_calls: None, name: None }],
         false,
     );
-    let long_ids: Vec<i32> = tokenizer.encode(long_p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+    let base_ids: Vec<i32> = tokenizer.encode(long_p, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+    let pp512_ids = &base_ids[..512.min(base_ids.len())];
+    let pp2048_ids = &base_ids[..2048.min(base_ids.len())];
 
     engine.reset_seq(0)?;
-    let tpp = Instant::now();
-    let _ = engine.prefill_tokens_seq(0, &long_ids)?;
-    let pp_nospec_tps = long_ids.len() as f64 / tpp.elapsed().as_secs_f64();
+    let _ = engine.prefill_tokens_seq(0, pp512_ids)?;
+    let mut pp512_runs = Vec::new();
+    for _ in 0..3 {
+        engine.reset_seq(0)?;
+        let tpp = Instant::now();
+        let _ = engine.prefill_tokens_seq(0, pp512_ids)?;
+        pp512_runs.push(pp512_ids.len() as f64 / tpp.elapsed().as_secs_f64());
+    }
+    let (pp512_tps, pp512_sd) = mean_std(&pp512_runs);
 
-    let mut pp_spec_tps = 0.0f64;
+    engine.reset_seq(0)?;
+    let _ = engine.prefill_tokens_seq(0, pp2048_ids)?;
+    let mut pp2048_runs = Vec::new();
+    let mut last_d2048 = 0i32;
+    for _ in 0..3 {
+        engine.reset_seq(0)?;
+        let tpp = Instant::now();
+        last_d2048 = engine.prefill_tokens_seq(0, pp2048_ids)?;
+        pp2048_runs.push(pp2048_ids.len() as f64 / tpp.elapsed().as_secs_f64());
+    }
+    let (pp2048_tps, pp2048_sd) = mean_std(&pp2048_runs);
+
+    let td2k = Instant::now();
+    let mut ct2k = last_d2048;
+    for _ in 0..dec_n {
+        ct2k = engine.step(ct2k)?;
+    }
+    let _ = ct2k;
+    let tg128_d2048_tps = dec_n as f64 / td2k.elapsed().as_secs_f64();
+
+    let mut pp2048_spec_tps = 0.0f64;
+    let mut pp2048_spec_sd = 0.0f64;
     if let Some(ref mut d) = drafter {
         engine.reset_seq(0)?;
         d.reset_seq(0);
-        let tps = Instant::now();
-        let _ = prefill_with_drafter(&mut engine, 0, &long_ids, &[], None, Some(d), None)?;
-        pp_spec_tps = long_ids.len() as f64 / tps.elapsed().as_secs_f64();
+        let _ = prefill_with_drafter(&mut engine, 0, pp2048_ids, &[], None, Some(d), None)?;
+        let mut s_runs = Vec::new();
+        for _ in 0..3 {
+            engine.reset_seq(0)?;
+            d.reset_seq(0);
+            let tps = Instant::now();
+            let _ = prefill_with_drafter(&mut engine, 0, pp2048_ids, &[], None, Some(d), None)?;
+            s_runs.push(pp2048_ids.len() as f64 / tps.elapsed().as_secs_f64());
+        }
+        let (m, s) = mean_std(&s_runs);
+        pp2048_spec_tps = m;
+        pp2048_spec_sd = s;
     }
 
+    let _ = cur_tok;
     println!("| Benchmark | Result | Details |");
     println!("| --- | --- | --- |");
     println!("| Cold Load | {:.2} s | spec={spec_mode}, hipGraph captured |", load_s);
-    println!("| Short Prompt TTFT | {:.1} ms | {} tokens |", ttft_ms, short_ids.len());
-    println!("| Long Prefill (No-Spec) | {:.1} tok/s | {} tokens |", pp_nospec_tps, long_ids.len());
-    if pp_spec_tps > 0.0 {
-        println!("| Long Prefill ({spec_mode}) | {:.1} tok/s | {} tokens (batched feature inject) |", pp_spec_tps, long_ids.len());
+    println!("| Short Prompt TTFT | {:.1} ± {:.1} ms | {} tokens (3 runs) |", ttft_ms, ttft_sd, short_ids.len());
+    println!("| pp512 (No-Spec) | {:.1} ± {:.1} tok/s | {} tokens, llama-bench parity (3 runs) |", pp512_tps, pp512_sd, pp512_ids.len());
+    println!("| pp2048 (No-Spec) | {:.1} ± {:.1} tok/s | {} tokens, llama-bench parity (3 runs) |", pp2048_tps, pp2048_sd, pp2048_ids.len());
+    if pp2048_spec_tps > 0.0 {
+        println!("| pp2048 ({spec_mode}) | {:.1} ± {:.1} tok/s | {} tokens, batched feature inject (3 runs) |", pp2048_spec_tps, pp2048_spec_sd, pp2048_ids.len());
     }
-    println!("| Single-User Decode (No-Spec) | {:.1} tok/s | B=1 hipGraph ({dec_n} tok) |", b1_nospec_tps);
+    println!("| tg128 (No-Spec) | {:.1} ± {:.1} tok/s | B=1 hipGraph, d=0 (3 runs) |", tg128_tps, tg128_sd);
+    println!("| tg128 @ d=2048 (No-Spec) | {:.1} tok/s | B=1 hipGraph, 2K KV depth |", tg128_d2048_tps);
 
     if let Some(ref mut d) = drafter {
         let k_len = d.spec_k();
@@ -1664,7 +1724,8 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
                     }
                 }
                 let agg = tot as f64 / t1.elapsed().as_secs_f64();
-                println!("| Multi-User B={b} ({spec_mode} K={mk}) | {:.1} agg tok/s | {:.1} tok/s/user |", agg, agg / b as f64);
+                let per_u = agg / b as f64;
+                println!("| Multi-User B={b} ({spec_mode} K={mk}) | {:.1} agg tok/s | {:.1} tok/s/user (ITL {:.1}ms) |", agg, per_u, 1000.0 / per_u);
             }
         }
     }
@@ -1684,7 +1745,8 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
                 cur = engine.step_multi(&seq_ids, &cur)?;
             }
             let agg = (b * steps) as f64 / t1.elapsed().as_secs_f64();
-            println!("| Multi-User B={b} (No-Spec) | {:.1} agg tok/s | {:.1} tok/s/user |", agg, agg / b as f64);
+            let per_u = agg / b as f64;
+            println!("| Multi-User B={b} (No-Spec) | {:.1} agg tok/s | {:.1} tok/s/user (ITL {:.1}ms) |", agg, per_u, 1000.0 / per_u);
         }
     }
 

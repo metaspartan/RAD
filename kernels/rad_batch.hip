@@ -1131,6 +1131,36 @@ __global__ void gemm_f32_f4_nt_k(const float* __restrict__ W,
     }
 }
 
+__global__ void gemm_f32_f4_rem_k(const float* __restrict__ W,
+                                  const float* __restrict__ X,
+                                  float* __restrict__ Y,
+                                  int n, int k, int B) {
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * 2 + warp;
+    int t0 = blockIdx.y * 8;
+    int nt = min(8, B - t0);
+    if (row >= n || nt <= 0) return;
+    int k4 = k >> 2;
+    const float4* wr = reinterpret_cast<const float4*>(W + (size_t)row * k);
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int j = lane; j < k4; j += 32) {
+        float4 wv = wr[j];
+        for (int m = 0; m < nt; ++m) {
+            const float4* xr = reinterpret_cast<const float4*>(X + (size_t)(t0 + m) * k);
+            float4 xv = xr[j];
+            acc[m] = fmaf(wv.x, xv.x, acc[m]);
+            acc[m] = fmaf(wv.y, xv.y, acc[m]);
+            acc[m] = fmaf(wv.z, xv.z, acc[m]);
+            acc[m] = fmaf(wv.w, xv.w, acc[m]);
+        }
+    }
+    for (int m = 0; m < nt; ++m) {
+        float v = b_warp_sum32(acc[m]);
+        if (lane == 0) Y[(size_t)(t0 + m) * n + row] = v;
+    }
+}
+
 extern "C" int ink_gemm_f32_wmma(hipStream_t s, const float* W, const float* X, float* Y, int n, int k, int B);
 extern "C" int ink_gemm_f32(hipStream_t s, const float* W, const float* X, float* Y, int n, int k, int B) {
     if (B >= 32) return ink_gemm_f32_wmma(s, W, X, Y, n, k, B);
@@ -1143,6 +1173,8 @@ extern "C" int ink_gemm_f32(hipStream_t s, const float* W, const float* X, float
             gemm_f32_f4_nt_k<4><<<dim3((n + 1) / 2, 1), dim3(64), 0, s>>>(W, X, Y, n, k, B);
             return 0;
         }
+        gemm_f32_f4_rem_k<<<dim3((n + 1) / 2, (B + 7) / 8), dim3(64), 0, s>>>(W, X, Y, n, k, B);
+        return 0;
     }
     gemm_f32_k<<<dim3((n + 3) / 4, (B + 7) / 8), dim3(128), 0, s>>>(W, X, Y, n, k, B);
     return 0;
@@ -1387,7 +1419,7 @@ __global__ void loop_ctrl_up_fast_nt_k(const float* __restrict__ cur0,
 }
 
 extern "C" int ink_loop_ctrl_3_norm_batch(hipStream_t s, const float* cur0, const float* cur1, const float* cur2, const float* msgs, const float* wd0, const float* wd1, const float* wd2, const float* wg0, const float* wg1, const float* wg2, const float* wf0, const float* wf1, const float* wf2, const float* nw0, const float* nw1, const float* nw2, float* h_buf, float* out0, float* out1, float* out2, int n_embd, int rank, int max_B, int B, float eps) {
-    if (B >= 16) {
+    if (B >= 12) {
         ink_loop_ctrl_down_wmma(s, cur0, cur1, cur2, msgs, wd0, wd1, wd2, h_buf, n_embd, rank, max_B, B, 3);
         ink_loop_ctrl_up_wmma(s, cur0, cur1, cur2, msgs, h_buf, wg0, wg1, wg2, wf0, wf1, wf2, out0, out1, out2, n_embd, rank, max_B, B, 3);
     } else if (B == 8 && (n_embd & 3) == 0) {
@@ -1404,7 +1436,7 @@ extern "C" int ink_loop_ctrl_3_norm_batch(hipStream_t s, const float* cur0, cons
     return 0;
 }
 extern "C" int ink_loop_ctrl_1_norm_batch(hipStream_t s, const float* cur, const float* msg, const float* wd, const float* wg, const float* wf, const float* nw, float* h_buf, float* out, int n_embd, int rank, int max_B, int B, float eps) {
-    if (B >= 16) {
+    if (B >= 12) {
         ink_loop_ctrl_down_wmma(s, cur, cur, cur, msg, wd, wd, wd, h_buf, n_embd, rank, max_B, B, 1);
         ink_loop_ctrl_up_wmma(s, cur, cur, cur, msg, h_buf, wg, wg, wg, wf, wf, wf, out, out, out, n_embd, rank, max_B, B, 1);
     } else if (B == 8 && (n_embd & 3) == 0) {
