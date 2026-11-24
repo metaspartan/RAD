@@ -377,6 +377,10 @@ pub struct InklingEngine {
     pub seq_pos: Vec<i32>,
     pub seq_tokens: Vec<Vec<i32>>,
     pub paged_kv: crate::paged_kv::PagedKvManager,
+    d_rewind_ptrs: DevBuf,
+    d_rw_u: DevBuf,
+    d_rw_seq: DevBuf,
+    d_rw_idx: DevBuf,
     last_logits_in_sc: bool,
     b1_sudot4: bool,
 }
@@ -624,6 +628,24 @@ impl InklingEngine {
         let mut stream: HipStream = std::ptr::null_mut();
         unsafe { hipStreamCreate(&mut stream) };
 
+        let mut rw_ptrs: Vec<u64> = Vec::with_capacity(slots.len() * 8);
+        for sl in &slots {
+            rw_ptrs.push(sl.k_snap.ptr as u64);
+            rw_ptrs.push(sl.k_hist.ptr as u64);
+            rw_ptrs.push(sl.v_snap.ptr as u64);
+            rw_ptrs.push(sl.v_hist.ptr as u64);
+            rw_ptrs.push(sl.attn_post_snap.ptr as u64);
+            rw_ptrs.push(sl.attn_post_hist.ptr as u64);
+            rw_ptrs.push(sl.ffn_post_snap.ptr as u64);
+            rw_ptrs.push(sl.ffn_post_hist.ptr as u64);
+        }
+        let mut d_rewind_ptrs = DevBuf::new(rw_ptrs.len() * 8).map_err(he)?;
+        let rw_bytes = unsafe { std::slice::from_raw_parts(rw_ptrs.as_ptr() as *const u8, rw_ptrs.len() * 8) };
+        d_rewind_ptrs.copy_from(rw_bytes, None).map_err(he)?;
+        let d_rw_u = DevBuf::new(MAX_BATCH * 4).map_err(he)?;
+        let d_rw_seq = DevBuf::new(MAX_BATCH * 4).map_err(he)?;
+        let d_rw_idx = DevBuf::new(MAX_BATCH * 4).map_err(he)?;
+
         Ok(Self {
             cfg,
             max_ctx,
@@ -654,6 +676,10 @@ impl InklingEngine {
                 std::env::var("RAD_KV_BLOCK_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(16),
                 std::env::var("RAD_KV_BLOCKS").ok().and_then(|s| s.parse().ok()),
             ),
+            d_rewind_ptrs,
+            d_rw_u,
+            d_rw_seq,
+            d_rw_idx,
             last_logits_in_sc: false,
             b1_sudot4,
         })
@@ -1558,7 +1584,7 @@ impl InklingEngine {
                         self.bsc.wt_sorted.ptr as *mut f32, self.cfg.n_expert_used as i32, bi,
                     );
                 }
-                if b >= 48 {
+                if b >= 96 {
                     ops::ink_moe_gu_q4_0_wmma_to_q8(
                         s, l.ffn_gate_up_exps.buf.ptr as *const u8, gu_sc, self.bsc.xq.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -1593,7 +1619,7 @@ impl InklingEngine {
                 );
             }
             WeightType::Q4_0 => {
-                if b >= 48 {
+                if b >= 96 {
                     ops::ink_moe_dn_q4_0_wmma(
                         s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -1601,7 +1627,7 @@ impl InklingEngine {
                         self.bsc.wt_sorted.ptr as *const f32, self.bsc.moe_dn_slots.ptr as *mut f32, moe_raw,
                         e, self.cfg.n_ff_exp as i32, self.cfg.n_expert_used as i32, bi,
                     );
-                } else if b <= 32 {
+                } else if b <= 64 {
                     ops::ink_moe_dn_q4_0_sudot4_nozero(
                         s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -1625,7 +1651,7 @@ impl InklingEngine {
             _ => unreachable!(),
         };
         let fp_snap = if b <= 64 { sl.ffn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
-        if b <= 32 && l.ffn_down_exps.ty == WeightType::Q4_0 {
+        if b <= 64 && l.ffn_down_exps.ty == WeightType::Q4_0 {
             ops::ink_shortconv_res_batch_snap_clear(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, fp_snap, ffn_inp, std::ptr::null_mut(), cur, e, bi);
         } else {
             ops::ink_shortconv_res_batch_snap(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, fp_snap, ffn_inp, std::ptr::null_mut(), cur, e, bi);
@@ -1637,7 +1663,7 @@ impl InklingEngine {
         let mb = MAX_BATCH as i32;
         let bi = b as i32;
         let be = (b * self.cfg.n_embd) as i32;
-        if b <= 32 {
+        if b <= 64 {
             ops::ink_zero_f32(s, self.bsc.moe_raw.ptr as *mut f32, be);
         }
         let cur = self.bsc.cur.ptr as *mut f32;
@@ -2103,29 +2129,40 @@ impl InklingEngine {
     pub fn rewind_verify_multi(&mut self, seq_ids: &[i32], n_acc: &[usize], k_len: usize) -> Result<()> {
         let kv_n = (self.cfg.n_head_kv * self.cfg.dh * 3) as i32;
         let e_n = (self.cfg.n_embd * 3) as i32;
-        let mut any = false;
-        unsafe {
-            for (u, &sid) in seq_ids.iter().enumerate() {
-                let acc = n_acc[u];
-                if acc < k_len {
-                    any = true;
-                    let su = sid as usize;
-                    let idx = acc - 1;
-                    let kv_src_off = (u * 8 + idx) * (kv_n as usize);
-                    let e_src_off = (u * 8 + idx) * (e_n as usize);
-                    let kv_dst_off = su * (kv_n as usize);
-                    let e_dst_off = su * (e_n as usize);
-                    for sl in &self.slots {
-                        ops::ink_copy_f32(self.stream, (sl.k_snap.ptr as *const f32).add(kv_src_off), (sl.k_hist.ptr as *mut f32).add(kv_dst_off), kv_n);
-                        ops::ink_copy_f32(self.stream, (sl.v_snap.ptr as *const f32).add(kv_src_off), (sl.v_hist.ptr as *mut f32).add(kv_dst_off), kv_n);
-                        ops::ink_copy_f32(self.stream, (sl.attn_post_snap.ptr as *const f32).add(e_src_off), (sl.attn_post_hist.ptr as *mut f32).add(e_dst_off), e_n);
-                        ops::ink_copy_f32(self.stream, (sl.ffn_post_snap.ptr as *const f32).add(e_src_off), (sl.ffn_post_hist.ptr as *mut f32).add(e_dst_off), e_n);
-                    }
-                    self.seq_pos[su] -= (k_len - acc) as i32;
-                    if su == 0 { self.pos = self.seq_pos[0]; }
-                }
+        let mut rw_u: Vec<i32> = Vec::with_capacity(seq_ids.len());
+        let mut rw_seq: Vec<i32> = Vec::with_capacity(seq_ids.len());
+        let mut rw_idx: Vec<i32> = Vec::with_capacity(seq_ids.len());
+        for (u, &sid) in seq_ids.iter().enumerate() {
+            let acc = n_acc[u];
+            if acc < k_len {
+                let su = sid as usize;
+                rw_u.push(u as i32);
+                rw_seq.push(sid);
+                rw_idx.push((acc - 1) as i32);
+                self.seq_pos[su] -= (k_len - acc) as i32;
+                if su == 0 { self.pos = self.seq_pos[0]; }
             }
-            if any {
+        }
+        if !rw_u.is_empty() {
+            let n_rw = rw_u.len();
+            let u_b = unsafe { std::slice::from_raw_parts(rw_u.as_ptr() as *const u8, n_rw * 4) };
+            let s_b = unsafe { std::slice::from_raw_parts(rw_seq.as_ptr() as *const u8, n_rw * 4) };
+            let i_b = unsafe { std::slice::from_raw_parts(rw_idx.as_ptr() as *const u8, n_rw * 4) };
+            self.d_rw_u.copy_from(u_b, Some(self.stream)).map_err(he)?;
+            self.d_rw_seq.copy_from(s_b, Some(self.stream)).map_err(he)?;
+            self.d_rw_idx.copy_from(i_b, Some(self.stream)).map_err(he)?;
+            unsafe {
+                ops::ink_rewind_multi_all_slots(
+                    self.stream,
+                    self.d_rewind_ptrs.ptr as *const u64,
+                    self.d_rw_u.ptr as *const i32,
+                    self.d_rw_seq.ptr as *const i32,
+                    self.d_rw_idx.ptr as *const i32,
+                    self.slots.len() as i32,
+                    n_rw as i32,
+                    kv_n,
+                    e_n,
+                );
                 rad_hip::hipStreamSynchronize(self.stream);
             }
         }
@@ -2565,7 +2602,7 @@ impl InklingEngine {
                         self.bsc.wt_sorted.ptr as *mut f32, self.cfg.n_expert_used as i32, bi,
                     );
                 }
-                if b >= 48 {
+                if b >= 96 {
                     ops::ink_moe_gu_q4_0_wmma_to_q8(
                         s, l.ffn_gate_up_exps.buf.ptr as *const u8, gu_sc, self.bsc.xq.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -2588,6 +2625,7 @@ impl InklingEngine {
             }
             _ => unreachable!(),
         };
+        let use_nozero = (seq_opt.is_none() || multi_k > 1) && b <= 64;
         match l.ffn_down_exps.ty {
             WeightType::Nvfp4 => {
                 ops::ink_quantize_q8_1(s, moe_act, self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, bi * self.cfg.n_expert_used as i32);
@@ -2600,7 +2638,7 @@ impl InklingEngine {
                 );
             }
             WeightType::Q4_0 => {
-                if b >= 48 {
+                if b >= 96 {
                     ops::ink_moe_dn_q4_0_wmma(
                         s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -2608,7 +2646,7 @@ impl InklingEngine {
                         self.bsc.wt_sorted.ptr as *const f32, self.bsc.moe_dn_slots.ptr as *mut f32, moe_raw,
                         e, self.cfg.n_ff_exp as i32, self.cfg.n_expert_used as i32, bi,
                     );
-                } else if seq_opt.is_some() && multi_k > 1 && b <= 32 {
+                } else if use_nozero {
                     ops::ink_moe_dn_q4_0_sudot4_nozero(
                         s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -2634,7 +2672,7 @@ impl InklingEngine {
         if let Some(seq) = seq_opt {
             let seq_eh_off = seq * self.cfg.n_embd * 3;
             if multi_k > 1 {
-                if b <= 32 && l.ffn_down_exps.ty == WeightType::Q4_0 {
+                if use_nozero && l.ffn_down_exps.ty == WeightType::Q4_0 {
                     ops::ink_shortconv_res_batch_snap_clear(s, moe_raw, l.ffn_post_conv.ptr as *const f32, (sl.ffn_post_hist.ptr as *mut f32).add(seq_eh_off), sl.ffn_post_snap.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, e, bi);
                 } else {
                     ops::ink_shortconv_res_batch_snap(s, moe_raw, l.ffn_post_conv.ptr as *const f32, (sl.ffn_post_hist.ptr as *mut f32).add(seq_eh_off), sl.ffn_post_snap.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, e, bi);
@@ -2643,7 +2681,13 @@ impl InklingEngine {
                 ops::ink_shortconv_res_batch(s, moe_raw, l.ffn_post_conv.ptr as *const f32, (sl.ffn_post_hist.ptr as *mut f32).add(seq_eh_off), ffn_inp, std::ptr::null_mut(), cur, e, bi);
             }
         } else if multi_k > 1 {
-            ops::ink_shortconv_res_multi_snap(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, sl.ffn_post_snap.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, self.bsc.d_seq_ids.ptr as *const i32, e, (b / multi_k) as i32, multi_k as i32);
+            if use_nozero && l.ffn_down_exps.ty == WeightType::Q4_0 {
+                ops::ink_shortconv_res_multi_snap_clear(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, sl.ffn_post_snap.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, self.bsc.d_seq_ids.ptr as *const i32, e, (b / multi_k) as i32, multi_k as i32);
+            } else {
+                ops::ink_shortconv_res_multi_snap(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, sl.ffn_post_snap.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, self.bsc.d_seq_ids.ptr as *const i32, e, (b / multi_k) as i32, multi_k as i32);
+            }
+        } else if use_nozero && l.ffn_down_exps.ty == WeightType::Q4_0 {
+            ops::ink_shortconv_res_multi_clear(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, self.bsc.d_seq_ids.ptr as *const i32, e, bi);
         } else {
             ops::ink_shortconv_res_multi(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, ffn_inp, std::ptr::null_mut(), cur, self.bsc.d_seq_ids.ptr as *const i32, e, bi);
         }
@@ -2730,7 +2774,7 @@ impl InklingEngine {
         let mb = MAX_BATCH as i32;
         let bi = b as i32;
         let be = (b * self.cfg.n_embd) as i32;
-        if seq_opt.is_some() && multi_k > 1 && b <= 32 {
+        if (seq_opt.is_none() || multi_k > 1) && b <= 64 {
             ops::ink_zero_f32(s, self.bsc.moe_raw.ptr as *mut f32, be);
         }
         let cur = self.bsc.cur.ptr as *mut f32;

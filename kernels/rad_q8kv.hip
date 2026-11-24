@@ -1277,22 +1277,39 @@ extern "C" __global__ void attn_decode_splitkv_reduce_q8kv_k(const float* __rest
                                                              q8kv_q8_1_blk* __restrict__ out_q8,
                                                              int n_splits) {
     int h = blockIdx.x;
-    int wid = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
     int d = wid * 32 + lane;
     const float* base = split_buf + (size_t)h * n_splits * 130;
-    float gm = -1e30f;
-    for (int sp = 0; sp < n_splits; ++sp) gm = fmaxf(gm, base[(size_t)sp * 130]);
-    float gl = 0.0f, go = 0.0f;
+    __shared__ float sm_w[96];
+    __shared__ float sm_gl;
+    if (wid == 0) {
+        float lm = -1e30f;
+        for (int sp = lane; sp < n_splits; sp += 32) {
+            lm = fmaxf(lm, base[(size_t)sp * 130]);
+        }
+        float gm = __shfl(q8kv_warp_max32(lm), 0, 32);
+        float ll = 0.0f;
+        for (int sp = lane; sp < n_splits; sp += 32) {
+            float ms = base[(size_t)sp * 130];
+            float sc = (ms > -1e20f) ? expf(ms - gm) : 0.0f;
+            sm_w[sp] = sc;
+            ll += base[(size_t)sp * 130 + 1] * sc;
+        }
+        float gl = q8kv_warp_sum32(ll);
+        if (lane == 0) sm_gl = 1.0f / gl;
+    }
+    __syncthreads();
+    float inv_gl = sm_gl;
+    float go = 0.0f;
     for (int sp = 0; sp < n_splits; ++sp) {
-        float ms = base[(size_t)sp * 130];
-        if (ms > -1e20f) {
-            float sc = expf(ms - gm);
-            gl += base[(size_t)sp * 130 + 1] * sc;
-            go += base[(size_t)sp * 130 + 2 + d] * sc;
+        float w = sm_w[sp];
+        if (w != 0.0f) {
+            go = fmaf(base[(size_t)sp * 130 + 2 + d], w, go);
         }
     }
-    float v = (go / gl) / (1.0f + expf(-gate[(size_t)h * 128 + d]));
+    float v = (go * inv_gl) / (1.0f + expf(-gate[(size_t)h * 128 + d]));
     __shared__ int8_t smq[4][32];
     q8kv_store_q8_1(v, lane, out_q8 + h * 4 + wid, smq[wid]);
 }

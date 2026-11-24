@@ -2018,7 +2018,11 @@ __global__ void loop_ctrl_up_fast_nt_k(const float* __restrict__ cur0,
 
 extern "C" int ink_loop_ctrl_3_norm_batch(hipStream_t s, const float* cur0, const float* cur1, const float* cur2, const float* msgs, const float* wd0, const float* wd1, const float* wd2, const float* wg0, const float* wg1, const float* wg2, const float* wf0, const float* wf1, const float* wf2, const float* nw0, const float* nw1, const float* nw2, float* h_buf, float* out0, float* out1, float* out2, int n_embd, int rank, int max_B, int B, float eps) {
     if (B >= 12) {
-        ink_loop_ctrl_down_wmma(s, cur0, cur1, cur2, msgs, wd0, wd1, wd2, h_buf, n_embd, rank, max_B, B, 3);
+        if (B <= 64 && (B & 7) == 0 && (n_embd & 3) == 0) {
+            loop_ctrl_down_nt_k<8><<<dim3(rank, 3, B / 8), dim3(256), 0, s>>>(cur0, cur1, cur2, msgs, wd0, wd1, wd2, h_buf, n_embd, rank, max_B);
+        } else {
+            ink_loop_ctrl_down_wmma(s, cur0, cur1, cur2, msgs, wd0, wd1, wd2, h_buf, n_embd, rank, max_B, B, 3);
+        }
         ink_loop_ctrl_up_wmma(s, cur0, cur1, cur2, msgs, h_buf, wg0, wg1, wg2, wf0, wf1, wf2, out0, out1, out2, n_embd, rank, max_B, B, 3);
     } else if (B == 8 && (n_embd & 3) == 0) {
         loop_ctrl_down_nt_k<8><<<dim3(rank, 3, 1), dim3(256), 0, s>>>(cur0, cur1, cur2, msgs, wd0, wd1, wd2, h_buf, n_embd, rank, max_B);
@@ -2035,7 +2039,11 @@ extern "C" int ink_loop_ctrl_3_norm_batch(hipStream_t s, const float* cur0, cons
 }
 extern "C" int ink_loop_ctrl_1_norm_batch(hipStream_t s, const float* cur, const float* msg, const float* wd, const float* wg, const float* wf, const float* nw, float* h_buf, float* out, int n_embd, int rank, int max_B, int B, float eps) {
     if (B >= 12) {
-        ink_loop_ctrl_down_wmma(s, cur, cur, cur, msg, wd, wd, wd, h_buf, n_embd, rank, max_B, B, 1);
+        if (B <= 64 && (B & 7) == 0 && (n_embd & 3) == 0) {
+            loop_ctrl_down_nt_k<8><<<dim3(rank, 1, B / 8), dim3(256), 0, s>>>(cur, cur, cur, msg, wd, wd, wd, h_buf, n_embd, rank, max_B);
+        } else {
+            ink_loop_ctrl_down_wmma(s, cur, cur, cur, msg, wd, wd, wd, h_buf, n_embd, rank, max_B, B, 1);
+        }
         ink_loop_ctrl_up_wmma(s, cur, cur, cur, msg, h_buf, wg, wg, wg, wf, wf, wf, out, out, out, n_embd, rank, max_B, B, 1);
     } else if (B == 8 && (n_embd & 3) == 0) {
         loop_ctrl_down_nt_k<8><<<dim3(rank, 1, 1), dim3(256), 0, s>>>(cur, cur, cur, msg, wd, wd, wd, h_buf, n_embd, rank, max_B);

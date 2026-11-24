@@ -1336,8 +1336,41 @@ extern "C" int ink_attn_multi_gated(hipStream_t s, const float* Q, const float* 
     return 0;
 }
 
+extern "C" __global__ void shortconv_res_multi_clear_k(float* __restrict__ raw,
+                                                       const float* __restrict__ conv_w,
+                                                       float* __restrict__ hist_pool,
+                                                       const float* __restrict__ add_src,
+                                                       float* __restrict__ block_dst,
+                                                       float* __restrict__ out,
+                                                       const int* __restrict__ d_seq_ids,
+                                                       int n_embd) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int bt = blockIdx.y;
+    if (c >= n_embd) return;
+    int seq = d_seq_ids[bt];
+    float* hc = hist_pool + ((size_t)seq * n_embd + c) * 3;
+    float h0 = hc[0], h1 = hc[1], h2 = hc[2];
+    const float* wc = conv_w + (size_t)c * 4;
+    size_t idx = (size_t)bt * n_embd + c;
+    float x = raw[idx];
+    raw[idx] = 0.0f;
+    float conv_out = (x + wc[0] * h0 + wc[1] * h1 + wc[2] * h2 + wc[3] * x) * rsqrtf(5.0f);
+    hc[0] = h1; hc[1] = h2; hc[2] = x;
+    if (block_dst) {
+        block_dst[idx] = add_src[idx];
+        out[idx] = conv_out;
+    } else {
+        out[idx] = add_src[idx] + conv_out;
+    }
+}
+
 extern "C" int ink_shortconv_res_multi(hipStream_t s, const float* raw, const float* conv_w, float* hist_pool, const float* add_src, float* block_dst, float* out, const int* d_seq_ids, int n_embd, int B) {
     shortconv_res_multi_k<<<dim3((n_embd + 255) / 256, B), dim3(256), 0, s>>>(raw, conv_w, hist_pool, add_src, block_dst, out, d_seq_ids, n_embd);
+    return 0;
+}
+
+extern "C" int ink_shortconv_res_multi_clear(hipStream_t s, float* raw, const float* conv_w, float* hist_pool, const float* add_src, float* block_dst, float* out, const int* d_seq_ids, int n_embd, int B) {
+    shortconv_res_multi_clear_k<<<dim3((n_embd + 255) / 256, B), dim3(256), 0, s>>>(raw, conv_w, hist_pool, add_src, block_dst, out, d_seq_ids, n_embd);
     return 0;
 }
 
@@ -2010,15 +2043,15 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
         return;
     }
 
-    for (int t0 = 0; t0 < cnt; t0 += 4) {
-        int nt = min(4, cnt - t0);
-        int tids[4];
-        int sids[4];
+    for (int t0 = 0; t0 < cnt; t0 += 8) {
+        int nt = min(8, cnt - t0);
+        int tids[8];
+        int sids[8];
         for (int m = 0; m < nt; ++m) {
             tids[m] = tok_sorted[off0 + t0 + m];
             sids[m] = slot_sorted[off0 + t0 + m];
         }
-        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         for (int b = lane4; b < nblk; b += 4) {
             uint4 q4 = qrow[b];
             float dw = __half2float(drow[b]);
@@ -4302,8 +4335,84 @@ extern "C" int ink_kv_conv_qkvr_store_multi_snap(hipStream_t s, float* Q, const 
     return 0;
 }
 
+extern "C" __global__ void shortconv_res_multi_snap_clear_k(float* __restrict__ raw,
+                                                            const float* __restrict__ conv_w,
+                                                            float* __restrict__ hist_pool,
+                                                            float* __restrict__ snap_pool,
+                                                            const float* __restrict__ add_src,
+                                                            float* __restrict__ block_dst,
+                                                            float* __restrict__ out,
+                                                            const int* __restrict__ d_seq_ids,
+                                                            int n_embd, int K) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int u = blockIdx.y;
+    if (c >= n_embd) return;
+    int seq = d_seq_ids[u * K];
+    int bt_base = u * K;
+    float* hc = hist_pool + ((size_t)seq * n_embd + c) * 3;
+    float* sn_base = snap_pool ? (snap_pool + (size_t)u * 8 * n_embd * 3) : nullptr;
+    float h0 = hc[0], h1 = hc[1], h2 = hc[2];
+    const float* wc = conv_w + (size_t)c * 4;
+    float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+    for (int t = 0; t < K; ++t) {
+        size_t idx = (size_t)(bt_base + t) * n_embd + c;
+        float x = raw[idx];
+        raw[idx] = 0.0f;
+        float conv_out = (x + w0 * h0 + w1 * h1 + w2 * h2 + w3 * x) * rsqrtf(5.0f);
+        h0 = h1; h1 = h2; h2 = x;
+        if (sn_base) {
+            float* sn = sn_base + ((size_t)t * n_embd + c) * 3;
+            sn[0] = h0; sn[1] = h1; sn[2] = h2;
+        }
+        if (block_dst) {
+            block_dst[idx] = add_src[idx];
+            out[idx] = conv_out;
+        } else {
+            out[idx] = add_src[idx] + conv_out;
+        }
+    }
+    hc[0] = h0; hc[1] = h1; hc[2] = h2;
+}
+
+extern "C" __global__ void rewind_multi_all_slots_k(const uint64_t* __restrict__ slot_ptrs,
+                                                    const int* __restrict__ d_rw_u,
+                                                    const int* __restrict__ d_rw_seq,
+                                                    const int* __restrict__ d_rw_idx,
+                                                    int kv_n, int e_n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int sl = blockIdx.y;
+    int r = blockIdx.z;
+    int u = d_rw_u[r];
+    int su = d_rw_seq[r];
+    int idx = d_rw_idx[r];
+    const uint64_t* sp = slot_ptrs + (size_t)sl * 8;
+    if (i < kv_n) {
+        size_t s_off = (size_t)(u * 8 + idx) * kv_n + i;
+        size_t d_off = (size_t)su * kv_n + i;
+        reinterpret_cast<float*>(sp[1])[d_off] = reinterpret_cast<const float*>(sp[0])[s_off];
+        reinterpret_cast<float*>(sp[3])[d_off] = reinterpret_cast<const float*>(sp[2])[s_off];
+    }
+    if (i < e_n) {
+        size_t s_off = (size_t)(u * 8 + idx) * e_n + i;
+        size_t d_off = (size_t)su * e_n + i;
+        reinterpret_cast<float*>(sp[5])[d_off] = reinterpret_cast<const float*>(sp[4])[s_off];
+        reinterpret_cast<float*>(sp[7])[d_off] = reinterpret_cast<const float*>(sp[6])[s_off];
+    }
+}
+
 extern "C" int ink_shortconv_res_multi_snap(hipStream_t s, const float* raw, const float* conv_w, float* hist_pool, float* snap_pool, const float* add_src, float* block_dst, float* out, const int* d_seq_ids, int n_embd, int n_users, int K) {
     shortconv_res_multi_snap_k<<<dim3((n_embd + 255) / 256, n_users), dim3(256), 0, s>>>(raw, conv_w, hist_pool, snap_pool, add_src, block_dst, out, d_seq_ids, n_embd, K);
+    return 0;
+}
+
+extern "C" int ink_shortconv_res_multi_snap_clear(hipStream_t s, float* raw, const float* conv_w, float* hist_pool, float* snap_pool, const float* add_src, float* block_dst, float* out, const int* d_seq_ids, int n_embd, int n_users, int K) {
+    shortconv_res_multi_snap_clear_k<<<dim3((n_embd + 255) / 256, n_users), dim3(256), 0, s>>>(raw, conv_w, hist_pool, snap_pool, add_src, block_dst, out, d_seq_ids, n_embd, K);
+    return 0;
+}
+
+extern "C" int ink_rewind_multi_all_slots(hipStream_t s, const uint64_t* slot_ptrs, const int* d_rw_u, const int* d_rw_seq, const int* d_rw_idx, int n_slots, int n_rw, int kv_n, int e_n) {
+    int max_n = (kv_n > e_n) ? kv_n : e_n;
+    rewind_multi_all_slots_k<<<dim3((max_n + 255) / 256, n_slots, n_rw), dim3(256), 0, s>>>(slot_ptrs, d_rw_u, d_rw_seq, d_rw_idx, kv_n, e_n);
     return 0;
 }
 
