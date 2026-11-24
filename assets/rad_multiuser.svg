@@ -38,9 +38,9 @@
   <rect x="345" y="113" width="109" height="22" rx="5" fill="url(#tealGrad)"/>
   <text x="464" y="129" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#2dd4bf">468.8 tok/s</text>
 
-  <text x="56" y="162" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=8 Continuous Batching (64.6 tok/s/user)</text>
-  <rect x="345" y="147" width="120" height="22" rx="5" fill="url(#slateGrad)"/>
-  <text x="475" y="163" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#cbd5e1">516.9 tok/s</text>
+  <text x="56" y="162" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=8 Continuous Batching (67.5 tok/s/user)</text>
+  <rect x="345" y="147" width="125" height="22" rx="5" fill="url(#slateGrad)"/>
+  <text x="480" y="163" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#cbd5e1">539.9 tok/s</text>
 
   <text x="56" y="196" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=8 Batched DSpark K=4 (57.3 tok/s/user)</text>
   <rect x="345" y="181" width="106" height="22" rx="5" fill="url(#greenGrad)"/>

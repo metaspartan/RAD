@@ -65,6 +65,7 @@ impl Drafter {
         }
     }
 
+    #[allow(dead_code)]
     fn ctx_len(&self) -> i32 {
         match self {
             Drafter::DFlash2(d) => d.ctx_len,
@@ -121,6 +122,13 @@ impl Drafter {
         match self {
             Drafter::DFlash2(d) => d.draft(anchor_tok, target, k_len),
             Drafter::Dspark(d) => d.draft(anchor_tok, target, k_len),
+        }
+    }
+
+    fn draft_seq(&mut self, seq: usize, anchor_tok: i32, target: &InklingEngine, k_len: usize) -> anyhow::Result<Vec<i32>> {
+        match self {
+            Drafter::DFlash2(d) => d.draft_seq(seq, anchor_tok, target, k_len),
+            Drafter::Dspark(d) => Ok(d.draft_multi(&[seq as i32], &[anchor_tok], target, k_len)?.pop().unwrap()),
         }
     }
 
@@ -553,15 +561,19 @@ fn run_scheduler(
             continue;
         }
 
-        if active.len() == 1 && active[0].seq == 0 {
+        if active.len() == 1 {
             if let Some(ref mut d) = drafter {
-                if d.ctx_len() == engine.seq_pos[0] {
+                let seq = active[0].seq;
+                if seq < d.max_seqs() && d.seq_ctx_len(seq) == engine.seq_pos[seq] {
                     let mut slot = active.pop().unwrap();
-                    engine.pos = engine.seq_pos[0];
-                    let pos0 = engine.pos;
+                    let pos0 = engine.seq_pos[seq];
                     let res = (|| -> anyhow::Result<Vec<i32>> {
-                        let draft = d.draft(slot.next_tok, &engine, spec_k)?;
-                        let verified = engine.verify_batch(&draft)?;
+                        let draft = if seq == 0 {
+                            d.draft(slot.next_tok, &engine, spec_k)?
+                        } else {
+                            d.draft_seq(seq, slot.next_tok, &engine, spec_k)?
+                        };
+                        let verified = engine.verify_batch_seq(seq, &draft)?;
                         let mut n_acc = 1usize;
                         for j in 0..(spec_k - 1) {
                             if verified[j] == draft[j + 1] {
@@ -570,11 +582,10 @@ fn run_scheduler(
                                 break;
                             }
                         }
-                        engine.rewind_verify_to(n_acc, spec_k)?;
-                        engine.seq_pos[0] = engine.pos;
-                        d.inject_batch_seq(0, &engine, 0, pos0, n_acc)?;
+                        engine.rewind_verify_seq_to(seq, n_acc, spec_k)?;
+                        d.inject_batch_seq(seq, &engine, 0, pos0, n_acc)?;
                         for j in 0..n_acc {
-                            engine.seq_tokens[0].push(draft[j]);
+                            engine.seq_tokens[seq].push(draft[j]);
                         }
                         let mut emitted_toks = Vec::with_capacity(n_acc);
                         for j in 1..n_acc {

@@ -94,6 +94,50 @@ extern "C" __global__ void quantize_q8_1_k(const float* __restrict__ X,
     }
 }
 
+extern "C" __global__ void quantize_q8_1_x3_k(const float* __restrict__ X0,
+                                              const float* __restrict__ X1,
+                                              const float* __restrict__ X2,
+                                              q8_1_blk* __restrict__ Y0,
+                                              q8_1_blk* __restrict__ Y1,
+                                              q8_1_blk* __restrict__ Y2,
+                                              int k) {
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int nblk = k >> 5;
+    int b = blockIdx.x * 4 + wid;
+    if (b >= nblk) return;
+    int t = blockIdx.y;
+    int z = blockIdx.z;
+    const float* X = (z == 0) ? X0 : ((z == 1) ? X1 : X2);
+    q8_1_blk* Y = (z == 0) ? Y0 : ((z == 1) ? Y1 : Y2);
+    float v = X[(size_t)t * k + (b << 5) + lane];
+    float amax = s_warp_max32(fabsf(v));
+    amax = __shfl(amax, 0, 32);
+    float d = amax / 127.0f;
+    float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    int qi = __float2int_rn(v * inv);
+    if (qi > 127) qi = 127;
+    if (qi < -127) qi = -127;
+    int32_t qsum = s_warp_sum32_i(qi);
+    int q1 = __shfl_down(qi, 1, 32);
+    int q2 = __shfl_down(qi, 2, 32);
+    int q3 = __shfl_down(qi, 3, 32);
+    q8_1_blk* dst = Y + (size_t)t * nblk + b;
+    if (lane == 0) {
+        dst->d = d;
+        dst->s = qsum;
+    }
+    if ((lane & 3) == 0) {
+        dst->q[lane >> 2] = pack4_i8((int8_t)qi, (int8_t)q1, (int8_t)q2, (int8_t)q3);
+    }
+}
+
+extern "C" int ink_quantize_q8_1_x3(hipStream_t s, const float* X0, const float* X1, const float* X2, void* Y0, void* Y1, void* Y2, int k, int B) {
+    int nblk = k >> 5;
+    quantize_q8_1_x3_k<<<dim3((nblk + 3) / 4, B, 3), dim3(128), 0, s>>>(X0, X1, X2, (q8_1_blk*)Y0, (q8_1_blk*)Y1, (q8_1_blk*)Y2, k);
+    return 0;
+}
+
 __device__ __forceinline__ float dot_nvfp4_q8_1_blk(const uint8_t* __restrict__ bp,
                                                     const q8_1_blk* __restrict__ xq2) {
     uint32_t ds;
@@ -349,6 +393,466 @@ extern "C" __global__ void moe_build_groups_k(const int* __restrict__ itop,
     __syncthreads();
     exp_counts[tid] = cnt[tid];
     exp_counts[128 + tid] = act[tid];
+}
+
+extern "C" __global__ void moe_router_and_groups_k(const float* __restrict__ logits,
+                                                   const float* __restrict__ bias,
+                                                   const float* __restrict__ scales,
+                                                   int* __restrict__ exp_counts,
+                                                   int* __restrict__ exp_offsets,
+                                                   int* __restrict__ tok_sorted,
+                                                   int* __restrict__ slot_sorted,
+                                                   float* __restrict__ wt_sorted,
+                                                   float route_scale, int B) {
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+
+    __shared__ int s_itop[32 * 8];
+    __shared__ float s_wtop[32 * 8];
+    __shared__ int cnt[128];
+    __shared__ int off[129];
+    __shared__ int act[128];
+
+    if (tid < 128) {
+        cnt[tid] = 0;
+        act[tid] = -1;
+    }
+
+    for (int bt = wid; bt < B; bt += 8) {
+        const float* lg = logits + (size_t)bt * 128;
+        float pv[4];
+        float sv[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            int e = lane + p * 32;
+            float pr = 1.0f / (1.0f + expf(-lg[e]));
+            pv[p] = pr;
+            sv[p] = bias ? (pr + bias[e]) : pr;
+        }
+        float chosen_p[8];
+        int chosen_i[8];
+        for (int t = 0; t < 8; ++t) {
+            float bv = sv[0];
+            float bp = pv[0];
+            int bi = lane;
+#pragma unroll
+            for (int p = 1; p < 4; ++p) {
+                int e = lane + p * 32;
+                if (sv[p] > bv || (sv[p] == bv && e < bi)) {
+                    bv = sv[p];
+                    bp = pv[p];
+                    bi = e;
+                }
+            }
+#pragma unroll
+            for (int stride = 16; stride > 0; stride >>= 1) {
+                float ov = __shfl_down(bv, stride, 32);
+                float op = __shfl_down(bp, stride, 32);
+                int oi = __shfl_down(bi, stride, 32);
+                if (ov > bv || (ov == bv && oi < bi)) {
+                    bv = ov;
+                    bp = op;
+                    bi = oi;
+                }
+            }
+            int win_i = __shfl(bi, 0, 32);
+            float win_p = __shfl(bp, 0, 32);
+            if ((win_i & 31) == lane) {
+                int wp = win_i >> 5;
+                if (wp == 0) sv[0] = -1e30f;
+                else if (wp == 1) sv[1] = -1e30f;
+                else if (wp == 2) sv[2] = -1e30f;
+                else sv[3] = -1e30f;
+            }
+            chosen_i[t] = win_i;
+            chosen_p[t] = win_p;
+        }
+        if (lane == 0) {
+            float wsum = 0.0f;
+#pragma unroll
+            for (int t = 0; t < 8; ++t) wsum += chosen_p[t];
+            float inv = route_scale / (wsum + 1e-20f);
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                s_itop[bt * 8 + t] = chosen_i[t];
+                s_wtop[bt * 8 + t] = chosen_p[t] * inv;
+            }
+        }
+    }
+    __syncthreads();
+
+    int total = B * 8;
+    for (int i = tid; i < total; i += 256) {
+        atomicAdd(&cnt[s_itop[i]], 1);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int s = 0;
+        int na = 0;
+        for (int e = 0; e < 128; ++e) {
+            off[e] = s;
+            if (cnt[e] > 0) act[na++] = e;
+            s += cnt[e];
+            cnt[e] = 0;
+        }
+        off[128] = s;
+    }
+    __syncthreads();
+    if (tid < 128) exp_offsets[tid] = off[tid];
+    if (tid == 0) exp_offsets[128] = off[128];
+    for (int i = tid; i < total; i += 256) {
+        int e = s_itop[i];
+        int pos = off[e] + atomicAdd(&cnt[e], 1);
+        tok_sorted[pos] = i >> 3;
+        slot_sorted[pos] = i & 7;
+        wt_sorted[pos] = s_wtop[i] * (scales ? scales[e] : 1.0f);
+    }
+    __syncthreads();
+    if (tid < 128) {
+        exp_counts[tid] = cnt[tid];
+        exp_counts[128 + tid] = act[tid];
+    }
+}
+
+extern "C" int ink_moe_router_and_groups(hipStream_t s, const float* logits, const float* bias, const float* scales, int* exp_counts, int* exp_offsets, int* tok_sorted, int* slot_sorted, float* wt_sorted, float route_scale, int B) {
+    moe_router_and_groups_k<<<dim3(1), dim3(256), 0, s>>>(logits, bias, scales, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, route_scale, B);
+    return 0;
+}
+
+extern "C" __global__ void b1_router_and_q8_k(const float* __restrict__ logits,
+                                              const float* __restrict__ bias,
+                                              float* __restrict__ wtop,
+                                              int* __restrict__ itop,
+                                              const float* __restrict__ x_in,
+                                              q8_1_blk* __restrict__ xq_out,
+                                              float route_scale, int k) {
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    if (wid == 0) {
+        float pv[4];
+        float sv[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            int e = lane + p * 32;
+            float pr = 1.0f / (1.0f + expf(-logits[e]));
+            pv[p] = pr;
+            sv[p] = bias ? (pr + bias[e]) : pr;
+        }
+        float chosen_p[8];
+        int chosen_i[8];
+        for (int t = 0; t < 8; ++t) {
+            float bv = sv[0];
+            float bp = pv[0];
+            int bi = lane;
+#pragma unroll
+            for (int p = 1; p < 4; ++p) {
+                int e = lane + p * 32;
+                if (sv[p] > bv || (sv[p] == bv && e < bi)) {
+                    bv = sv[p];
+                    bp = pv[p];
+                    bi = e;
+                }
+            }
+#pragma unroll
+            for (int stride = 16; stride > 0; stride >>= 1) {
+                float ov = __shfl_down(bv, stride, 32);
+                float op = __shfl_down(bp, stride, 32);
+                int oi = __shfl_down(bi, stride, 32);
+                if (ov > bv || (ov == bv && oi < bi)) {
+                    bv = ov;
+                    bp = op;
+                    bi = oi;
+                }
+            }
+            int win_i = __shfl(bi, 0, 32);
+            float win_p = __shfl(bp, 0, 32);
+            if ((win_i & 31) == lane) {
+                int wp = win_i >> 5;
+                if (wp == 0) sv[0] = -1e30f;
+                else if (wp == 1) sv[1] = -1e30f;
+                else if (wp == 2) sv[2] = -1e30f;
+                else sv[3] = -1e30f;
+            }
+            chosen_i[t] = win_i;
+            chosen_p[t] = win_p;
+        }
+        if (lane == 0) {
+            float wsum = 0.0f;
+#pragma unroll
+            for (int t = 0; t < 8; ++t) wsum += chosen_p[t];
+            float inv = route_scale / (wsum + 1e-20f);
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                itop[t] = chosen_i[t];
+                wtop[t] = chosen_p[t] * inv;
+            }
+        }
+    } else {
+        int nblk = k >> 5;
+        for (int b = wid - 1; b < nblk; b += 7) {
+            float v = x_in[(b << 5) + lane];
+            float amax = __shfl(s_warp_max32(fabsf(v)), 0, 32);
+            float d = amax / 127.0f;
+            float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            int qi = __float2int_rn(v * inv);
+            if (qi > 127) qi = 127;
+            if (qi < -127) qi = -127;
+            int32_t qsum = s_warp_sum32_i(qi);
+            int q1 = __shfl_down(qi, 1, 32);
+            int q2 = __shfl_down(qi, 2, 32);
+            int q3 = __shfl_down(qi, 3, 32);
+            q8_1_blk* dst = xq_out + b;
+            if (lane == 0) {
+                dst->d = d;
+                dst->s = qsum;
+            }
+            if ((lane & 3) == 0) {
+                dst->q[lane >> 2] = pack4_i8((int8_t)qi, (int8_t)q1, (int8_t)q2, (int8_t)q3);
+            }
+        }
+    }
+}
+
+extern "C" int ink_b1_router_and_q8(hipStream_t s, const float* logits, const float* bias, float* wtop, int* itop, const float* x_in, void* xq_out, float route_scale, int k) {
+    b1_router_and_q8_k<<<dim3(1), dim3(256), 0, s>>>(logits, bias, wtop, itop, x_in, (q8_1_blk*)xq_out, route_scale, k);
+    return 0;
+}
+
+extern "C" __global__ void moe_router_groups_and_q8_k(const float* __restrict__ logits,
+                                                      const float* __restrict__ bias,
+                                                      const float* __restrict__ scales,
+                                                      int* __restrict__ exp_counts,
+                                                      int* __restrict__ exp_offsets,
+                                                      int* __restrict__ tok_sorted,
+                                                      int* __restrict__ slot_sorted,
+                                                      float* __restrict__ wt_sorted,
+                                                      const float* __restrict__ x_in,
+                                                      q8_1_blk* __restrict__ xq_out,
+                                                      float route_scale, int k, int B) {
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    if (blockIdx.x > 0) {
+        int t = blockIdx.x - 1;
+        int nblk = k >> 5;
+        const float* xt = x_in + (size_t)t * k;
+        q8_1_blk* yt = xq_out + (size_t)t * nblk;
+        for (int b = wid; b < nblk; b += 8) {
+            float v = xt[(b << 5) + lane];
+            float amax = __shfl(s_warp_max32(fabsf(v)), 0, 32);
+            float d = amax / 127.0f;
+            float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            int qi = __float2int_rn(v * inv);
+            if (qi > 127) qi = 127;
+            if (qi < -127) qi = -127;
+            int32_t qsum = s_warp_sum32_i(qi);
+            int q1 = __shfl_down(qi, 1, 32);
+            int q2 = __shfl_down(qi, 2, 32);
+            int q3 = __shfl_down(qi, 3, 32);
+            q8_1_blk* dst = yt + b;
+            if (lane == 0) {
+                dst->d = d;
+                dst->s = qsum;
+            }
+            if ((lane & 3) == 0) {
+                dst->q[lane >> 2] = pack4_i8((int8_t)qi, (int8_t)q1, (int8_t)q2, (int8_t)q3);
+            }
+        }
+        return;
+    }
+
+    __shared__ int s_itop[16 * 8];
+    __shared__ float s_wtop[16 * 8];
+    __shared__ int cnt[128];
+    __shared__ int off[129];
+    __shared__ int act[128];
+
+    if (tid < 128) {
+        cnt[tid] = 0;
+        act[tid] = -1;
+    }
+
+    for (int bt = wid; bt < B; bt += 8) {
+        const float* lg = logits + (size_t)bt * 128;
+        float pv[4];
+        float sv[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            int e = lane + p * 32;
+            float pr = 1.0f / (1.0f + expf(-lg[e]));
+            pv[p] = pr;
+            sv[p] = bias ? (pr + bias[e]) : pr;
+        }
+        float chosen_p[8];
+        int chosen_i[8];
+        for (int t = 0; t < 8; ++t) {
+            float bv = sv[0];
+            float bp = pv[0];
+            int bi = lane;
+#pragma unroll
+            for (int p = 1; p < 4; ++p) {
+                int e = lane + p * 32;
+                if (sv[p] > bv || (sv[p] == bv && e < bi)) {
+                    bv = sv[p];
+                    bp = pv[p];
+                    bi = e;
+                }
+            }
+#pragma unroll
+            for (int stride = 16; stride > 0; stride >>= 1) {
+                float ov = __shfl_down(bv, stride, 32);
+                float op = __shfl_down(bp, stride, 32);
+                int oi = __shfl_down(bi, stride, 32);
+                if (ov > bv || (ov == bv && oi < bi)) {
+                    bv = ov;
+                    bp = op;
+                    bi = oi;
+                }
+            }
+            int win_i = __shfl(bi, 0, 32);
+            float win_p = __shfl(bp, 0, 32);
+            if ((win_i & 31) == lane) {
+                int wp = win_i >> 5;
+                if (wp == 0) sv[0] = -1e30f;
+                else if (wp == 1) sv[1] = -1e30f;
+                else if (wp == 2) sv[2] = -1e30f;
+                else sv[3] = -1e30f;
+            }
+            chosen_i[t] = win_i;
+            chosen_p[t] = win_p;
+        }
+        if (lane == 0) {
+            float wsum = 0.0f;
+#pragma unroll
+            for (int t = 0; t < 8; ++t) wsum += chosen_p[t];
+            float inv = route_scale / (wsum + 1e-20f);
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                s_itop[bt * 8 + t] = chosen_i[t];
+                s_wtop[bt * 8 + t] = chosen_p[t] * inv;
+            }
+        }
+    }
+    __syncthreads();
+
+    int total = B * 8;
+    for (int i = tid; i < total; i += 256) {
+        atomicAdd(&cnt[s_itop[i]], 1);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int s = 0;
+        int na = 0;
+        for (int e = 0; e < 128; ++e) {
+            off[e] = s;
+            if (cnt[e] > 0) act[na++] = e;
+            s += cnt[e];
+            cnt[e] = 0;
+        }
+        off[128] = s;
+    }
+    __syncthreads();
+    if (tid < 128) exp_offsets[tid] = off[tid];
+    if (tid == 0) exp_offsets[128] = off[128];
+    for (int i = tid; i < total; i += 256) {
+        int e = s_itop[i];
+        int pos = off[e] + atomicAdd(&cnt[e], 1);
+        tok_sorted[pos] = i >> 3;
+        slot_sorted[pos] = i & 7;
+        wt_sorted[pos] = s_wtop[i] * (scales ? scales[e] : 1.0f);
+    }
+    __syncthreads();
+    if (tid < 128) {
+        exp_counts[tid] = cnt[tid];
+        exp_counts[128 + tid] = act[tid];
+    }
+}
+
+extern "C" int ink_moe_router_groups_and_q8(hipStream_t s, const float* logits, const float* bias, const float* scales, int* exp_counts, int* exp_offsets, int* tok_sorted, int* slot_sorted, float* wt_sorted, const float* x_in, void* xq_out, float route_scale, int k, int B) {
+    moe_router_groups_and_q8_k<<<dim3(1 + B), dim3(256), 0, s>>>(logits, bias, scales, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, x_in, (q8_1_blk*)xq_out, route_scale, k, B);
+    return 0;
+}
+
+template <int NT>
+__global__ void dflash2_qkv_q4_nt_k(const uint8_t* __restrict__ wq,
+                                    const uint8_t* __restrict__ wk,
+                                    const uint8_t* __restrict__ wv,
+                                    const q8_1_blk* __restrict__ Xq,
+                                    float* __restrict__ Q,
+                                    float* __restrict__ K,
+                                    float* __restrict__ V,
+                                    int k, int q_dim, int kv_dim) {
+    int grp = threadIdx.x >> 3;
+    int lane8 = threadIdx.x & 7;
+    int gid = blockIdx.x * 32 + grp;
+    int o1 = q_dim;
+    int o2 = o1 + kv_dim;
+    int o3 = o2 + kv_dim;
+    if (gid >= o3) return;
+    const uint8_t* W;
+    float* Y;
+    int row, n_out;
+    if (gid < o1) { W = wq; Y = Q; row = gid; n_out = q_dim; }
+    else if (gid < o2) { W = wk; Y = K; row = gid - o1; n_out = kv_dim; }
+    else { W = wv; Y = V; row = gid - o2; n_out = kv_dim; }
+    int nblk = k >> 5;
+    size_t rbytes = q4_soa_row_bytes(nblk);
+    const uint8_t* wrow = W + (size_t)row * rbytes;
+    const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
+    const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
+    float acc[NT];
+#pragma unroll
+    for (int m = 0; m < NT; ++m) acc[m] = 0.0f;
+    for (int b = lane8; b < nblk; b += 8) {
+        uint4 q4 = qrow[b];
+        float dw = __half2float(drow[b]);
+        int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu);
+        int32_t w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+        int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu);
+        int32_t w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+        int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu);
+        int32_t w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+        int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu);
+        int32_t w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
+#pragma unroll
+        for (int m = 0; m < NT; ++m) {
+            const q8_1_blk xb = Xq[(size_t)m * nblk + b];
+            int32_t sumi = 0;
+            sumi = __builtin_amdgcn_sudot4(false, w0, true, xb.q[0], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w1, true, xb.q[1], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w2, true, xb.q[2], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w3, true, xb.q[3], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w4, true, xb.q[4], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w5, true, xb.q[5], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w6, true, xb.q[6], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w7, true, xb.q[7], sumi, false);
+            acc[m] = fmaf(dw * xb.d, (float)(sumi - 8 * xb.s), acc[m]);
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < NT; ++m) {
+        float v = s_warp_sum8(acc[m]);
+        if (lane8 == 0) Y[(size_t)m * n_out + row] = v;
+    }
+}
+
+extern "C" int ink_dflash2_qkv_q4(hipStream_t s, const uint8_t* wq, const uint8_t* wk, const uint8_t* wv, const void* Xq, float* Q, float* K, float* V, int k, int q_dim, int kv_dim, int B) {
+    int total_rows = q_dim + 2 * kv_dim;
+    if (B == 8) {
+        dflash2_qkv_q4_nt_k<8><<<dim3((total_rows + 31) / 32), dim3(256), 0, s>>>(wq, wk, wv, (const q8_1_blk*)Xq, Q, K, V, k, q_dim, kv_dim);
+        return 0;
+    }
+    if (B == 6) {
+        dflash2_qkv_q4_nt_k<6><<<dim3((total_rows + 31) / 32), dim3(256), 0, s>>>(wq, wk, wv, (const q8_1_blk*)Xq, Q, K, V, k, q_dim, kv_dim);
+        return 0;
+    }
+    if (B == 4) {
+        dflash2_qkv_q4_nt_k<4><<<dim3((total_rows + 31) / 32), dim3(256), 0, s>>>(wq, wk, wv, (const q8_1_blk*)Xq, Q, K, V, k, q_dim, kv_dim);
+        return 0;
+    }
+    return 1;
 }
 
 extern "C" __global__ void moe_gu_nvfp4_sudot4_k(const uint8_t* __restrict__ W,
@@ -1484,9 +1988,9 @@ __global__ void qkvrg_q4_nt_k(const uint8_t* __restrict__ wq,
                               float* __restrict__ Vdyn,
                               int k, int q_dim, int kv_dim,
                               int r_dim, int n_head, int dyn_dim) {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int gid = blockIdx.x * 4 + warp;
+    int grp = threadIdx.x >> 3;
+    int lane8 = threadIdx.x & 7;
+    int gid = blockIdx.x * 32 + grp;
     int o1 = q_dim;
     int o2 = o1 + kv_dim;
     int o3 = o2 + kv_dim;
@@ -1516,7 +2020,7 @@ __global__ void qkvrg_q4_nt_k(const uint8_t* __restrict__ wq,
         float acc[NT];
 #pragma unroll
         for (int m = 0; m < NT; ++m) acc[m] = 0.0f;
-        for (int b = lane; b < nblk; b += 32) {
+        for (int b = lane8; b < nblk; b += 8) {
             uint4 q4 = qrow[b];
             float dw = __half2float(drow[b]);
             int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu);
@@ -1544,8 +2048,8 @@ __global__ void qkvrg_q4_nt_k(const uint8_t* __restrict__ wq,
         }
 #pragma unroll
         for (int m = 0; m < NT; ++m) {
-            float v = s_warp_sum32(acc[m]);
-            if (lane == 0) Y[(size_t)m * n_out + row] = v;
+            float v = s_warp_sum8(acc[m]);
+            if (lane8 == 0) Y[(size_t)m * n_out + row] = v;
         }
     } else {
         const uint16_t* W;
@@ -1555,23 +2059,132 @@ __global__ void qkvrg_q4_nt_k(const uint8_t* __restrict__ wq,
         if (gid < o6) { W = wsink; X = X0; Y = S; row = gid - o5; n_out = n_head; }
         else if (gid < o7) { W = wkdyn; X = X1; Y = Kdyn; row = gid - o6; n_out = dyn_dim; }
         else { W = wvdyn; X = X2; Y = Vdyn; row = gid - o7; n_out = dyn_dim; }
-        const uint16_t* wrow = W + (size_t)row * k;
+        const uint4* w4p = reinterpret_cast<const uint4*>(W + (size_t)row * k);
+        int k8 = k >> 3;
         float acc[NT];
 #pragma unroll
         for (int m = 0; m < NT; ++m) acc[m] = 0.0f;
-        for (int j = lane; j < k; j += 32) {
-            float wv_f = s_bf16_f32(wrow[j]);
+        for (int j = lane8; j < k8; j += 8) {
+            uint4 wv = w4p[j];
+            float f0 = s_bf16_f32((uint16_t)(wv.x & 0xFFFFu));
+            float f1 = s_bf16_f32((uint16_t)(wv.x >> 16));
+            float f2 = s_bf16_f32((uint16_t)(wv.y & 0xFFFFu));
+            float f3 = s_bf16_f32((uint16_t)(wv.y >> 16));
+            float f4 = s_bf16_f32((uint16_t)(wv.z & 0xFFFFu));
+            float f5 = s_bf16_f32((uint16_t)(wv.z >> 16));
+            float f6 = s_bf16_f32((uint16_t)(wv.w & 0xFFFFu));
+            float f7 = s_bf16_f32((uint16_t)(wv.w >> 16));
 #pragma unroll
             for (int m = 0; m < NT; ++m) {
-                acc[m] = fmaf(wv_f, X[(size_t)m * k + j], acc[m]);
+                const float4* x4 = reinterpret_cast<const float4*>(X + (size_t)m * k + (size_t)j * 8);
+                float4 xa = x4[0], xb = x4[1];
+                float s = fmaf(f0, xa.x, fmaf(f1, xa.y, fmaf(f2, xa.z, f3 * xa.w)));
+                s = fmaf(f4, xb.x, fmaf(f5, xb.y, fmaf(f6, xb.z, fmaf(f7, xb.w, s))));
+                acc[m] += s;
             }
         }
 #pragma unroll
         for (int m = 0; m < NT; ++m) {
-            float v = s_warp_sum32(acc[m]);
-            if (lane == 0) Y[(size_t)m * n_out + row] = v;
+            float v = s_warp_sum8(acc[m]);
+            if (lane8 == 0) Y[(size_t)m * n_out + row] = v;
         }
     }
+}
+
+template <int NT>
+__global__ void wo_conv_res_q4_nt_snap_k(const uint8_t* __restrict__ W,
+                                         const q8_1_blk* __restrict__ Xq,
+                                         const float* __restrict__ conv_w,
+                                         float* __restrict__ hist,
+                                         float* __restrict__ snap,
+                                         const float* __restrict__ add_src,
+                                         float* __restrict__ block_dst,
+                                         float* __restrict__ out,
+                                         int n_embd, int q_dim) {
+    int grp = threadIdx.x >> 3;
+    int lane8 = threadIdx.x & 7;
+    int row = blockIdx.x * 32 + grp;
+    if (row >= n_embd) return;
+    int nblk = q_dim >> 5;
+    size_t rbytes = q4_soa_row_bytes(nblk);
+    const uint8_t* wrow = W + (size_t)row * rbytes;
+    const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
+    const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
+    float acc[NT];
+#pragma unroll
+    for (int m = 0; m < NT; ++m) acc[m] = 0.0f;
+    for (int b = lane8; b < nblk; b += 8) {
+        uint4 q4 = qrow[b];
+        float dw = __half2float(drow[b]);
+        int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu);
+        int32_t w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+        int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu);
+        int32_t w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+        int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu);
+        int32_t w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+        int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu);
+        int32_t w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
+#pragma unroll
+        for (int m = 0; m < NT; ++m) {
+            const q8_1_blk xb = Xq[(size_t)m * nblk + b];
+            int32_t sumi = 0;
+            sumi = __builtin_amdgcn_sudot4(false, w0, true, xb.q[0], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w1, true, xb.q[1], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w2, true, xb.q[2], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w3, true, xb.q[3], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w4, true, xb.q[4], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w5, true, xb.q[5], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w6, true, xb.q[6], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w7, true, xb.q[7], sumi, false);
+            acc[m] = fmaf(dw * xb.d, (float)(sumi - 8 * xb.s), acc[m]);
+        }
+    }
+    float vals[NT];
+#pragma unroll
+    for (int m = 0; m < NT; ++m) {
+        vals[m] = s_warp_sum8(acc[m]);
+    }
+    if (lane8 == 0) {
+        float* hc = hist + (size_t)row * 3;
+        float h0 = hc[0], h1 = hc[1], h2 = hc[2];
+        const float* wc = conv_w + (size_t)row * 4;
+        float cw0 = wc[0], cw1 = wc[1], cw2 = wc[2], cw3 = wc[3];
+        float inv5 = rsqrtf(5.0f);
+#pragma unroll
+        for (int m = 0; m < NT; ++m) {
+            size_t idx = (size_t)m * n_embd + row;
+            float x = vals[m];
+            float conv_out = (x + cw0 * h0 + cw1 * h1 + cw2 * h2 + cw3 * x) * inv5;
+            h0 = h1; h1 = h2; h2 = x;
+            if (snap) {
+                float* sn = snap + ((size_t)m * n_embd + row) * 3;
+                sn[0] = h0; sn[1] = h1; sn[2] = h2;
+            }
+            if (block_dst) {
+                block_dst[idx] = add_src[idx];
+                out[idx] = conv_out;
+            } else {
+                out[idx] = add_src[idx] + conv_out;
+            }
+        }
+        hc[0] = h0; hc[1] = h1; hc[2] = h2;
+    }
+}
+
+extern "C" int ink_wo_conv_res_q4_batch_snap(hipStream_t s, const uint8_t* W, const void* Xq, const float* conv_w, float* hist, float* snap, const float* add_src, float* block_dst, float* out, int n_embd, int q_dim, int B) {
+    if (B == 8) {
+        wo_conv_res_q4_nt_snap_k<8><<<dim3((n_embd + 31) / 32), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, conv_w, hist, snap, add_src, block_dst, out, n_embd, q_dim);
+        return 0;
+    }
+    if (B == 6) {
+        wo_conv_res_q4_nt_snap_k<6><<<dim3((n_embd + 31) / 32), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, conv_w, hist, snap, add_src, block_dst, out, n_embd, q_dim);
+        return 0;
+    }
+    if (B == 4) {
+        wo_conv_res_q4_nt_snap_k<4><<<dim3((n_embd + 31) / 32), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, conv_w, hist, snap, add_src, block_dst, out, n_embd, q_dim);
+        return 0;
+    }
+    return 1;
 }
 
 extern "C" int ink_qkvrg_gemm_sudot4(hipStream_t s, const uint8_t* wq, const uint8_t* wk, const uint8_t* wv, const uint8_t* wr, const uint8_t* wg, const uint16_t* wsink, const uint16_t* wkdyn, const uint16_t* wvdyn, const void* Xq0, const void* Xq1, const void* Xq2, const float* X0, const float* X1, const float* X2, float* Q, float* K, float* V, float* R, float* G, float* S, float* Kdyn, float* Vdyn, int k, int q_dim, int kv_dim, int r_dim, int n_head, int dyn_dim, int B, int is_q4) {
@@ -1580,15 +2193,15 @@ extern "C" int ink_qkvrg_gemm_sudot4(hipStream_t s, const uint8_t* wq, const uin
     }
     int total_rows = q_dim + kv_dim + kv_dim + r_dim + q_dim + n_head + 2 * dyn_dim;
     if (is_q4 && B == 8) {
-        qkvrg_q4_nt_k<8><<<dim3((total_rows + 3) / 4), dim3(128), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
+        qkvrg_q4_nt_k<8><<<dim3((total_rows + 31) / 32), dim3(256), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
         return 0;
     }
     if (is_q4 && B == 6) {
-        qkvrg_q4_nt_k<6><<<dim3((total_rows + 3) / 4), dim3(128), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
+        qkvrg_q4_nt_k<6><<<dim3((total_rows + 31) / 32), dim3(256), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
         return 0;
     }
     if (is_q4 && B == 4) {
-        qkvrg_q4_nt_k<4><<<dim3((total_rows + 3) / 4), dim3(128), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
+        qkvrg_q4_nt_k<4><<<dim3((total_rows + 31) / 32), dim3(256), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
         return 0;
     }
     qkvrg_gemm_sudot4_k<<<dim3((total_rows + 3) / 4, (B + 7) / 8), dim3(128), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim, B, is_q4);
@@ -3461,4 +4074,77 @@ extern "C" int ink_attn_batch_gated_q8(hipStream_t s, const float* Q, const floa
     }
     inkling_attn_batch_gated_q8_k<<<dim3(n_head, B), dim3(256), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, (q8_1_blk*)out_q8, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx);
     return 0;
+}
+
+template <int NT>
+__global__ void dflash2_gu_swiglu_q8_nt_k(const uint8_t* __restrict__ wg,
+                                          const uint8_t* __restrict__ wu,
+                                          const q8_1_blk* __restrict__ Xq,
+                                          q8_1_blk* __restrict__ out_q8,
+                                          int n_ff, int k) {
+    int grp = threadIdx.x >> 3;
+    int lane8 = threadIdx.x & 7;
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * 32 + grp;
+    int nblk = k >> 5;
+    int qblk_out = n_ff >> 5;
+    size_t rbytes = q4_soa_row_bytes(nblk);
+    int r_safe = min(row, n_ff - 1);
+    const uint8_t* wgr = wg + (size_t)r_safe * rbytes;
+    const uint8_t* wur = wu + (size_t)r_safe * rbytes;
+    const uint4* qgr = reinterpret_cast<const uint4*>(wgr);
+    const __half* dgr = reinterpret_cast<const __half*>(wgr + (size_t)nblk * 16);
+    const uint4* qur = reinterpret_cast<const uint4*>(wur);
+    const __half* dur = reinterpret_cast<const __half*>(wur + (size_t)nblk * 16);
+
+    float ag[NT];
+    float au[NT];
+#pragma unroll
+    for (int m = 0; m < NT; ++m) { ag[m] = 0.0f; au[m] = 0.0f; }
+    if (row < n_ff) {
+        for (int b = lane8; b < nblk; b += 8) {
+            uint4 qg = qgr[b];
+            uint4 qu = qur[b];
+            float dg = __half2float(dgr[b]);
+            float du = __half2float(dur[b]);
+#pragma unroll
+            for (int m = 0; m < NT; ++m) {
+                const q8_1_blk xb = Xq[(size_t)m * nblk + b];
+                ag[m] += dot_q4_soa_q8_1_blk(qg, dg, xb);
+                au[m] += dot_q4_soa_q8_1_blk(qu, du, xb);
+            }
+        }
+    }
+    __shared__ float sm_v[NT][32];
+    __shared__ int8_t sm_q[NT][32];
+#pragma unroll
+    for (int m = 0; m < NT; ++m) {
+        float g = s_warp_sum8(ag[m]);
+        float u = s_warp_sum8(au[m]);
+        if (lane8 == 0) {
+            sm_v[m][grp] = (row < n_ff) ? ((g / (1.0f + expf(-g))) * u) : 0.0f;
+        }
+    }
+    __syncthreads();
+    if (wid < NT) {
+        size_t qidx = (size_t)wid * qblk_out + blockIdx.x;
+        store_q8_1_from_warp(sm_v[wid][lane], lane, out_q8 + qidx, sm_q[wid]);
+    }
+}
+
+extern "C" int ink_dflash2_gu_swiglu_q8(hipStream_t s, const uint8_t* wg, const uint8_t* wu, const void* Xq, void* out_q8, int n_ff, int k, int B) {
+    if (B == 8) {
+        dflash2_gu_swiglu_q8_nt_k<8><<<dim3((n_ff + 31) / 32), dim3(256), 0, s>>>(wg, wu, (const q8_1_blk*)Xq, (q8_1_blk*)out_q8, n_ff, k);
+        return 0;
+    }
+    if (B == 6) {
+        dflash2_gu_swiglu_q8_nt_k<6><<<dim3((n_ff + 31) / 32), dim3(256), 0, s>>>(wg, wu, (const q8_1_blk*)Xq, (q8_1_blk*)out_q8, n_ff, k);
+        return 0;
+    }
+    if (B == 4) {
+        dflash2_gu_swiglu_q8_nt_k<4><<<dim3((n_ff + 31) / 32), dim3(256), 0, s>>>(wg, wu, (const q8_1_blk*)Xq, (q8_1_blk*)out_q8, n_ff, k);
+        return 0;
+    }
+    return 1;
 }

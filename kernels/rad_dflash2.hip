@@ -79,6 +79,82 @@ extern "C" __global__ void dflash2_conv_k(const float* __restrict__ hidden,
     out[(size_t)bt * n_embd + c] = w0 * v0 + w1 * v1;
 }
 
+extern "C" __global__ void dflash2_conv_add_k(const float* __restrict__ hidden,
+                                              const float* __restrict__ dynamic,
+                                              const float* __restrict__ base_kernel,
+                                              float* __restrict__ x_inout,
+                                              int n_embd, int block_size,
+                                              int group_size, int side) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int bt = blockIdx.y;
+    if (c >= n_embd) return;
+    int pos_in_blk = bt % block_size;
+    int n_groups = n_embd / group_size;
+    int g = c / group_size;
+    const float* dyn_t = dynamic + (size_t)bt * (size_t)(4 * n_groups) + (size_t)(side * 2 * n_groups);
+    const float* base_s = base_kernel + (size_t)(side * 2 * n_embd);
+    float w0 = base_s[c] + dyn_t[g];
+    float w1 = base_s[n_embd + c] + dyn_t[n_groups + g];
+    float v0 = hidden[(size_t)bt * n_embd + c];
+    float v1 = (pos_in_blk > 0) ? hidden[(size_t)(bt - 1) * n_embd + c] : 0.0f;
+    x_inout[(size_t)bt * n_embd + c] += w0 * v0 + w1 * v1;
+}
+
+struct df2_q8_1_blk {
+    float d;
+    int32_t s;
+    int32_t q[8];
+};
+
+__device__ __forceinline__ float df2_warp_max32(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down(v, off, 32));
+    return v;
+}
+
+__device__ __forceinline__ int32_t df2_warp_sum32_i(int32_t v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off, 32);
+    return v;
+}
+
+__device__ __forceinline__ int32_t df2_pack4_i8(int8_t a, int8_t b, int8_t c, int8_t d) {
+    return ((int32_t)(uint8_t)a) | (((int32_t)(uint8_t)b) << 8) | (((int32_t)(uint8_t)c) << 16) | (((int32_t)(uint8_t)d) << 24);
+}
+
+extern "C" __global__ void dspark_swiglu_q8_k(const float* __restrict__ gate,
+                                              const float* __restrict__ up,
+                                              df2_q8_1_blk* __restrict__ out_q8,
+                                              int k) {
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int nblk = k >> 5;
+    int b = blockIdx.x * 4 + wid;
+    if (b >= nblk) return;
+    int t = blockIdx.y;
+    size_t idx = (size_t)t * k + (b << 5) + lane;
+    float g = gate[idx];
+    float v = (g / (1.0f + expf(-g))) * up[idx];
+    float amax = __shfl(df2_warp_max32(fabsf(v)), 0, 32);
+    float d = amax / 127.0f;
+    float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    int qi = __float2int_rn(v * inv);
+    if (qi > 127) qi = 127;
+    if (qi < -127) qi = -127;
+    int32_t qsum = df2_warp_sum32_i(qi);
+    int q1 = __shfl_down(qi, 1, 32);
+    int q2 = __shfl_down(qi, 2, 32);
+    int q3 = __shfl_down(qi, 3, 32);
+    df2_q8_1_blk* dst = out_q8 + (size_t)t * nblk + b;
+    if (lane == 0) {
+        dst->d = d;
+        dst->s = qsum;
+    }
+    if ((lane & 3) == 0) {
+        dst->q[lane >> 2] = df2_pack4_i8((int8_t)qi, (int8_t)q1, (int8_t)q2, (int8_t)q3);
+    }
+}
+
 extern "C" __global__ void dflash2_topk16_k(const float* __restrict__ logits,
                                             int* __restrict__ cand_ids,
                                             float* __restrict__ cand_vals,
@@ -350,5 +426,16 @@ extern "C" int ink_dflash2_rope_norm_ctx_batch(hipStream_t s, const float* k_in,
 
 extern "C" int ink_dflash2_select_path(hipStream_t s, const int* cand_ids, const float* cand_vals, const float* h_proj, const uint16_t* pred_cb, const uint16_t* succ_cb, int* d_draft_toks, int n_users, int K_len, int rank, float softcap) {
     dflash2_select_path_k<<<dim3(n_users), dim3(256), 0, s>>>(cand_ids, cand_vals, h_proj, pred_cb, succ_cb, d_draft_toks, K_len, rank, softcap);
+    return 0;
+}
+
+extern "C" int ink_dflash2_conv_add(hipStream_t s, const float* hidden, const float* dynamic, const float* base_kernel, float* x_inout, int n_embd, int block_size, int group_size, int side, int B) {
+    dflash2_conv_add_k<<<dim3((n_embd + 255) / 256, B), dim3(256), 0, s>>>(hidden, dynamic, base_kernel, x_inout, n_embd, block_size, group_size, side);
+    return 0;
+}
+
+extern "C" int ink_dspark_swiglu_q8(hipStream_t s, const float* gate, const float* up, void* out_q8, int k, int B) {
+    int nblk = k >> 5;
+    dspark_swiglu_q8_k<<<dim3((nblk + 3) / 4, B), dim3(128), 0, s>>>(gate, up, (df2_q8_1_blk*)out_q8, k);
     return 0;
 }
