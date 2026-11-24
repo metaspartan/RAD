@@ -8,19 +8,19 @@ The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybri
 
 ## Highlights
 
-- **Native `incoai/Inkling-2-Mini-DFlash2` Speculative Decoding (`285.4 tok/s` Single-User, `3,367.5 tok/s` `pp2048` Prefill)**
-  - Zero-copy `safetensors` loader + 5-layer parallel block-diffusion drafter with `Q8_0` conv/selector projections, precomputed mask embeddings, 1 parallel `lm_head` pass, GPU top-16 candidate path selector, token-tiled 8-split Split-KV attention (`draft=2.24 ms` short ctx, `2.74 ms` at `2K ctx`), zero-spill compile-time `<NT>` `sudot4` kernels, and batched WMMA feature-injection (`verify=22.19 ms`, `inject=0.16 ms`, `avg_emit=7.13` on code; **`190.7 tok/s`** on math; **`129.5 tok/s`** at `2K ctx` in `rad bench`, and **`100.2 / 93.9 / 88.0 tok/s`** live HTTP+SSE at `2K / 4K / 8K` context).
-  - Full `hipGraph`-captured draft & verify loops for both single-user (`B=1` `tg128 = 102.5 tok/s`, `tg128 @ d=2048 = 94.1 tok/s` via GQA 3:1 Split-KV FlashDecoding + fused single-pass `float4` state mixing & loop controllers) and multi-user (`B=4` at **`458.5 agg tok/s` / `114.6 tok/s/user`**, `B=8` up to **`638.1 agg tok/s`**), plus fallback support for **DSpark** (`dspark-Inkling-2-Mini-Q8_0.gguf`).
+- **Native `incoai/Inkling-2-Mini-DFlash2` Speculative Decoding (`285.4 tok/s` Single-User, `3,415.7 tok/s` `pp2048` Prefill)**
+  - Zero-copy `safetensors` loader + 5-layer parallel block-diffusion drafter with `Q8_0` conv/selector projections, precomputed mask embeddings, 1 parallel `lm_head` pass, GPU top-16 candidate path selector, token-tiled 8-split Split-KV attention (`draft=2.24 ms` short ctx, `2.74 ms` at `2K ctx`), zero-spill compile-time `<NT>` `sudot4` kernels, and batched WMMA feature-injection (`verify=22.19 ms`, `inject=0.16 ms`, `avg_emit=7.13` on code; **`197.8 tok/s`** on math; **`94.5 tok/s`** on prose; **`129.5 tok/s`** at `2K ctx` in `rad bench`, and **`100.2 / 93.9 / 88.0 tok/s`** live HTTP+SSE at `2K / 4K / 8K` context).
+  - Full `hipGraph`-captured draft & verify loops for both single-user (`B=1` `tg128 = 106.5 tok/s`, `tg128 @ d=2048 = 96.5 tok/s` via GQA 3:1 Split-KV FlashDecoding + LDS-cached `Q8_1` activations + fused single-pass `float4` state mixing & loop controllers) and multi-user (`B=4` at **`468.8 agg tok/s` / `117.2 tok/s/user`**, `B=8` up to **`638.1 agg tok/s`**), plus fallback support for **DSpark** (`dspark-Inkling-2-Mini-Q8_0.gguf`).
 - **Native GPU Vision (`mmproj-F16.gguf`, Enabled by Default)**
   - Full 23-layer HIP ViT encoder (`640×640`, `20×20` patches, LayerScale `ls1`/`ls2`, bidirectional self-attention, `2×2` spatial merge, `inkling2v` MLP projector) outputting 256 multimodal embeddings directly into `InklingEngine` and `DFlash2Drafter`.
   - Works out of the box via OpenAI `image_url` (data URLs / local files) in `/v1/chat/completions` and `rad run --image <PATH>`.
 - **RDNA4 (`gfx1201`) 8-Warp Coalesced LDS-Tiled Wave32 WMMA Matrix Core Suite (ROCm 7.x)**
-  - Custom `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12` 8-warp `128×64` & `64×64` `BK=4` coalesced LDS-tiled kernels for `Q4_0_SOA` × `Q8_1` GEMM (`qkvrg`, `wo`, `lm_head`, grouped MoE gate/up, and zero-atomic grouped MoE down with 6-way hot-expert token splitting), zero-LDS warp-shuffle `Q8_1` quantization, compiled with `-ffast-math -munsafe-fp-atomics`.
+  - Custom `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12` 8-warp `128×64` & `64×64` `BK=4` coalesced LDS-tiled kernels for `Q4_0_SOA` × `Q8_1` GEMM (`qkvrg`, `wo`, `lm_head`, fused MoE gate/up-to-`Q8_1` eliminating `3.6 GB` FP32 round-trips on `pp2048`, and zero-atomic grouped MoE down with 6-way hot-expert token splitting), zero-LDS warp-shuffle `Q8_1` quantization, compiled with `-ffast-math -munsafe-fp-atomics`.
   - Custom `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` **FlashAttention-2** (reverse causal tile scheduling, bank-conflict-free LDS KV tile, register-preloaded `float4` relative-position projections, plus 4-warp Split-KV WMMA FlashAttention for `B=4..16`), fused multi-query `float4` state mixing (`mix_batch_f4_k`), register-cached `float4` RMSNorm, WMMA `sink_dyn_bf16`, single-pass `float4` & LDS WMMA loop controllers, and 64-CU `float4` router GEMM/GEMV.
 - **On-GPU `Q4_0_SOA` Weight Repacking & `hipGraph` Execution**
   - Converts `Q8_0`, `NVFP4`, and `BF16` tensors directly on GPU at load time (**~1.16 s** cold load) into 16-byte-aligned structure-of-arrays blocks for coalesced `uint4` loads and `sudot4` / WMMA execution.
 - **vLLM-Style Continuous Batching, Prefix Caching & Full OpenAI API (`rad`)**
-  - Dedicated GPU scheduler thread with prefix-cache affinity and continuous batched decode (`step_multi` with GQA 3:1 attention) scaling up to `B=128` concurrent sequences (**`1,821.5 agg tok/s`**).
+  - Dedicated GPU scheduler thread with prefix-cache affinity and continuous batched decode (`step_multi` with GQA 3:1 attention) scaling up to `B=128` concurrent sequences (**`1,856.0 agg tok/s`**).
   - `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (text + vision, JSON + SSE), `POST /v1/completions` (single + batch), `POST /v1/responses` (HTTP + SSE), `GET /v1/responses` (WebSocket).
 
 ---
@@ -31,15 +31,15 @@ The current focus of RAD is **Inkling-2-Mini** (26B MoE, 48 looped visits, hybri
 
 ![RAD vs Stock llama.cpp and RTX PRO 6000 Blackwell](assets/rad_benchmark.svg)
 
-Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)**, **same GGUF (`Inkling-2-Mini-UD-Q4_K_XL-v2.gguf`)**, and **same `B=1` / `ctx=4096` / `pp2048` / `tg128`** (`llama-bench` / vLLM-parity 3-run `mean ± stddev` via `rad bench`; RAD repacks GGUF `NVFP4`/`Q8_0` linear weights on-GPU to `Q4_0_SOA` at load time with **FP16 KV cache** vs. `llama.cpp`'s Q8 KV) — achieving **4.05× faster decode** and **4.45× faster `pp2048` prefill** than stock `llama.cpp`, and outperforming Unsloth's claimed **125 tok/s** on an **NVIDIA RTX PRO 6000 Blackwell (96 GB, ~\$8,500)** by **+128.3% (2.28×)**:
+Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)**, **same GGUF (`Inkling-2-Mini-UD-Q4_K_XL-v2.gguf`)**, and **same `B=1` / `ctx=4096` / `pp2048` / `tg128`** (`llama-bench` / vLLM-parity 3-run `mean ± stddev` via `rad bench`; RAD repacks GGUF `NVFP4`/`Q8_0` linear weights on-GPU to `Q4_0_SOA` at load time with **FP16 KV cache** vs. `llama.cpp`'s Q8 KV) — achieving **4.05× faster decode** and **4.52× faster `pp2048` prefill** than stock `llama.cpp`, and outperforming Unsloth's claimed **125 tok/s** on an **NVIDIA RTX PRO 6000 Blackwell (96 GB, ~\$8,500)** by **+128.3% (2.28×)**:
 
 | Engine / Hardware | Decode (`tok/s`) | `pp2048` Prefill (`tok/s`) | Notes |
 | --- | --- | --- | --- |
 | **Stock `llama.cpp` (R9700 + DSpark)** | `70.5 tok/s` | `765.5 tok/s` | `-fa on -ctk q8_0 -ctv q8_0 --spec-type draft-dspark` |
-| **RAD (R9700, No-Spec `hipGraph`)** | **`102.5 ± 0.6 tok/s`** (`1.45×`) | **`3,403.5 ± 2.9 tok/s`** (**`4.45×`**) | `tg128 @ d=2048 = 94.1 tok/s`; `pp512 = 2,934.2 ± 2.1 tok/s` |
+| **RAD (R9700, No-Spec `hipGraph`)** | **`106.5 ± 0.6 tok/s`** (`1.51×`) | **`3,459.2 ± 3.8 tok/s`** (**`4.52×`**) | `tg128 @ d=2048 = 96.5 tok/s`; `pp512 = 2,959.3 ± 0.9 tok/s` |
 | **Unsloth RTX PRO 6000 Blackwell** | `125.0 tok/s` *(claimed)* | — | 96 GB workstation GPU (~\$8,500) |
-| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`3,403.5 tok/s`** (**`4.45×`**) | `verify=23.7 ms`, `avg_emit=4.27` |
-| **RAD (R9700 + DFlash 2 `K=8`)** | **`285.4 tok/s`** (**`4.05×`**) | **`3,367.5 ± 0.7 tok/s`** (**`4.40×`**) | **2.28× vs. RTX PRO 6000 Blackwell**, `draft=2.29 ms`, `verify=22.28 ms`, `2K/4K/8K SSE = 100.2 / 93.9 / 88.0 tok/s` |
+| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`3,459.2 tok/s`** (**`4.52×`**) | `verify=23.7 ms`, `avg_emit=4.27` |
+| **RAD (R9700 + DFlash 2 `K=8`)** | **`285.4 tok/s`** (**`4.05×`**) | **`3,415.7 ± 2.0 tok/s`** (**`4.46×`**) | **2.28× vs. RTX PRO 6000 Blackwell**, `draft=2.29 ms`, `verify=22.28 ms`, `2K/4K/8K SSE = 100.2 / 93.9 / 88.0 tok/s` |
 
 ### Multi-User Continuous Batching & Batched Speculative Decoding
 
@@ -47,17 +47,17 @@ Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)**, *
 
 | Workload | Throughput / Latency | Notes |
 | --- | --- | --- |
-| **Cold Load (`max_seqs=16`, DFlash 2)** | **1.82 s** | On-GPU `Q4_0_SOA` + `Q8_0` conversion & `hipGraph` capture |
-| **Short Prompt TTFT (`15 tok`)** | **34.6 ± 0.1 ms** | 3-run mean; 8-warp LDS WMMA + fused `float4` state mixing |
+| **Cold Load (`max_seqs=16`, DFlash 2)** | **1.83 s** | On-GPU `Q4_0_SOA` + `Q8_0` conversion & `hipGraph` capture |
+| **Short Prompt TTFT (`15 tok`)** | **34.6 ± 0.0 ms** | 3-run mean; 8-warp LDS WMMA + fused `float4` state mixing |
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **32.5 ms** | Prefix-cache affinity hit |
-| **Multi-User Decode (`B=4`, Batched DFlash 2 `K=4`)** | **458.5 agg tok/s** | **`114.6 tok/s/user`** (`ITL 8.7 ms`, zero-spill MoE + LDS WMMA) |
+| **Multi-User Decode (`B=4`, Batched DFlash 2 `K=4`)** | **468.8 agg tok/s** | **`117.2 tok/s/user`** (`ITL 8.5 ms`, zero-spill MoE + LDS WMMA) |
 | **Multi-User Decode (`B=8`, no-spec)** | **516.9 agg tok/s** | `64.6 tok/s/user` (`ITL 15.5 ms`, `hipGraph` + fused `float4` mix) |
 | **Multi-User Decode (`B=8`, Batched DSpark `K=4`)** | **458.6 agg tok/s** | `57.3 tok/s/user` |
 | **Multi-User Decode (`B=8`, Batched DFlash 2 `K=4`)** | **638.1 agg tok/s** | **`79.8 tok/s/user`** (8 concurrent users each faster than single-user `llama.cpp`) |
-| **Multi-User Decode (`B=16`, no-spec)** | **680.2 agg tok/s** | `42.5 tok/s/user` (`ITL 23.5 ms`) |
-| **Multi-User Decode (`B=32`, no-spec)** | **848.3 agg tok/s** | `26.5 tok/s/user` (GQA 3:1 multi-user attention + `float4` RMSNorm) |
+| **Multi-User Decode (`B=16`, no-spec)** | **683.5 agg tok/s** | `42.7 tok/s/user` (`ITL 23.4 ms`) |
+| **Multi-User Decode (`B=32`, no-spec)** | **867.2 agg tok/s** | `27.1 tok/s/user` (GQA 3:1 multi-user attention + `float4` RMSNorm) |
 | **Multi-User Decode (`B=64`, no-spec)** | **1,162.2 agg tok/s** | `18.2 tok/s/user` (8-warp `128×64` LDS WMMA MoE) |
-| **Multi-User Decode (`B=128`, no-spec)** | **1,821.5 agg tok/s** | **`14.2 tok/s/user`** (8-warp LDS WMMA + `float4` MoE slot reduction) |
+| **Multi-User Decode (`B=128`, no-spec)** | **1,856.0 agg tok/s** | **`14.5 tok/s/user`** (fused WMMA MoE-to-`Q8_1` + `float4` slot reduction) |
 
 ---
 

@@ -29,6 +29,22 @@ __device__ __forceinline__ float w_warp_sum32(float v) {
     return v;
 }
 
+__device__ __forceinline__ float w_fmax32_top(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down(v, off, 32));
+    return v;
+}
+
+__device__ __forceinline__ int32_t w_isum32_top(int32_t v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off, 32);
+    return v;
+}
+
+__device__ __forceinline__ int32_t w_p4i8_top(int8_t a, int8_t b, int8_t c, int8_t d) {
+    return ((int32_t)(uint8_t)a) | (((int32_t)(uint8_t)b) << 8) | (((int32_t)(uint8_t)c) << 16) | (((int32_t)(uint8_t)d) << 24);
+}
+
 extern "C" __global__ void gemm_q4_0_wmma64_k(const uint8_t* __restrict__ W,
                                               const w_q8_1_blk* __restrict__ Xq,
                                               float* __restrict__ Y,
@@ -930,6 +946,220 @@ extern "C" __global__ void moe_gu_q4_0_wmma_k(const uint8_t* __restrict__ W,
     }
 }
 
+extern "C" __global__ void moe_gu_q4_0_wmma_q8_k(const uint8_t* __restrict__ W,
+                                                 const float* __restrict__ scales,
+                                                 const w_q8_1_blk* __restrict__ Xq,
+                                                 const int* __restrict__ exp_counts,
+                                                 const int* __restrict__ exp_offsets,
+                                                 const int* __restrict__ tok_sorted,
+                                                 const int* __restrict__ slot_sorted,
+                                                 w_q8_1_blk* __restrict__ act_q,
+                                                 int n_ff, int k, int n_used,
+                                                 float beta, float lb) {
+    int exp_id = exp_counts[128 + blockIdx.y];
+    if (exp_id < 0) return;
+    int cnt = exp_counts[exp_id];
+    if (cnt == 0) return;
+    int off0 = exp_offsets[exp_id];
+
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int col = lane & 15;
+    int half = lane >> 4;
+    int wm = warp >> 1;
+    int wn = warp & 1;
+    int blk_row0 = blockIdx.x * 64;
+    if (blk_row0 >= n_ff) return;
+
+    int nblk = k >> 5;
+    size_t rbytes = w_q4_soa_row_bytes(nblk);
+    size_t exp_bytes = (size_t)(2 * n_ff) * rbytes;
+
+    __shared__ union {
+        struct {
+            uint4 wg[4][64];
+            uint4 wu[4][64];
+            float dg[4][64];
+            float du[4][64];
+            int2 xq[4][4][64];
+            float xd[4][64];
+            int32_t xs[4][64];
+        } t;
+        float act[64][65];
+    } sm;
+
+    int r_loc = tid >> 2;
+    int kb_load = tid & 3;
+    int r_g = min(blk_row0 + r_loc, n_ff - 1);
+    const uint8_t* wg_p = W + (size_t)exp_id * exp_bytes + (size_t)r_g * rbytes;
+    const uint8_t* wu_p = W + (size_t)exp_id * exp_bytes + (size_t)(n_ff + r_g) * rbytes;
+    const uint4* qg_r = reinterpret_cast<const uint4*>(wg_p);
+    const __half* dg_r = reinterpret_cast<const __half*>(wg_p + (size_t)nblk * 16);
+    const uint4* qu_r = reinterpret_cast<const uint4*>(wu_p);
+    const __half* du_r = reinterpret_cast<const __half*>(wu_p + (size_t)nblk * 16);
+    float sc = scales ? scales[exp_id] : 1.0f;
+
+    int m0 = wm * 16;
+    int n0 = wn * 32;
+    int n1 = n0 + 16;
+    int qblk_per_slot = n_ff >> 5;
+    int blk_base = blk_row0 >> 5;
+
+    int z_id = blockIdx.z;
+    int z_n = gridDim.z;
+    for (int t0 = z_id * 64; t0 < cnt; t0 += z_n * 64) {
+        int nt = min(64, cnt - t0);
+        int idx_l = off0 + t0 + min(r_loc, nt - 1);
+        const w_q8_1_blk* xr = Xq + (size_t)tok_sorted[idx_l] * nblk;
+
+        float ag0[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        float au0[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        float ag1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        float au1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+        for (int b0 = 0; b0 < nblk; b0 += 4) {
+            int b = b0 + kb_load;
+            if (b < nblk) {
+                sm.t.wg[kb_load][r_loc] = qg_r[b];
+                sm.t.dg[kb_load][r_loc] = __half2float(dg_r[b]);
+                sm.t.wu[kb_load][r_loc] = qu_r[b];
+                sm.t.du[kb_load][r_loc] = __half2float(du_r[b]);
+                const w_q8_1_blk xb = xr[b];
+                sm.t.xq[kb_load][0][r_loc] = make_int2(xb.q[0], xb.q[1]);
+                sm.t.xq[kb_load][1][r_loc] = make_int2(xb.q[2], xb.q[3]);
+                sm.t.xq[kb_load][2][r_loc] = make_int2(xb.q[4], xb.q[5]);
+                sm.t.xq[kb_load][3][r_loc] = make_int2(xb.q[6], xb.q[7]);
+                sm.t.xd[kb_load][r_loc] = xb.d;
+                sm.t.xs[kb_load][r_loc] = 8 * xb.s;
+            } else {
+                sm.t.wg[kb_load][r_loc] = make_uint4(0, 0, 0, 0);
+                sm.t.dg[kb_load][r_loc] = 0.0f;
+                sm.t.wu[kb_load][r_loc] = make_uint4(0, 0, 0, 0);
+                sm.t.du[kb_load][r_loc] = 0.0f;
+                sm.t.xd[kb_load][r_loc] = 0.0f;
+                sm.t.xs[kb_load][r_loc] = 0;
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (int kb = 0; kb < 4; ++kb) {
+                uint4 qg = sm.t.wg[kb][m0 + col];
+                uint32_t g0 = half ? qg.z : qg.x;
+                uint32_t g1 = half ? qg.w : qg.y;
+                wmma_i2_v ag_lo = {(int32_t)(g0 & 0x0F0F0F0Fu), (int32_t)(g1 & 0x0F0F0F0Fu)};
+                wmma_i2_v ag_hi = {(int32_t)((g0 >> 4) & 0x0F0F0F0Fu), (int32_t)((g1 >> 4) & 0x0F0F0F0Fu)};
+
+                uint4 qu = sm.t.wu[kb][m0 + col];
+                uint32_t u0 = half ? qu.z : qu.x;
+                uint32_t u1 = half ? qu.w : qu.y;
+                wmma_i2_v au_lo = {(int32_t)(u0 & 0x0F0F0F0Fu), (int32_t)(u1 & 0x0F0F0F0Fu)};
+                wmma_i2_v au_hi = {(int32_t)((u0 >> 4) & 0x0F0F0F0Fu), (int32_t)((u1 >> 4) & 0x0F0F0F0Fu)};
+
+                int2 x0l = sm.t.xq[kb][half][n0 + col];
+                int2 x0h = sm.t.xq[kb][2 + half][n0 + col];
+                wmma_i2_v b0_lo = {x0l.x, x0l.y};
+                wmma_i2_v b0_hi = {x0h.x, x0h.y};
+
+                int2 x1l = sm.t.xq[kb][half][n1 + col];
+                int2 x1h = sm.t.xq[kb][2 + half][n1 + col];
+                wmma_i2_v b1_lo = {x1l.x, x1l.y};
+                wmma_i2_v b1_hi = {x1h.x, x1h.y};
+
+                wmma_i8_v cg0 = {0, 0, 0, 0, 0, 0, 0, 0};
+                wmma_i8_v cu0 = {0, 0, 0, 0, 0, 0, 0, 0};
+                wmma_i8_v cg1 = {0, 0, 0, 0, 0, 0, 0, 0};
+                wmma_i8_v cu1 = {0, 0, 0, 0, 0, 0, 0, 0};
+                cg0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_lo, true, b0_lo, cg0, false);
+                cg0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_hi, true, b0_hi, cg0, false);
+                cu0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_lo, true, b0_lo, cu0, false);
+                cu0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_hi, true, b0_hi, cu0, false);
+                cg1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_lo, true, b1_lo, cg1, false);
+                cg1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_hi, true, b1_hi, cg1, false);
+                cu1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_lo, true, b1_lo, cu1, false);
+                cu1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_hi, true, b1_hi, cu1, false);
+
+                float xd0 = sm.t.xd[kb][n0 + col];
+                int32_t xs0 = sm.t.xs[kb][n0 + col];
+                float xd1 = sm.t.xd[kb][n1 + col];
+                int32_t xs1 = sm.t.xs[kb][n1 + col];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    float dgi = sm.t.dg[kb][m0 + half * 8 + i];
+                    float dui = sm.t.du[kb][m0 + half * 8 + i];
+                    ag0[i] = fmaf(dgi * xd0, (float)(cg0[i] - xs0), ag0[i]);
+                    au0[i] = fmaf(dui * xd0, (float)(cu0[i] - xs0), au0[i]);
+                    ag1[i] = fmaf(dgi * xd1, (float)(cg1[i] - xs1), ag1[i]);
+                    au1[i] = fmaf(dui * xd1, (float)(cu1[i] - xs1), au1[i]);
+                }
+            }
+            __syncthreads();
+        }
+        if (n0 + col < nt) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int lr = m0 + half * 8 + i;
+                int r = blk_row0 + lr;
+                float v = 0.0f;
+                if (r < n_ff) {
+                    float g = ag0[i] * sc;
+                    float u = au0[i] * sc;
+                    float sg = 1.0f / (1.0f + expf(-g));
+                    float act = beta * tanhf(g / beta) * sg;
+                    float up = (lb > 0.0f) ? (lb * tanhf(u / lb)) : u;
+                    v = act * up;
+                }
+                sm.act[n0 + col][lr] = v;
+            }
+        }
+        if (n1 + col < nt) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int lr = m0 + half * 8 + i;
+                int r = blk_row0 + lr;
+                float v = 0.0f;
+                if (r < n_ff) {
+                    float g = ag1[i] * sc;
+                    float u = au1[i] * sc;
+                    float sg = 1.0f / (1.0f + expf(-g));
+                    float act = beta * tanhf(g / beta) * sg;
+                    float up = (lb > 0.0f) ? (lb * tanhf(u / lb)) : u;
+                    v = act * up;
+                }
+                sm.act[n1 + col][lr] = v;
+            }
+        }
+        __syncthreads();
+        for (int idx = warp; idx < nt * 2; idx += 8) {
+            int tk = idx >> 1;
+            int blk = idx & 1;
+            if (blk_base + blk < qblk_per_slot) {
+                float v = sm.act[tk][blk * 32 + lane];
+                float amax = __shfl(w_fmax32_top(fabsf(v)), 0, 32);
+                float d = amax / 127.0f;
+                float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+                int qi = __float2int_rn(v * inv);
+                if (qi > 127) qi = 127;
+                if (qi < -127) qi = -127;
+                int32_t qsum = w_isum32_top(qi);
+                int q1 = __shfl_down(qi, 1, 32);
+                int q2 = __shfl_down(qi, 2, 32);
+                int q3 = __shfl_down(qi, 3, 32);
+                int t_idx = off0 + t0 + tk;
+                w_q8_1_blk* dst = act_q + ((size_t)tok_sorted[t_idx] * n_used + slot_sorted[t_idx]) * qblk_per_slot + blk_base + blk;
+                if (lane == 0) {
+                    dst->d = d;
+                    dst->s = qsum;
+                }
+                if ((lane & 3) == 0) {
+                    dst->q[lane >> 2] = w_p4i8_top((int8_t)qi, (int8_t)q1, (int8_t)q2, (int8_t)q3);
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
 extern "C" __global__ void moe_dn_q4_0_wmma_k(const uint8_t* __restrict__ W,
                                               const w_q8_1_blk* __restrict__ act_q,
                                               const int* __restrict__ exp_counts,
@@ -1594,6 +1824,13 @@ extern "C" int ink_moe_gu_q4_0_wmma(hipStream_t s, const uint8_t* W, const float
     int gy = (B * n_used < 128) ? (B * n_used) : 128;
     int gz = (B >= 512) ? 6 : ((B >= 128) ? 2 : 1);
     moe_gu_q4_0_wmma_k<<<dim3((n_ff + 63) / 64, gy, gz), dim3(256), 0, s>>>(W, scales, (const w_q8_1_blk*)Xq, exp_counts, exp_offsets, tok_sorted, slot_sorted, act_out, n_ff, k, n_used, beta, lb);
+    return 0;
+}
+
+extern "C" int ink_moe_gu_q4_0_wmma_to_q8(hipStream_t s, const uint8_t* W, const float* scales, const void* Xq, const int* exp_counts, const int* exp_offsets, const int* tok_sorted, const int* slot_sorted, void* act_q, int n_ff, int k, int n_used, float beta, float lb, int B) {
+    int gy = (B * n_used < 128) ? (B * n_used) : 128;
+    int gz = (B >= 512) ? 6 : ((B >= 128) ? 2 : 1);
+    moe_gu_q4_0_wmma_q8_k<<<dim3((n_ff + 63) / 64, gy, gz), dim3(256), 0, s>>>(W, scales, (const w_q8_1_blk*)Xq, exp_counts, exp_offsets, tok_sorted, slot_sorted, (w_q8_1_blk*)act_q, n_ff, k, n_used, beta, lb);
     return 0;
 }
 

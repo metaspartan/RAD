@@ -1199,9 +1199,17 @@ extern "C" __global__ void moe_dn_conv_add_q4_0_b1_sudot4_k(const uint8_t* __res
     int grp = threadIdx.x >> 3;
     int lane8 = threadIdx.x & 7;
     int row = blockIdx.x * 16 + grp;
-    if (row >= n_embd) return;
-
     int nblk = n_ff >> 5;
+    int tot_aq = n_used * nblk;
+
+    __shared__ q8_1_blk sm_aq[288];
+    if (tot_aq <= 288) {
+        for (int i = threadIdx.x; i < tot_aq; i += 128) sm_aq[i] = act_q[i];
+        __syncthreads();
+    }
+    if (row >= n_embd) return;
+    const q8_1_blk* aq_base = (tot_aq <= 288) ? sm_aq : act_q;
+
     size_t row_bytes = q4_soa_row_bytes(nblk);
     size_t exp_bytes = (size_t)n_embd * row_bytes;
 
@@ -1212,7 +1220,7 @@ extern "C" __global__ void moe_dn_conv_add_q4_0_b1_sudot4_k(const uint8_t* __res
         const uint8_t* wrow = W + (size_t)exp_id * exp_bytes + (size_t)row * row_bytes;
         const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
         const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
-        const q8_1_blk* aq = act_q + (size_t)s * nblk;
+        const q8_1_blk* aq = aq_base + (size_t)s * nblk;
         float acc = 0.0f;
         for (int b = lane8; b < nblk; b += 8) {
             acc += dot_q4_soa_q8_1_blk(qrow[b], __half2float(drow[b]), aq[b]);
@@ -2350,10 +2358,17 @@ extern "C" __global__ void moe_gu_q4_0_b1_to_q8_k(const uint8_t* __restrict__ W,
     int grp = threadIdx.x >> 3;
     int lane8 = threadIdx.x & 7;
     int row = blockIdx.x * 32 + grp;
+    int nblk = k >> 5;
+
+    __shared__ q8_1_blk sm_x[96];
+    if (nblk <= 96) {
+        if (threadIdx.x < nblk) sm_x[threadIdx.x] = Xq[threadIdx.x];
+        __syncthreads();
+    }
+    const q8_1_blk* xsrc = (nblk <= 96) ? sm_x : Xq;
 
     __shared__ float sm_v[32];
     if (row < n_ff) {
-        int nblk = k >> 5;
         size_t row_bytes = q4_soa_row_bytes(nblk);
         size_t exp_bytes = (size_t)(2 * n_ff) * row_bytes;
         const uint8_t* wg = W + (size_t)exp_id * exp_bytes + (size_t)row * row_bytes;
@@ -2365,7 +2380,7 @@ extern "C" __global__ void moe_gu_q4_0_b1_to_q8_k(const uint8_t* __restrict__ W,
 
         float ag = 0.0f, au = 0.0f;
         for (int b = lane8; b < nblk; b += 8) {
-            const q8_1_blk xb = Xq[b];
+            const q8_1_blk xb = xsrc[b];
             ag += dot_q4_soa_q8_1_blk(qg_row[b], __half2float(dg_row[b]), xb);
             au += dot_q4_soa_q8_1_blk(qu_row[b], __half2float(du_row[b]), xb);
         }
@@ -2420,7 +2435,8 @@ extern "C" __global__ void qkvrg_q4_b1_k(const uint8_t* __restrict__ wq,
                                          int r_dim, int n_head, int dyn_dim) {
     int grp = threadIdx.x >> 3;
     int lane8 = threadIdx.x & 7;
-    int gid = blockIdx.x * 16 + grp;
+    int blk_gid0 = blockIdx.x * 16;
+    int gid = blk_gid0 + grp;
 
     int o1 = q_dim;
     int o2 = o1 + kv_dim;
@@ -2430,6 +2446,19 @@ extern "C" __global__ void qkvrg_q4_b1_k(const uint8_t* __restrict__ wq,
     int o6 = o5 + n_head;
     int o7 = o6 + dyn_dim;
     int o8 = o7 + dyn_dim;
+
+    int nblk = k >> 5;
+    __shared__ q8_1_blk sm_x[96];
+    const q8_1_blk* blk_xq = nullptr;
+    if (nblk <= 96 && blk_gid0 + 15 < o5) {
+        if (blk_gid0 + 15 < o1 || (blk_gid0 >= o3 && blk_gid0 + 15 < o5)) blk_xq = Xq0;
+        else if (blk_gid0 >= o1 && blk_gid0 + 15 < o2) blk_xq = Xq1;
+        else if (blk_gid0 >= o2 && blk_gid0 + 15 < o3) blk_xq = Xq2;
+    }
+    if (blk_xq) {
+        if (threadIdx.x < nblk) sm_x[threadIdx.x] = blk_xq[threadIdx.x];
+        __syncthreads();
+    }
     if (gid >= o8) return;
 
     if (gid < o5) {
@@ -2443,14 +2472,14 @@ extern "C" __global__ void qkvrg_q4_b1_k(const uint8_t* __restrict__ wq,
         else if (gid < o4) { W = wr; Xq = Xq0; Y = R; row = gid - o3; }
         else { W = wg; Xq = Xq0; Y = G; row = gid - o4; }
 
-        int nblk = k >> 5;
+        const q8_1_blk* xsrc = blk_xq ? sm_x : Xq;
         size_t rbytes = q4_soa_row_bytes(nblk);
         const uint8_t* wrow = W + (size_t)row * rbytes;
         const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
         const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
         float acc = 0.0f;
         for (int b = lane8; b < nblk; b += 8) {
-            acc += dot_q4_soa_q8_1_blk(qrow[b], __half2float(drow[b]), Xq[b]);
+            acc += dot_q4_soa_q8_1_blk(qrow[b], __half2float(drow[b]), xsrc[b]);
         }
         acc = s_warp_sum8(acc);
         if (lane8 == 0) Y[row] = acc;
@@ -2462,10 +2491,22 @@ extern "C" __global__ void qkvrg_q4_b1_k(const uint8_t* __restrict__ wq,
         if (gid < o6) { W = wsink; X = X0; Y = S; row = gid - o5; }
         else if (gid < o7) { W = wkdyn; X = X1; Y = Kdyn; row = gid - o6; }
         else { W = wvdyn; X = X2; Y = Vdyn; row = gid - o7; }
-        const uint16_t* wrow = W + (size_t)row * k;
+        const uint4* w4 = reinterpret_cast<const uint4*>(W + (size_t)row * k);
+        const float4* x4 = reinterpret_cast<const float4*>(X);
+        int k8 = k >> 3;
         float acc = 0.0f;
-        for (int j = lane8; j < k; j += 8) {
-            acc = fmaf(s_bf16_f32(wrow[j]), X[j], acc);
+        for (int j = lane8; j < k8; j += 8) {
+            uint4 wv = w4[j];
+            float4 x0 = x4[j * 2];
+            float4 x1 = x4[j * 2 + 1];
+            acc = fmaf(s_bf16_f32((uint16_t)(wv.x & 0xFFFFu)), x0.x, acc);
+            acc = fmaf(s_bf16_f32((uint16_t)(wv.x >> 16)), x0.y, acc);
+            acc = fmaf(s_bf16_f32((uint16_t)(wv.y & 0xFFFFu)), x0.z, acc);
+            acc = fmaf(s_bf16_f32((uint16_t)(wv.y >> 16)), x0.w, acc);
+            acc = fmaf(s_bf16_f32((uint16_t)(wv.z & 0xFFFFu)), x1.x, acc);
+            acc = fmaf(s_bf16_f32((uint16_t)(wv.z >> 16)), x1.y, acc);
+            acc = fmaf(s_bf16_f32((uint16_t)(wv.w & 0xFFFFu)), x1.z, acc);
+            acc = fmaf(s_bf16_f32((uint16_t)(wv.w >> 16)), x1.w, acc);
         }
         acc = s_warp_sum8(acc);
         if (lane8 == 0) Y[row] = acc;
@@ -2483,15 +2524,21 @@ extern "C" __global__ void wo_conv_res_q4_b1_8_k(const uint8_t* __restrict__ W,
     int grp = threadIdx.x >> 3;
     int lane8 = threadIdx.x & 7;
     int row = blockIdx.x * 16 + grp;
-    if (row >= n_embd) return;
     int nblk = q_dim >> 5;
+    __shared__ q8_1_blk sm_x[96];
+    if (nblk <= 96) {
+        if (threadIdx.x < nblk) sm_x[threadIdx.x] = Xq[threadIdx.x];
+        __syncthreads();
+    }
+    if (row >= n_embd) return;
+    const q8_1_blk* xsrc = (nblk <= 96) ? sm_x : Xq;
     size_t rbytes = q4_soa_row_bytes(nblk);
     const uint8_t* wrow = W + (size_t)row * rbytes;
     const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
     const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
     float acc = 0.0f;
     for (int b = lane8; b < nblk; b += 8) {
-        acc += dot_q4_soa_q8_1_blk(qrow[b], __half2float(drow[b]), Xq[b]);
+        acc += dot_q4_soa_q8_1_blk(qrow[b], __half2float(drow[b]), xsrc[b]);
     }
     acc = s_warp_sum8(acc);
     if (lane8 == 0) {
@@ -2516,15 +2563,21 @@ extern "C" __global__ void gemv_q4_b1_8_k(const uint8_t* __restrict__ W,
     int grp = threadIdx.x >> 3;
     int lane8 = threadIdx.x & 7;
     int row = blockIdx.x * 16 + grp;
-    if (row >= n) return;
     int nblk = k >> 5;
+    __shared__ q8_1_blk sm_x[96];
+    if (nblk <= 96) {
+        if (threadIdx.x < nblk) sm_x[threadIdx.x] = Xq[threadIdx.x];
+        __syncthreads();
+    }
+    if (row >= n) return;
+    const q8_1_blk* xsrc = (nblk <= 96) ? sm_x : Xq;
     size_t rbytes = q4_soa_row_bytes(nblk);
     const uint8_t* wrow = W + (size_t)row * rbytes;
     const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
     const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
     float acc = 0.0f;
     for (int b = lane8; b < nblk; b += 8) {
-        acc += dot_q4_soa_q8_1_blk(qrow[b], __half2float(drow[b]), Xq[b]);
+        acc += dot_q4_soa_q8_1_blk(qrow[b], __half2float(drow[b]), xsrc[b]);
     }
     acc = s_warp_sum8(acc);
     if (lane8 == 0) Y[row] = acc;

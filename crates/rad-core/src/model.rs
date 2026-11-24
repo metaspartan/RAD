@@ -1382,11 +1382,11 @@ impl InklingEngine {
                     self.bsc.wt_sorted.ptr as *mut f32, self.cfg.n_expert_used as i32, bi,
                 );
                 if b >= 48 {
-                    ops::ink_moe_gu_q4_0_wmma(
+                    ops::ink_moe_gu_q4_0_wmma_to_q8(
                         s, l.ffn_gate_up_exps.buf.ptr as *const u8, gu_sc, self.bsc.xq.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
                         self.bsc.tok_sorted.ptr as *const i32, self.bsc.slot_sorted.ptr as *const i32,
-                        moe_act, self.cfg.n_ff_exp as i32, e, self.cfg.n_expert_used as i32,
+                        self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, e, self.cfg.n_expert_used as i32,
                         self.cfg.situ_beta, self.cfg.situ_lb, bi,
                     );
                 } else {
@@ -1417,7 +1417,6 @@ impl InklingEngine {
             }
             WeightType::Q4_0 => {
                 if b >= 48 {
-                    ops::ink_quantize_q8_1(s, moe_act, self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, bi * self.cfg.n_expert_used as i32);
                     ops::ink_moe_dn_q4_0_wmma(
                         s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -2185,11 +2184,11 @@ impl InklingEngine {
                     self.bsc.wt_sorted.ptr as *mut f32, self.cfg.n_expert_used as i32, bi,
                 );
                 if b >= 48 {
-                    ops::ink_moe_gu_q4_0_wmma(
+                    ops::ink_moe_gu_q4_0_wmma_to_q8(
                         s, l.ffn_gate_up_exps.buf.ptr as *const u8, gu_sc, self.bsc.xq.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
                         self.bsc.tok_sorted.ptr as *const i32, self.bsc.slot_sorted.ptr as *const i32,
-                        moe_act, self.cfg.n_ff_exp as i32, e, self.cfg.n_expert_used as i32,
+                        self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, e, self.cfg.n_expert_used as i32,
                         self.cfg.situ_beta, self.cfg.situ_lb, bi,
                     );
                 } else {
@@ -2220,7 +2219,6 @@ impl InklingEngine {
             }
             WeightType::Q4_0 => {
                 if b >= 48 {
-                    ops::ink_quantize_q8_1(s, moe_act, self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, bi * self.cfg.n_expert_used as i32);
                     ops::ink_moe_dn_q4_0_wmma(
                         s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
                         self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
@@ -2893,11 +2891,11 @@ impl InklingEngine {
                             self.bsc.wt_sorted.ptr as *mut f32, self.cfg.n_expert_used as i32, bi,
                         );
                         if b >= 48 {
-                            ops::ink_moe_gu_q4_0_wmma(
+                            ops::ink_moe_gu_q4_0_wmma_to_q8(
                                 s, l.ffn_gate_up_exps.buf.ptr as *const u8, gu_sc, xq0,
                                 self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
                                 self.bsc.tok_sorted.ptr as *const i32, self.bsc.slot_sorted.ptr as *const i32,
-                                self.bsc.moe_act.ptr as *mut f32, self.cfg.n_ff_exp as i32, e, self.cfg.n_expert_used as i32,
+                                self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, e, self.cfg.n_expert_used as i32,
                                 self.cfg.situ_beta, self.cfg.situ_lb, bi,
                             );
                         } else {
@@ -2914,7 +2912,6 @@ impl InklingEngine {
                     t_mgu += (t8 - t7).as_secs_f64() * 1000.0;
                     unsafe {
                         if b >= 48 {
-                            ops::ink_quantize_q8_1(s, self.bsc.moe_act.ptr as *const f32, self.bsc.act_q.ptr, self.cfg.n_ff_exp as i32, bi * self.cfg.n_expert_used as i32);
                             ops::ink_moe_dn_q4_0_wmma(
                                 s, l.ffn_down_exps.buf.ptr as *const u8, self.bsc.act_q.ptr,
                                 self.bsc.exp_counts.ptr as *const i32, self.bsc.exp_offsets.ptr as *const i32,
