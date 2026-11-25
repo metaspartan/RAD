@@ -1,8 +1,10 @@
-# RAD — Inference Engine
+# RAD - Inference Engine
 
-**RAD** is a high-performance, from-scratch multimodal LLM inference engine written in **Rust** and **ROCm/HIP**, engineered for ultra-fast single-user speculative generation, 256K long-context inference, and high-throughput multi-user serving on **AMD Radeon AI PRO R9700 (RDNA4 `gfx1201`)**.
+**RAD** is a high-performance, from-scratch multimodal LLM inference engine written in **Rust**, **ROCm/HIP**, and **CUDA**, engineered for ultra-fast single-user speculative generation, 256K long-context inference, and high-throughput multi-user serving on **AMD Radeon AI PRO R9700 (RDNA4 `gfx1201`)** and **NVIDIA Blackwell (`sm_121`, 2x DGX Spark / ASUS Ascent GX10 over ConnectX-7 RoCE v2 RDMA)**.
 
-RAD natively runs **Inkling-2-Mini** (26B MoE, 48 looped visits, hybrid SWA + full attention, dynamic shortconv, rank-64 loop controllers, native **DFlash 2** & **DSpark** speculative decoding, and native **GPU Vision** via `mmproj-F16.gguf`) with zero external inference runtime dependencies.
+RAD natively runs:
+- **Inkling-2-Mini (ROCm/HIP, R9700 `gfx1201`):** 26B MoE, 48 looped visits, hybrid SWA + full attention, dynamic shortconv, rank-64 loop controllers, native **DFlash 2** & **DSpark** speculative decoding, and native **GPU Vision** via `mmproj-F16.gguf`.
+- **DeepSeek-V4.1-Flash-1017 EXL3 (CUDA, 2x DGX Spark `sm_121`):** 40-layer 384-expert MoE (2/3/4/5/6-bit EXL3 `mul1` Tensor Core `mma.sync.aligned.m16n8k16` kernels), 4-stream FP32 mHC Sinkhorn-Knopp, CSA2 sliding-window MQA with `attn_sink` & inverse RoPE, zero-copy GPU-mapped ConnectX-7 RoCE v2 RDMA (`7 us` AllReduce), Engram conditional memory (`layers.1` & `layers.14`), native 3-layer DSpark MTP (`block_size=5`), and DSML tool-call + reasoning OpenAI API.
 
 ---
 
@@ -91,6 +93,22 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 
 ---
 
+## Benchmarks (2x NVIDIA DGX Spark / ASUS Ascent GX10, `sm_121`, CUDA)
+
+First CUDA backend (`rad-cuda` + `rad-dsv41`) running **DeepSeek-V4.1-Flash-1017 EXL3** (40 layers, 384 experts, 2/3/4/5/6-bit EXL3 `mul1` weights, 4-stream FP32 mHC Sinkhorn-Knopp, CSA2 sliding-window MQA with `attn_sink` & inverse RoPE, Engram conditional memory, native 3-layer DSpark MTP) across **2x NVIDIA GB10 Blackwell (`sm_121`)** nodes over **ConnectX-7 RoCE v2 RDMA (`rocep1s0f1`)**:
+
+| Component / Workload | Measured Performance | Notes |
+| --- | --- | --- |
+| **EXL3 `mul1` Tensor Core GEMV (`M=1`, 4-bit)** | **269.9 GB/s** (**98.9% peak**) | `mma.sync.aligned.m16n8k16` (`rad_exl3_mma.cu`), verified `<2e-5` rel_err across 2/3/4/5/6-bit |
+| **EXL3 `mul1` Tensor Core Prefill (`M=16..64`)** | **21.02 TFLOPS** | Fused WHT-128 + `mul1` `0x83DCD12D` Tensor Core MMA |
+| **ConnectX-7 RoCE v2 RDMA AllReduce** | **7 us** (**134x** vs TCP) | Zero-copy `cudaHostAllocMapped` + `libibverbs` (`938 us` TCP -> `7 us` RDMA) with GPU-side peer add |
+| **MoE Router (`384` experts, `sqrtsoftplus`, `top_k=12`)** | **93 us** (**4.7x** speedup) | Vectorized `half2` logits + parallel 256-thread top-K (`rad_dsv41_router.cu`) |
+| **Live 40-Layer TP=2 RDMA TTFT** | **170.8 ms** (**1.56x** vs vLLM) | Beats `267.2 ms` vLLM baseline on identical 2x DGX Spark hardware |
+| **Live 40-Layer TP=2 RDMA Decode (No-Spec)** | **24.5 tok/s** | Full 40-layer TP=2/EP=2 RDMA OpenAI `/v1/chat/completions` + `<think>` + DSML tool calls |
+| **1-Layer TP=2 Parity (`M=1` vs `M=4`)** | **100% bit-exact** | Exact token match across batched prefill & decode (`PARITY M=1 vs M=4: match=true`) |
+
+---
+
 ## Repository Structure
 
 ```text
@@ -98,21 +116,30 @@ RAD/
 ├── Cargo.toml                 Workspace manifest
 ├── kernels/
 │   ├── build.sh               Backend kernel build dispatcher
-│   └── rocm/                  ROCm/HIP kernels (gfx1201, all modules < 2K LOC)
-│       ├── build.sh           Builds kernels/rocm/librad_ops.so via hipcc
-│       ├── rad_ops*.hip       Core decode, RMSNorm, shortconv, attention, loop-ctrl kernels
-│       ├── rad_batch*.hip     Batched prefill, router & multi-user kernels
-│       ├── rad_sudot4*.hip    Q4_0_SOA / Q8_1 / NVFP4 sudot4, MoE & fused B=1 kernels
-│       ├── rad_wmma*.hip      RDNA4 Wave32 WMMA INT8 GEMM, MoE & FP16 FlashAttention-2
-│       ├── rad_q8kv*.hip      INT8 KV cache store & GQA-3:1 Split-KV WMMA FlashAttention
-│       ├── rad_dflash2.hip    DFlash 2 grouped dynamic conv, top-16 & path selector kernels
-│       ├── rad_dspark.hip     DSpark speculative drafter kernels
-│       └── rad_vision.hip     ViT FP16 GEMM, LayerNorm, GELU, LayerScale, bidirectional attn & 2x2 merge
+│   ├── rocm/                  ROCm/HIP kernels (gfx1201, all modules < 2K LOC)
+│   │   ├── build.sh           Builds kernels/rocm/librad_ops.so via hipcc
+│   │   ├── rad_ops*.hip       Core decode, RMSNorm, shortconv, attention, loop-ctrl kernels
+│   │   ├── rad_batch*.hip     Batched prefill, router & multi-user kernels
+│   │   ├── rad_sudot4*.hip    Q4_0_SOA / Q8_1 / NVFP4 sudot4, MoE & fused B=1 kernels
+│   │   ├── rad_wmma*.hip      RDNA4 Wave32 WMMA INT8 GEMM, MoE & FP16 FlashAttention-2
+│   │   ├── rad_q8kv*.hip      INT8 KV cache store & GQA-3:1 Split-KV WMMA FlashAttention
+│   │   ├── rad_dflash2.hip    DFlash 2 grouped dynamic conv, top-16 & path selector kernels
+│   │   ├── rad_dspark.hip     DSpark speculative drafter kernels
+│   │   └── rad_vision.hip     ViT FP16 GEMM, LayerNorm, GELU, LayerScale, bidirectional attn & 2x2 merge
+│   └── cuda/                  NVIDIA Blackwell CUDA kernels (sm_121, all modules < 2K LOC)
+│       ├── build.sh           Builds kernels/cuda/librad_cuda_ops.so via nvcc + libibverbs
+│       ├── rad_exl3.cu        EXL3 mul1 (0x83DCD12D, __dp4a) WHT-128 & GEMV kernels
+│       ├── rad_exl3_mma.cu    Blackwell Tensor Core mma.sync.aligned.m16n8k16 EXL3 GEMM & EP=2 MoE MMA
+│       ├── rad_dsv41_ops.cu   FP32 mHC Sinkhorn, YaRN + inverse RoPE, MQA attn_sink, Engram gate & MTP fusion
+│       ├── rad_dsv41_router.cu Vectorized half2 MoE sqrtsoftplus router, parallel 256-thread top-K & argmax
+│       └── rad_rdma.cu        Zero-copy cudaHostAllocMapped ConnectX-7 RoCE v2 RDMA (libibverbs)
 ├── crates/
 │   ├── rad-gguf/              Zero-copy mmap GGUF reader
 │   ├── rad-hip/               Minimal ROCm/HIP FFI, RAII DevBuf, P2P & CapturedGraph
 │   ├── rad-core/              InklingEngine (model/{mod,decode,multi,profile}), DFlash 2 & DSpark, Paged KV, VisionEncoder
-│   └── rad-serve/             `rad` CLI + Axum server (main, types, prompt, scheduler, handlers, grammar, metrics, bench)
+│   ├── rad-serve/             `rad` CLI + Axum server (main, types, prompt, scheduler, handlers, grammar, metrics, bench)
+│   ├── rad-cuda/              Minimal CUDA FFI, RAII CudaBuf, CudaCapturedGraph & ConnectX-7 TP=2 RDMA/TCP comm
+│   └── rad-dsv41/             DeepSeek-V4.1-Flash EXL3 TP=2 engine (`rad-dsv41`: weights, engine, engram, mtp, server)
 ├── assets/
 │   ├── rad_benchmark.svg      Single-user decode & prefill comparison chart
 │   ├── rad_longctx.svg        Long-context 2K–256K decode & prefill scaling chart
@@ -192,7 +219,27 @@ Includes Cold Load, TTFT, `pp512`/`pp2048` Prefill, Single-User Code/Math/Prose,
 python3 scripts/test_serve.py
 ```
 
-### 5. Install & Deploy (Docker, `.deb`, Homebrew, Flatpak)
+### 5. Build & Run CUDA Backend (2x NVIDIA DGX Spark, `sm_121`)
+
+Requires **CUDA 12.x / 13.x** (`nvcc`), `libibverbs-dev` (for ConnectX-7 RoCE v2 RDMA), and **Rust**:
+
+```bash
+bash kernels/cuda/build.sh
+cargo build --release --manifest-path crates/rad-dsv41/Cargo.toml
+
+./crates/rad-dsv41/target/release/rad-dsv41 \
+  --model-dir /path/to/deepseek-v4.1-flash-1017-exl3 \
+  --rank 0 --world-size 2 --peer-addr 10.100.232.1:29500 \
+  --rdma-dev rocep1s0f1 --port 8888
+
+./crates/rad-dsv41/target/release/rad-dsv41 \
+  --rank 1 --world-size 2 --peer-addr 10.100.232.1:29500 \
+  --rdma-dev rocep1s0f1
+```
+
+Rank 0 streams Hadamard-128 aligned TP=2/EP=2 shards to Rank 1 over ConnectX-7 at startup, so Rank 1 requires zero local model storage.
+
+### 6. Install & Deploy (Docker, `.deb`, Homebrew, Flatpak)
 
 - **Docker with AMD ROCm GPU Passthrough:**
   ```bash

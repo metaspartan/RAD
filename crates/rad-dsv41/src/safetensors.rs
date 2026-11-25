@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TensorMeta {
     pub dtype: String,

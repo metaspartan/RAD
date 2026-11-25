@@ -354,6 +354,9 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
     let (job_tx, mut job_rx) = mpsc::unbounded_channel::<ServeJob>();
     std::thread::spawn(move || {
         while let Some(job) = job_rx.blocking_recv() {
+            if job.tx.is_closed() {
+                continue;
+            }
             let enc = match tok.encode(job.prompt, false) {
                 Ok(e) => e,
                 Err(e) => {
@@ -363,6 +366,13 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
             };
             let p_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
             let prompt_n = p_ids.len();
+            if prompt_n >= eng.max_ctx {
+                let _ = job.tx.send(ServeEvent::Error(format!(
+                    "prompt length {prompt_n} exceeds max_ctx {}",
+                    eng.max_ctx
+                )));
+                continue;
+            }
             eng.pos = 0;
             let mut reset_cmd = 0u32;
             let _ = comm.broadcast_u32(&mut reset_cmd);
@@ -377,7 +387,7 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
             let mut gen_ids: Vec<u32> = Vec::new();
             let mut prev_str = String::new();
             let mut finish_reason = "length";
-            while gen_ids.len() < job.max_tokens {
+            while gen_ids.len() < job.max_tokens && eng.pos + 1 < eng.max_ctx {
                 if next_tok == eos || job.tx.is_closed() {
                     finish_reason = "stop";
                     break;
