@@ -267,7 +267,12 @@ fn run_prompt(cli: &Cli, prompt_text: &str, comm: &mut Tp2Comm) -> Result<()> {
     }
     let tok = Tokenizer::from_file(cli.model.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
-    let formatted = format_dsv41_prompt(&[serde_json::json!({"role": "user", "content": prompt_text})], None);
+    let formatted = format_dsv41_prompt(
+        &[serde_json::json!({"role": "user", "content": prompt_text})],
+        None,
+        true,
+        50,
+    );
     let enc = tok.encode(formatted, false).map_err(|e| anyhow::anyhow!("{e}"))?;
     let p_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
     let t_pre = Instant::now();
@@ -306,6 +311,36 @@ fn run_prompt(cli: &Cli, prompt_text: &str, comm: &mut Tp2Comm) -> Result<()> {
     let mut quit = 99u32;
     let _ = comm.broadcast_u32(&mut quit);
     Ok(())
+}
+
+fn detect_degenerate_cycle(tokens: &[u32]) -> bool {
+    let n = tokens.len();
+    if n < 48 {
+        return false;
+    }
+    for p in 1..=64usize {
+        let min_reps = if p == 1 {
+            32
+        } else if p <= 4 {
+            16
+        } else if p <= 8 {
+            10
+        } else if p <= 16 {
+            6
+        } else {
+            4
+        };
+        let need = p * min_reps;
+        if n < need {
+            continue;
+        }
+        let win = &tokens[n - need..];
+        let pat = &win[need - p..];
+        if win.chunks_exact(p).all(|c| c == pat) {
+            return true;
+        }
+    }
+    false
 }
 
 fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
@@ -440,7 +475,8 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                                 }
                             }
                         }
-                        if stopped {
+                        if stopped || detect_degenerate_cycle(&gen_ids) {
+                            finish_reason = "stop";
                             break;
                         }
                         next_tok = last;

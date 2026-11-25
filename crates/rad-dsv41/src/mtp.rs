@@ -8,7 +8,6 @@ use crate::weights::{load_raw_buf_replicated, load_raw_buf_row_shard, Exl3Linear
 
 pub struct MtpKvCache {
     pub k_cache: CudaBuf,
-    pub v_cache: CudaBuf,
 }
 
 pub struct DsparkMtp {
@@ -52,7 +51,6 @@ impl DsparkMtp {
             )?);
             kv_caches.push(MtpKvCache {
                 k_cache: CudaBuf::new(max_ctx * tc.head_dim * 2).map_err(CudaFail)?,
-                v_cache: CudaBuf::new(max_ctx * tc.head_dim * 2).map_err(CudaFail)?,
             });
         }
         let d = tc.hidden_size;

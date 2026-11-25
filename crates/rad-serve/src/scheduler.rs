@@ -603,8 +603,14 @@ pub(crate) fn run_scheduler(
                     let res = (|| -> anyhow::Result<Vec<i32>> {
                         let rem_kv = engine.max_ctx.saturating_sub(pos0 as usize);
                         let max_ng_k = 128usize.min(rem_kv);
-                        let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[seq], slot.next_tok, max_ng_k) {
-                            ng
+                        let draft = if let Some((ng, mlen)) = ngram_lookup_draft_ex(&engine.seq_tokens[seq], slot.next_tok, max_ng_k) {
+                            if mlen >= 4 {
+                                ng
+                            } else if seq == 0 {
+                                d.draft(slot.next_tok, &engine, spec_k)?
+                            } else {
+                                d.draft_seq(seq, slot.next_tok, &engine, spec_k)?
+                            }
                         } else if seq == 0 {
                             d.draft(slot.next_tok, &engine, spec_k)?
                         } else {

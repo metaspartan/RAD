@@ -143,15 +143,15 @@ __global__ void mma_wht128_post_f32_to_f16_k(
     }
     half* yr = y + (size_t)row * N + col;
     if (add_to_y) {
-        yr[0] = __float2half(__half2float(yr[0]) + v0);
-        yr[1] = __float2half(__half2float(yr[1]) + v1);
-        yr[2] = __float2half(__half2float(yr[2]) + v2);
-        yr[3] = __float2half(__half2float(yr[3]) + v3);
+        yr[0] = __float2half(fmaxf(fminf(__half2float(yr[0]) + v0, 65000.0f), -65000.0f));
+        yr[1] = __float2half(fmaxf(fminf(__half2float(yr[1]) + v1, 65000.0f), -65000.0f));
+        yr[2] = __float2half(fmaxf(fminf(__half2float(yr[2]) + v2, 65000.0f), -65000.0f));
+        yr[3] = __float2half(fmaxf(fminf(__half2float(yr[3]) + v3, 65000.0f), -65000.0f));
     } else {
-        yr[0] = __float2half(v0);
-        yr[1] = __float2half(v1);
-        yr[2] = __float2half(v2);
-        yr[3] = __float2half(v3);
+        yr[0] = __float2half(fmaxf(fminf(v0, 65000.0f), -65000.0f));
+        yr[1] = __float2half(fmaxf(fminf(v1, 65000.0f), -65000.0f));
+        yr[2] = __float2half(fmaxf(fminf(v2, 65000.0f), -65000.0f));
+        yr[3] = __float2half(fmaxf(fminf(v3, 65000.0f), -65000.0f));
     }
 }
 
@@ -683,6 +683,12 @@ static int* g_moe_meta = nullptr;
 
 extern "C" {
 
+void rad_cuda_moe_init_meta(void) {
+    if (!g_moe_meta) {
+        cudaMalloc(&g_moe_meta, 2048 * sizeof(int));
+    }
+}
+
 void rad_cuda_exl3_moe_mma_f16(
     const half* x_in,
     const uint16_t* const* trellis_ptrs,
@@ -700,6 +706,7 @@ void rad_cuda_exl3_moe_mma_f16(
     int x_per_expert,
     int expert_start,
     int n_local_experts,
+    int reuse_groups,
     cudaStream_t stream
 ) {
     int n_blocks = N / 128;
@@ -713,10 +720,12 @@ void rad_cuda_exl3_moe_mma_f16(
         int* d_offs = g_moe_meta + 1024;
         int* d_lens = g_moe_meta + 1536;
         int* d_ng = g_moe_meta + 2047;
-        moe_build_groups_k<<<1, 1, 0, stream>>>(
-            expert_ids, pairs, expert_start, n_local_experts,
-            d_sorted, d_eids, d_offs, d_lens, d_ng
-        );
+        if (!reuse_groups) {
+            moe_build_groups_k<<<1, 1, 0, stream>>>(
+                expert_ids, pairs, expert_start, n_local_experts,
+                d_sorted, d_eids, d_offs, d_lens, d_ng
+            );
+        }
         int max_groups = (pairs < n_local_experts + (pairs / 16) + 1) ? pairs : (n_local_experts + (pairs / 16) + 1);
         int split_k = (n_blocks * max_groups < 128) ? 4 : ((n_blocks * max_groups < 256) ? 2 : 1);
         if (K / 128 < split_k) split_k = K / 128;

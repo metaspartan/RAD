@@ -205,9 +205,9 @@ impl EngramHost {
 
     pub fn lookup_batch_f16(&self, table_idx: usize, history: &[i32], start_pos: usize, m: usize) -> Result<Vec<u16>> {
         let shard = &self.shards[table_idx];
-        let mut out = vec![0u16; m * 24 * 256];
-        let mut wbuf = [0u8; 256];
-        let mut sbuf = [0u8; 8];
+        let total_cols = m * 24;
+        let mut out = vec![0u16; total_cols * 256];
+        let mut row_ids = vec![0u64; total_cols];
         for mr in 0..m {
             let pos = start_pos + mr;
             let mut c = [self.pad_comp; 4];
@@ -226,20 +226,47 @@ impl EngramHost {
                 let mix = mixes[ord];
                 for h in 0..8 {
                     let col = ord * 8 + h;
-                    let row_id = (shard.offsets[col] + mix.rem_euclid(shard.primes[col])) as u64;
-                    shard.file.read_exact_at(&mut wbuf, shard.weight_base + row_id * 256)?;
-                    shard.file.read_exact_at(&mut sbuf, shard.scale_base + row_id * 8)?;
-                    let dst = &mut out[(mr * 24 + col) * 256..(mr * 24 + col + 1) * 256];
-                    for blk in 0..8 {
-                        let e = sbuf[blk] as i32;
-                        let scale = if e == 0 { 0.0f32 } else { f32::from_bits((e as u32) << 23) };
-                        let base = blk * 32;
-                        for j in 0..32 {
-                            dst[base + j] = f32_to_f16(self.e4m3_lut[wbuf[base + j] as usize] * scale);
-                        }
-                    }
+                    row_ids[mr * 24 + col] = (shard.offsets[col] + mix.rem_euclid(shard.primes[col])) as u64;
                 }
             }
+        }
+        let n_threads = 8usize.min(total_cols).max(1);
+        let chunk_cols = (total_cols + n_threads - 1) / n_threads;
+        let lut = &self.e4m3_lut;
+        let err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+        std::thread::scope(|s| {
+            for (t_idx, out_chunk) in out.chunks_mut(chunk_cols * 256).enumerate() {
+                let col_start = t_idx * chunk_cols;
+                let n_c = out_chunk.len() / 256;
+                let rids = &row_ids[col_start..col_start + n_c];
+                let err_ref = &err;
+                s.spawn(move || {
+                    let mut wbuf = [0u8; 256];
+                    let mut sbuf = [0u8; 8];
+                    for (local_i, &row_id) in rids.iter().enumerate() {
+                        if let Err(e) = shard.file.read_exact_at(&mut wbuf, shard.weight_base + row_id * 256) {
+                            *err_ref.lock().unwrap() = Some(e.into());
+                            return;
+                        }
+                        if let Err(e) = shard.file.read_exact_at(&mut sbuf, shard.scale_base + row_id * 8) {
+                            *err_ref.lock().unwrap() = Some(e.into());
+                            return;
+                        }
+                        let dst = &mut out_chunk[local_i * 256..(local_i + 1) * 256];
+                        for blk in 0..8 {
+                            let e = sbuf[blk] as i32;
+                            let scale = if e == 0 { 0.0f32 } else { f32::from_bits((e as u32) << 23) };
+                            let base = blk * 32;
+                            for j in 0..32 {
+                                dst[base + j] = f32_to_f16(lut[wbuf[base + j] as usize] * scale);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = err.into_inner().unwrap() {
+            return Err(e);
         }
         Ok(out)
     }

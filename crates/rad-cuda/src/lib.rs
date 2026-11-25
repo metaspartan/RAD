@@ -167,6 +167,11 @@ impl CudaCapturedGraph {
         if rc == CUDA_SUCCESS { Ok(()) } else { Err(rc) }
     }
 
+    pub fn launch_on(&self, stream: CudaStream) -> Result<(), CudaError> {
+        let rc = unsafe { cudaGraphLaunch(self.exec, stream) };
+        if rc == CUDA_SUCCESS { Ok(()) } else { Err(rc) }
+    }
+
     pub fn sync(&self) -> Result<(), CudaError> {
         let rc = unsafe { cudaStreamSynchronize(self.stream) };
         if rc == CUDA_SUCCESS { Ok(()) } else { Err(rc) }

@@ -34,6 +34,12 @@ pub enum ServeEvent {
     Error(String),
 }
 
+#[derive(Deserialize, Default)]
+pub struct ChatTemplateKwargs {
+    pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<Value>,
+}
+
 #[derive(Deserialize)]
 pub struct ChatReq {
     pub model: Option<String>,
@@ -42,6 +48,24 @@ pub struct ChatReq {
     pub max_tokens: Option<usize>,
     pub max_completion_tokens: Option<usize>,
     pub stream: Option<bool>,
+    pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<Value>,
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+fn parse_reasoning_effort(v: Option<&Value>) -> u32 {
+    match v {
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(50).clamp(1, 100) as u32,
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "minimal" => 10,
+            "low" => 25,
+            "medium" => 50,
+            "high" => 85,
+            "max" => 100,
+            other => other.parse::<u32>().unwrap_or(50).clamp(1, 100),
+        },
+        _ => 50,
+    }
 }
 
 fn check_auth(headers: &HeaderMap, keys: &[String]) -> bool {
@@ -113,8 +137,16 @@ fn extract_content_str(m: &Value) -> String {
     }
 }
 
-pub fn format_dsv41_prompt(messages: &[Value], tools: Option<&[Value]>) -> String {
-    let mut out = String::from("<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n");
+pub fn format_dsv41_prompt(
+    messages: &[Value],
+    tools: Option<&[Value]>,
+    enable_thinking: bool,
+    reasoning_effort: u32,
+) -> String {
+    let effort = reasoning_effort.clamp(1, 100);
+    let mut out = format!(
+        "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: {effort} (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+    );
     let mut sys_text = String::new();
     for m in messages {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -207,7 +239,11 @@ pub fn format_dsv41_prompt(messages: &[Value], tools: Option<&[Value]>) -> Strin
             _ => {}
         }
     }
-    out.push_str("<｜Assistant｜><think>");
+    if enable_thinking {
+        out.push_str("<｜Assistant｜><think>");
+    } else {
+        out.push_str("<｜Assistant｜></think>");
+    }
     out
 }
 
@@ -294,7 +330,19 @@ async fn chat_completions(
     let model_id = req.model.unwrap_or_else(|| st.model_name.clone());
     let max_tokens = req.max_tokens.or(req.max_completion_tokens).unwrap_or(2048).min(32768);
     let stream = req.stream.unwrap_or(false);
-    let prompt = format_dsv41_prompt(&req.messages, req.tools.as_deref());
+    let enable_thinking = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|k| k.enable_thinking)
+        .or(req.enable_thinking)
+        .unwrap_or(true);
+    let reasoning_effort = parse_reasoning_effort(
+        req.chat_template_kwargs
+            .as_ref()
+            .and_then(|k| k.reasoning_effort.as_ref())
+            .or(req.reasoning_effort.as_ref()),
+    );
+    let prompt = format_dsv41_prompt(&req.messages, req.tools.as_deref(), enable_thinking, reasoning_effort);
     let req_id = format!("chatcmpl-rad-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
     let created = now_unix();
 
@@ -307,7 +355,7 @@ async fn chat_completions(
         let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
         tokio::spawn(async move {
             let mut sent_role = false;
-            let mut in_think = true;
+            let mut in_think = enable_thinking;
             let mut raw_acc = String::new();
             let mut in_dsml = false;
             while let Some(ev) = rx.recv().await {

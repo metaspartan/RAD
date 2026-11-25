@@ -2,6 +2,8 @@ use core::ffi::c_void;
 use rad_cuda::CudaStream;
 
 extern "C" {
+    pub fn rad_cuda_moe_init_meta();
+
     pub fn rad_cuda_wht128_pre_mul_f16(
         x: *const c_void,
         suh: *const c_void,
@@ -44,6 +46,7 @@ extern "C" {
         x_per_expert: i32,
         expert_start: i32,
         n_local_experts: i32,
+        reuse_groups: i32,
         stream: CudaStream,
     );
 

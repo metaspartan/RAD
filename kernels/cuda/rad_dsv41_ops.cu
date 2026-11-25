@@ -159,7 +159,9 @@ __global__ void kv_scatter_f16_k(
     if (i < head_dim) {
         int p = (start_pos + mr) % max_ctx;
         k_cache[(size_t)p * head_dim + i] = k_in[(size_t)mr * head_dim + i];
-        v_cache[(size_t)p * head_dim + i] = v_in[(size_t)mr * head_dim + i];
+        if (v_cache != k_cache) {
+            v_cache[(size_t)p * head_dim + i] = v_in[(size_t)mr * head_dim + i];
+        }
     }
 }
 
@@ -311,23 +313,84 @@ __global__ void mqa_attn_sink_causal_f16_k(
     int h = blockIdx.x;
     int mr = blockIdx.y;
     int t = threadIdx.x;
-    const half* qh = q + ((size_t)mr * n_heads + h) * head_dim;
-    extern __shared__ float smem[];
-    float* s_q = smem;
-    float* s_acc = smem + head_dim;
-    __shared__ float wsum[32];
-    for (int d = t; d < head_dim; d += blockDim.x) {
-        s_q[d] = __half2float(qh[d]);
-        s_acc[d] = 0.0f;
-    }
-    __syncthreads();
+    int lane = t & 31;
+    int warp = t >> 5;
     int seq_len = start_pos + mr + 1;
     if (seq_len > max_ctx) seq_len = max_ctx;
     int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
     float m_max = attn_sink ? attn_sink[h] : -1e30f;
     float l_sum = attn_sink ? 1.0f : 0.0f;
-    int lane = t & 31;
-    int warp = t >> 5;
+    __shared__ float wsum[8];
+
+    if (head_dim == 512) {
+        const half2* qh2 = reinterpret_cast<const half2*>(q + ((size_t)mr * n_heads + h) * 512);
+        float2 qv = __half22float2(__ldg(qh2 + t));
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        bool same_kv = (k_cache == v_cache);
+        for (int p = p_start; p < seq_len; ++p) {
+            const half2* kp2 = reinterpret_cast<const half2*>(k_cache + (size_t)p * 512);
+            float2 kv = __half22float2(__ldg(kp2 + t));
+            float dot = fmaf(qv.x, kv.x, qv.y * kv.y);
+            for (int m = 16; m > 0; m >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, m);
+            if (lane == 0) wsum[warp] = dot;
+            __syncthreads();
+            if (warp == 0) {
+                float v = (lane < 8) ? wsum[lane] : 0.0f;
+                for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+                if (lane == 0) wsum[0] = v * scale;
+            }
+            __syncthreads();
+            float score = wsum[0];
+            float new_max = fmaxf(m_max, score);
+            float alpha = expf(m_max - new_max);
+            float beta = expf(score - new_max);
+            l_sum = l_sum * alpha + beta;
+            m_max = new_max;
+            float2 vv = same_kv ? kv : __half22float2(__ldg(reinterpret_cast<const half2*>(v_cache + (size_t)p * 512) + t));
+            a0 = fmaf(a0, alpha, beta * vv.x);
+            a1 = fmaf(a1, alpha, beta * vv.y);
+        }
+        if (comp_kv && comp_ratio > 0) {
+            int n_comp = seq_len / comp_ratio;
+            for (int c = 0; c < n_comp; ++c) {
+                const half2* ck2 = reinterpret_cast<const half2*>(comp_kv + (size_t)c * 512);
+                float2 kv = __half22float2(__ldg(ck2 + t));
+                float dot = fmaf(qv.x, kv.x, qv.y * kv.y);
+                for (int m = 16; m > 0; m >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, m);
+                if (lane == 0) wsum[warp] = dot;
+                __syncthreads();
+                if (warp == 0) {
+                    float v = (lane < 8) ? wsum[lane] : 0.0f;
+                    for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+                    if (lane == 0) wsum[0] = v * scale;
+                }
+                __syncthreads();
+                float score = wsum[0];
+                float new_max = fmaxf(m_max, score);
+                float alpha = expf(m_max - new_max);
+                float beta = expf(score - new_max);
+                l_sum = l_sum * alpha + beta;
+                m_max = new_max;
+                a0 = fmaf(a0, alpha, beta * kv.x);
+                a1 = fmaf(a1, alpha, beta * kv.y);
+            }
+        }
+        float inv = 1.0f / fmaxf(l_sum, 1e-20f);
+        half2* oh2 = reinterpret_cast<half2*>(out + ((size_t)mr * n_heads + h) * 512);
+        oh2[t] = __float22half2_rn(make_float2(a0 * inv, a1 * inv));
+        return;
+    }
+
+    const half* qh = q + ((size_t)mr * n_heads + h) * head_dim;
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* s_acc = smem + head_dim;
+    for (int d = t; d < head_dim; d += blockDim.x) {
+        s_q[d] = __half2float(qh[d]);
+        s_acc[d] = 0.0f;
+    }
+    __syncthreads();
     for (int p = p_start; p < seq_len; ++p) {
         const half* kp = k_cache + (size_t)p * head_dim;
         float dot = 0.0f;
@@ -338,8 +401,8 @@ __global__ void mqa_attn_sink_causal_f16_k(
         if (lane == 0) wsum[warp] = dot;
         __syncthreads();
         if (warp == 0) {
-            float v = (lane < (blockDim.x >> 5)) ? wsum[lane] : 0.0f;
-            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+            float v = (lane < 8) ? wsum[lane] : 0.0f;
+            for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
             if (lane == 0) wsum[0] = v * scale;
         }
         __syncthreads();
@@ -353,36 +416,6 @@ __global__ void mqa_attn_sink_causal_f16_k(
         const half* vp = v_cache + (size_t)p * head_dim;
         for (int d = t; d < head_dim; d += blockDim.x) {
             s_acc[d] = s_acc[d] * alpha + beta * __half2float(vp[d]);
-        }
-    }
-    if (comp_kv && comp_ratio > 0) {
-        int n_comp = seq_len / comp_ratio;
-        int c_start = (n_comp > 512) ? (n_comp - 512) : 0;
-        for (int c = c_start; c < n_comp; ++c) {
-            const half* ck = comp_kv + (size_t)c * head_dim;
-            float dot = 0.0f;
-            for (int d = t; d < head_dim; d += blockDim.x) {
-                dot += s_q[d] * __half2float(ck[d]);
-            }
-            for (int m = 16; m > 0; m >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, m);
-            if (lane == 0) wsum[warp] = dot;
-            __syncthreads();
-            if (warp == 0) {
-                float v = (lane < (blockDim.x >> 5)) ? wsum[lane] : 0.0f;
-                for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
-                if (lane == 0) wsum[0] = v * scale;
-            }
-            __syncthreads();
-            float score = wsum[0];
-            __syncthreads();
-            float new_max = fmaxf(m_max, score);
-            float alpha = expf(m_max - new_max);
-            float beta = expf(score - new_max);
-            l_sum = l_sum * alpha + beta;
-            m_max = new_max;
-            for (int d = t; d < head_dim; d += blockDim.x) {
-                s_acc[d] = s_acc[d] * alpha + beta * __half2float(ck[d]);
-            }
         }
     }
     float inv = 1.0f / fmaxf(l_sum, 1e-20f);
@@ -665,7 +698,7 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     float scale,
     cudaStream_t stream
 ) {
-    size_t smem = (size_t)head_dim * 2 * sizeof(float);
+    size_t smem = (head_dim == 512) ? 0 : (size_t)head_dim * 2 * sizeof(float);
     dim3 grid(n_heads, M);
     mqa_attn_sink_causal_f16_k<<<grid, 256, smem, stream>>>(
         q, k_cache, v_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, head_dim, scale
@@ -824,7 +857,8 @@ __global__ void mhc_collapse_mean_to_f16_k(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < D) {
         const float* sr = streams + (size_t)mr * 4 * D;
-        float v = 0.25f * (sr[0 * D + i] + sr[1 * D + i] + sr[2 * D + i] + sr[3 * D + i]);
+        float v = (0.25f / 16.0f) * (sr[0 * D + i] + sr[1 * D + i] + sr[2 * D + i] + sr[3 * D + i]);
+        v = fmaxf(fminf(v, 65000.0f), -65000.0f);
         out[(size_t)mr * out_stride + out_col_off + i] = __float2half(v);
     }
 }
@@ -847,21 +881,80 @@ __global__ void mqa_attn_sink_dspark_f16_k(
     int h = blockIdx.x;
     int mr = blockIdx.y;
     int t = threadIdx.x;
+    int lane = t & 31;
+    int warp = t >> 5;
+    int p_start = (sliding_window > 0 && q0 > sliding_window) ? (q0 - sliding_window) : 0;
+    float m_max = attn_sink ? attn_sink[h] : -1e30f;
+    float l_sum = attn_sink ? 1.0f : 0.0f;
+    __shared__ float wsum[8];
+
+    if (head_dim == 512) {
+        const half2* qh2 = reinterpret_cast<const half2*>(q + ((size_t)mr * n_heads + h) * 512);
+        float2 qv = __half22float2(__ldg(qh2 + t));
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        bool same_kv = (k_ring == v_ring);
+        for (int p = p_start; p < q0; ++p) {
+            int slot = p % max_ctx;
+            const half2* kp2 = reinterpret_cast<const half2*>(k_ring + (size_t)slot * 512);
+            float2 kv = __half22float2(__ldg(kp2 + t));
+            float dot = fmaf(qv.x, kv.x, qv.y * kv.y);
+            for (int m = 16; m > 0; m >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, m);
+            if (lane == 0) wsum[warp] = dot;
+            __syncthreads();
+            if (warp == 0) {
+                float v = (lane < 8) ? wsum[lane] : 0.0f;
+                for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+                if (lane == 0) wsum[0] = v * scale;
+            }
+            __syncthreads();
+            float score = wsum[0];
+            float new_max = fmaxf(m_max, score);
+            float alpha = expf(m_max - new_max);
+            float beta = expf(score - new_max);
+            l_sum = l_sum * alpha + beta;
+            m_max = new_max;
+            float2 vv = same_kv ? kv : __half22float2(__ldg(reinterpret_cast<const half2*>(v_ring + (size_t)slot * 512) + t));
+            a0 = fmaf(a0, alpha, beta * vv.x);
+            a1 = fmaf(a1, alpha, beta * vv.y);
+        }
+        for (int b = 0; b < blk_len; ++b) {
+            const half2* kb2 = reinterpret_cast<const half2*>(kv_blk + (size_t)b * 512);
+            float2 kv = __half22float2(__ldg(kb2 + t));
+            float dot = fmaf(qv.x, kv.x, qv.y * kv.y);
+            for (int m = 16; m > 0; m >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, m);
+            if (lane == 0) wsum[warp] = dot;
+            __syncthreads();
+            if (warp == 0) {
+                float v = (lane < 8) ? wsum[lane] : 0.0f;
+                for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+                if (lane == 0) wsum[0] = v * scale;
+            }
+            __syncthreads();
+            float score = wsum[0];
+            float new_max = fmaxf(m_max, score);
+            float alpha = expf(m_max - new_max);
+            float beta = expf(score - new_max);
+            l_sum = l_sum * alpha + beta;
+            m_max = new_max;
+            a0 = fmaf(a0, alpha, beta * kv.x);
+            a1 = fmaf(a1, alpha, beta * kv.y);
+        }
+        float inv = 1.0f / fmaxf(l_sum, 1e-20f);
+        half2* oh2 = reinterpret_cast<half2*>(out + ((size_t)mr * n_heads + h) * 512);
+        oh2[t] = __float22half2_rn(make_float2(a0 * inv, a1 * inv));
+        return;
+    }
+
     const half* qh = q + ((size_t)mr * n_heads + h) * head_dim;
     extern __shared__ float dspark_smem[];
     float* s_q = dspark_smem;
     float* s_acc = dspark_smem + head_dim;
-    __shared__ float wsum[32];
     for (int d = t; d < head_dim; d += blockDim.x) {
         s_q[d] = __half2float(qh[d]);
         s_acc[d] = 0.0f;
     }
     __syncthreads();
-    int p_start = (sliding_window > 0 && q0 > sliding_window) ? (q0 - sliding_window) : 0;
-    float m_max = attn_sink ? attn_sink[h] : -1e30f;
-    float l_sum = attn_sink ? 1.0f : 0.0f;
-    int lane = t & 31;
-    int warp = t >> 5;
     for (int p = p_start; p < q0; ++p) {
         int slot = p % max_ctx;
         const half* kp = k_ring + (size_t)slot * head_dim;
@@ -873,8 +966,8 @@ __global__ void mqa_attn_sink_dspark_f16_k(
         if (lane == 0) wsum[warp] = dot;
         __syncthreads();
         if (warp == 0) {
-            float v = (lane < (blockDim.x >> 5)) ? wsum[lane] : 0.0f;
-            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+            float v = (lane < 8) ? wsum[lane] : 0.0f;
+            for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
             if (lane == 0) wsum[0] = v * scale;
         }
         __syncthreads();
@@ -900,8 +993,8 @@ __global__ void mqa_attn_sink_dspark_f16_k(
         if (lane == 0) wsum[warp] = dot;
         __syncthreads();
         if (warp == 0) {
-            float v = (lane < (blockDim.x >> 5)) ? wsum[lane] : 0.0f;
-            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+            float v = (lane < 8) ? wsum[lane] : 0.0f;
+            for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
             if (lane == 0) wsum[0] = v * scale;
         }
         __syncthreads();
@@ -981,8 +1074,8 @@ void rad_cuda_mqa_attn_sink_dspark_f16(
     cudaStream_t stream
 ) {
     dim3 grid(n_heads, M);
-    size_t smem = (size_t)head_dim * 2 * sizeof(float);
-    mqa_attn_sink_dspark_f16_k<<<grid, 128, smem, stream>>>(
+    size_t smem = (head_dim == 512) ? 0 : (size_t)head_dim * 2 * sizeof(float);
+    mqa_attn_sink_dspark_f16_k<<<grid, 256, smem, stream>>>(
         q, k_ring, v_ring, kv_blk, attn_sink, out, n_heads, q0, max_ctx, sliding_window, M, head_dim, scale
     );
 }
