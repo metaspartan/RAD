@@ -181,7 +181,6 @@ impl Dsv41Engine {
         let attn_scale = 1.0f32 / (tc.head_dim as f32).sqrt();
         let mut host_ids = vec![0i32; tc.num_experts_per_tok];
         let mut host_weights = vec![0.0f32; tc.num_experts_per_tok];
-        let mut ar_buf = vec![0.0f32; d];
         let mut f16_tmp = vec![0u16; d];
 
         for l in 0..self.layers.len() {
@@ -392,43 +391,5 @@ impl Dsv41Engine {
         self.d_best_id.copy_to_host(unsafe { std::slice::from_raw_parts_mut(&mut best_id as *mut i32 as *mut u8, 4) }).map_err(CudaFail)?;
         self.pos += 1;
         Ok(best_id + (self.rank * self.head.n) as i32)
-    }
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let s = ((bits >> 15) & 1) as u32;
-    let e = ((bits >> 10) & 0x1f) as u32;
-    let f = (bits & 0x3ff) as u32;
-    let out = if e == 0 {
-        if f == 0 {
-            s << 31
-        } else {
-            let mut m = f;
-            let mut exp = 127 - 14;
-            while (m & 0x400) == 0 {
-                m <<= 1;
-                exp -= 1;
-            }
-            (s << 31) | (exp << 23) | ((m & 0x3ff) << 13)
-        }
-    } else if e == 31 {
-        (s << 31) | 0x7f800000 | (f << 13)
-    } else {
-        (s << 31) | ((e + 112) << 23) | (f << 13)
-    };
-    f32::from_bits(out)
-}
-
-fn f32_to_f16(val: f32) -> u16 {
-    let b = val.to_bits();
-    let s = ((b >> 16) & 0x8000) as u16;
-    let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
-    let f = b & 0x7fffff;
-    if e <= 0 {
-        s
-    } else if e >= 31 {
-        s | 0x7c00
-    } else {
-        s | ((e as u16) << 10) | ((f >> 13) as u16)
     }
 }

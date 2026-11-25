@@ -1,6 +1,7 @@
 mod config;
 mod cuda_ops;
 mod engine;
+mod mtp;
 mod safetensors;
 mod server;
 mod weights;
