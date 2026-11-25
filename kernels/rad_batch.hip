@@ -1384,20 +1384,29 @@ __device__ int g_b_softcap_max_i[128 * 32];
 
 extern "C" __global__ void softcap_argmax_batch_p1_k(float* __restrict__ logits,
                                                      float cap, int vocab_padded, int n_unpadded) {
+    (void)cap;
     int sp = blockIdx.x;
     int bt = blockIdx.y;
     int tid = threadIdx.x;
     int stride = gridDim.x * blockDim.x;
-    float* lg = logits + (size_t)bt * vocab_padded;
+    const float* lg = logits + (size_t)bt * vocab_padded;
+    const float4* lg4 = reinterpret_cast<const float4*>(lg);
+    int n4 = n_unpadded >> 2;
     float bv = -1e30f;
     int bi = 0;
-    for (int i = sp * blockDim.x + tid; i < n_unpadded; i += stride) {
-        float v = lg[i];
-        if (cap > 0.0f) {
-            v = cap * tanhf(v / cap);
-            lg[i] = v;
+    for (int i4 = sp * blockDim.x + tid; i4 < n4; i4 += stride) {
+        float4 v = lg4[i4];
+        int base = i4 << 2;
+        if (v.x > bv) { bv = v.x; bi = base; }
+        if (v.y > bv) { bv = v.y; bi = base + 1; }
+        if (v.z > bv) { bv = v.z; bi = base + 2; }
+        if (v.w > bv) { bv = v.w; bi = base + 3; }
+    }
+    if (sp == 0) {
+        for (int i = (n4 << 2) + tid; i < n_unpadded; i += blockDim.x) {
+            float v = lg[i];
+            if (v > bv) { bv = v; bi = i; }
         }
-        if (v > bv) { bv = v; bi = i; }
     }
     __shared__ float rv[8];
     __shared__ int ri[8];
@@ -1439,16 +1448,23 @@ extern "C" __global__ void softcap_argmax_batch_p2_k(int* __restrict__ out_toks)
 extern "C" __global__ void softcap_argmax_batch_k(float* __restrict__ logits,
                                                   float cap, int vocab_padded, int n_unpadded,
                                                   int* __restrict__ out_toks) {
+    (void)cap;
     int bt = blockIdx.x;
-    float* lg = logits + (size_t)bt * vocab_padded;
+    const float* lg = logits + (size_t)bt * vocab_padded;
+    const float4* lg4 = reinterpret_cast<const float4*>(lg);
+    int n4 = n_unpadded >> 2;
     float bv = -1e30f;
     int bi = 0;
-    for (int i = threadIdx.x; i < n_unpadded; i += blockDim.x) {
+    for (int i4 = threadIdx.x; i4 < n4; i4 += blockDim.x) {
+        float4 v = lg4[i4];
+        int base = i4 << 2;
+        if (v.x > bv) { bv = v.x; bi = base; }
+        if (v.y > bv) { bv = v.y; bi = base + 1; }
+        if (v.z > bv) { bv = v.z; bi = base + 2; }
+        if (v.w > bv) { bv = v.w; bi = base + 3; }
+    }
+    for (int i = (n4 << 2) + threadIdx.x; i < n_unpadded; i += blockDim.x) {
         float v = lg[i];
-        if (cap > 0.0f) {
-            v = cap * tanhf(v / cap);
-            lg[i] = v;
-        }
         if (v > bv) { bv = v; bi = i; }
     }
     __shared__ float rv[8];

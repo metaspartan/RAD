@@ -506,7 +506,9 @@ impl InklingEngine {
             let mut v_hist = DevBuf::new(max_seqs * kv_dim * 3 * 4).map_err(he)?;
             let mut attn_post_hist = DevBuf::new(max_seqs * cfg.n_embd * 3 * 4).map_err(he)?;
             let mut ffn_post_hist = DevBuf::new(max_seqs * cfg.n_embd * 3 * 4).map_err(he)?;
-            let snap_cap = if max_seqs >= 8 && max_ctx <= 65536 {
+            let snap_cap = if max_seqs >= 8 && max_ctx <= 32768 {
+                1024
+            } else if max_seqs >= 8 && max_ctx <= 65536 {
                 512
             } else if max_seqs >= 4 && max_ctx <= 65536 {
                 256
@@ -586,7 +588,9 @@ impl InklingEngine {
         };
 
         let mb = MAX_BATCH;
-        let multi_verify_cap = if max_seqs >= 8 && max_ctx <= 65536 {
+        let multi_verify_cap = if max_seqs >= 8 && max_ctx <= 32768 {
+            1024
+        } else if max_seqs >= 8 && max_ctx <= 65536 {
             512
         } else if max_seqs >= 4 && max_ctx <= 65536 {
             256
@@ -3591,7 +3595,11 @@ impl InklingEngine {
         if rc != rad_hip::HIP_SUCCESS {
             return Err(he(rc));
         }
-        Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        let cap = self.cfg.final_softcap;
+        Ok(raw.chunks_exact(4).map(|c| {
+            let v = f32::from_le_bytes(c.try_into().unwrap());
+            if cap > 0.0 { cap * (v / cap).tanh() } else { v }
+        }).collect())
     }
 
     pub fn read_batch_topk64(&self, b: usize) -> Result<(Vec<f32>, Vec<i32>)> {
@@ -3625,6 +3633,12 @@ impl InklingEngine {
             );
             if rc2 != rad_hip::HIP_SUCCESS { return Err(he(rc2)); }
             rad_hip::hipStreamSynchronize(self.stream);
+        }
+        let cap = self.cfg.final_softcap;
+        if cap > 0.0 {
+            for v in &mut vals {
+                *v = cap * (*v / cap).tanh();
+            }
         }
         Ok((vals, ids))
     }
