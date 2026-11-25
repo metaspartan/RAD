@@ -1849,7 +1849,9 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
     int exp_id = exp_counts[128 + blockIdx.y];
     if (exp_id < 0) return;
     int cnt = exp_counts[exp_id];
-    if (cnt == 0) return;
+    int z_id = blockIdx.z;
+    int z_n = gridDim.z;
+    if (cnt == 0 || z_id * 8 >= cnt) return;
     int off0 = exp_offsets[exp_id];
     int grp = threadIdx.x >> 2;
     int lane4 = threadIdx.x & 3;
@@ -2043,7 +2045,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
         return;
     }
 
-    for (int t0 = 0; t0 < cnt; t0 += 8) {
+    for (int t0 = z_id * 8; t0 < cnt; t0 += z_n * 8) {
         int nt = min(8, cnt - t0);
         int tids[8];
         int sids[8];
@@ -2484,14 +2486,16 @@ extern "C" int ink_moe_gu_q4_0_sudot4(hipStream_t s, const uint8_t* W, const flo
 extern "C" int ink_moe_dn_q4_0_sudot4(hipStream_t s, const uint8_t* W, const void* act_q, const int* exp_counts, const int* exp_offsets, const int* tok_sorted, const int* slot_sorted, const float* wt_sorted, float* y_out, int n_embd, int n_ff, int n_used, int B) {
     int tot = B * n_embd;
     int gy = (B * n_used < 128) ? (B * n_used) : 128;
+    int gz = (B >= 40) ? 4 : ((B >= 20) ? 2 : 1);
     zero_buf_f32_k<<<dim3((tot + 255) / 256), dim3(256), 0, s>>>(y_out, tot);
-    moe_dn_q4_0_sudot4_k<<<dim3((n_embd + 31) / 32, gy), dim3(128), 0, s>>>(W, (const q8_1_blk*)act_q, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, y_out, n_embd, n_ff, n_used);
+    moe_dn_q4_0_sudot4_k<<<dim3((n_embd + 31) / 32, gy, gz), dim3(128), 0, s>>>(W, (const q8_1_blk*)act_q, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, y_out, n_embd, n_ff, n_used);
     return 0;
 }
 
 extern "C" int ink_moe_dn_q4_0_sudot4_nozero(hipStream_t s, const uint8_t* W, const void* act_q, const int* exp_counts, const int* exp_offsets, const int* tok_sorted, const int* slot_sorted, const float* wt_sorted, float* y_out, int n_embd, int n_ff, int n_used, int B) {
     int gy = (B * n_used < 128) ? (B * n_used) : 128;
-    moe_dn_q4_0_sudot4_k<<<dim3((n_embd + 31) / 32, gy), dim3(128), 0, s>>>(W, (const q8_1_blk*)act_q, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, y_out, n_embd, n_ff, n_used);
+    int gz = (B >= 40) ? 4 : ((B >= 20) ? 2 : 1);
+    moe_dn_q4_0_sudot4_k<<<dim3((n_embd + 31) / 32, gy, gz), dim3(128), 0, s>>>(W, (const q8_1_blk*)act_q, exp_counts, exp_offsets, tok_sorted, slot_sorted, wt_sorted, y_out, n_embd, n_ff, n_used);
     return 0;
 }
 
@@ -3805,7 +3809,9 @@ extern "C" __global__ void moe_gu_q4_0_sudot4_to_q8_k(const uint8_t* __restrict_
     int exp_id = exp_counts[128 + blockIdx.y];
     if (exp_id < 0) return;
     int cnt = exp_counts[exp_id];
-    if (cnt == 0) return;
+    int z_id = blockIdx.z;
+    int z_n = gridDim.z;
+    if (cnt == 0 || z_id * 8 >= cnt) return;
     int off0 = exp_offsets[exp_id];
 
     int grp = threadIdx.x >> 3;
@@ -4104,7 +4110,7 @@ extern "C" __global__ void moe_gu_q4_0_sudot4_to_q8_k(const uint8_t* __restrict_
         return;
     }
 
-    for (int t0 = 0; t0 < cnt; t0 += 8) {
+    for (int t0 = z_id * 8; t0 < cnt; t0 += z_n * 8) {
         int nt = min(8, cnt - t0);
         int tids[8];
         int sids[8];
@@ -4223,7 +4229,8 @@ extern "C" __global__ void moe_gu_q4_0_sudot4_to_q8_k(const uint8_t* __restrict_
 
 extern "C" int ink_moe_gu_q4_0_sudot4_to_q8(hipStream_t s, const uint8_t* W, const float* scales, const void* Xq, const int* exp_counts, const int* exp_offsets, const int* tok_sorted, const int* slot_sorted, void* act_q, int n_ff, int k, int n_used, float beta, float lb, int B) {
     int gy = (B * n_used < 128) ? (B * n_used) : 128;
-    moe_gu_q4_0_sudot4_to_q8_k<<<dim3((n_ff + 31) / 32, gy), dim3(256), 0, s>>>(W, scales, (const q8_1_blk*)Xq, exp_counts, exp_offsets, tok_sorted, slot_sorted, (q8_1_blk*)act_q, n_ff, k, n_used, beta, lb);
+    int gz = (B >= 40) ? 4 : ((B >= 20) ? 2 : 1);
+    moe_gu_q4_0_sudot4_to_q8_k<<<dim3((n_ff + 31) / 32, gy, gz), dim3(256), 0, s>>>(W, scales, (const q8_1_blk*)Xq, exp_counts, exp_offsets, tok_sorted, slot_sorted, (q8_1_blk*)act_q, n_ff, k, n_used, beta, lb);
     return 0;
 }
 

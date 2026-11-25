@@ -1544,7 +1544,7 @@ impl InklingEngine {
         let moe_act = self.bsc.moe_act.ptr as *mut f32;
         let moe_raw = self.bsc.moe_raw.ptr as *mut f32;
 
-        let fused_rg = l.ffn_gate_up_exps.ty == WeightType::Q4_0 && b <= 16 && self.cfg.n_expert == 128 && self.cfg.n_expert_used == 8;
+        let fused_rg = l.ffn_gate_up_exps.ty == WeightType::Q4_0 && b <= 64 && self.cfg.n_expert == 128 && self.cfg.n_expert_used == 8;
         if fused_rg {
             ops::ink_moe_router_groups_and_q8(
                 s, router_logits, bias_ptr, dn_sc,
@@ -2562,7 +2562,7 @@ impl InklingEngine {
         let moe_act = self.bsc.moe_act.ptr as *mut f32;
         let moe_raw = self.bsc.moe_raw.ptr as *mut f32;
 
-        let fused_rg = l.ffn_gate_up_exps.ty == WeightType::Q4_0 && b <= 16 && self.cfg.n_expert == 128 && self.cfg.n_expert_used == 8;
+        let fused_rg = l.ffn_gate_up_exps.ty == WeightType::Q4_0 && b <= 64 && self.cfg.n_expert == 128 && self.cfg.n_expert_used == 8;
         if fused_rg {
             ops::ink_moe_router_groups_and_q8(
                 s, router_logits, bias_ptr, dn_sc,

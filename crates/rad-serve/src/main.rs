@@ -938,13 +938,17 @@ fn ngram_lookup_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<
         return None;
     }
     let min_follow = 8usize;
-    if n >= 3 {
-        let a = history[n - 3];
-        let b = history[n - 2];
-        let c = history[n - 1];
-        let mut i = n.saturating_sub(min_follow + 1);
-        while i >= 3 {
-            if history[i] == anchor && history[i - 1] == c && history[i - 2] == b && history[i - 3] == a {
+    let mut best4: Option<usize> = None;
+    let mut best3: Option<usize> = None;
+    let c = history[n - 1];
+    let b = history[n - 2];
+    let a = history[n - 3];
+    let d = if n >= 4 { history[n - 4] } else { -1 };
+    let e = if n >= 5 { history[n - 5] } else { -1 };
+    let mut i = n.saturating_sub(min_follow + 1);
+    while i >= 2 {
+        if history[i] == anchor && history[i - 1] == c && history[i - 2] == b {
+            if i >= 5 && n >= 5 && history[i - 3] == a && history[i - 4] == d && history[i - 5] == e {
                 let take = ngram_bucket_len((n - i).min(max_k));
                 if take >= min_follow {
                     let mut out = Vec::with_capacity(take);
@@ -953,24 +957,21 @@ fn ngram_lookup_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<
                     return Some(out);
                 }
             }
-            i -= 1;
+            if best4.is_none() && i >= 3 && history[i - 3] == a {
+                best4 = Some(i);
+            } else if best3.is_none() {
+                best3 = Some(i);
+            }
         }
+        i -= 1;
     }
-    if n >= 2 {
-        let b = history[n - 2];
-        let c = history[n - 1];
-        let mut i = n.saturating_sub(min_follow + 1);
-        while i >= 2 {
-            if history[i] == anchor && history[i - 1] == c && history[i - 2] == b {
-                let take = ngram_bucket_len((n - i).min(max_k));
-                if take >= min_follow {
-                    let mut out = Vec::with_capacity(take);
-                    out.push(anchor);
-                    out.extend_from_slice(&history[(i + 1)..(i + take)]);
-                    return Some(out);
-                }
-            }
-            i -= 1;
+    if let Some(pos) = best4.or(best3) {
+        let take = ngram_bucket_len((n - pos).min(max_k));
+        if take >= min_follow {
+            let mut out = Vec::with_capacity(take);
+            out.push(anchor);
+            out.extend_from_slice(&history[(pos + 1)..(pos + take)]);
+            return Some(out);
         }
     }
     None
@@ -1306,7 +1307,7 @@ fn run_scheduler(
             }
         }
 
-        if active.len() >= 1 && active.len() <= 8 && !any_grammar {
+        if active.len() >= 1 && active.len() <= 16 && !any_grammar {
             if let Some(ref mut d) = drafter {
                 let all_ready = active.iter().all(|a| a.seq < d.max_seqs() && d.seq_ctx_len(a.seq) == engine.seq_pos[a.seq]);
                 if all_ready {
@@ -2972,7 +2973,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
             );
         }
 
-        for &b in &[4usize, 8usize] {
+        for &b in &[4usize, 8usize, 16usize] {
             if b <= d.max_seqs() {
                 let mk = 4usize;
                 let code_p = format_prompt(
@@ -3018,7 +3019,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
         }
     }
 
-    for &b in &[8usize, 16usize] {
+    for &b in &[8usize, 16usize, 32usize, 64usize] {
         if b <= max_seqs {
             let seq_ids: Vec<i32> = (0..b as i32).collect();
             let mut cur = vec![0i32; b];

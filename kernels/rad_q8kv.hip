@@ -1977,6 +1977,10 @@ extern "C" int ink_attn_batch_gated_flash_q8kv(hipStream_t s, const float* Q, co
 }
 
 extern "C" int ink_attn_multi_gated_q8_q8kv(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const int8_t* kc_pool, const int8_t* vc_pool, const __half* ks_pool, const __half* vs_pool, const float* gate, const int* d_seq_ids, const int* d_positions, void* out_q8, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int max_ctx, int B) {
+    if (n_head == n_head_kv * 3 && dh == 128 && B >= 8) {
+        inkling_attn_multi_gqa3_q8_q8kv_k<<<dim3(n_head_kv, B), dim3(256), 0, s>>>(Q, R, sinks, rel_bias, kc_pool, vc_pool, ks_pool, vs_pool, gate, d_seq_ids, d_positions, (q8kv_q8_1_blk*)out_q8, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx);
+        return 0;
+    }
     inkling_attn_multi_gated_q8_q8kv_k<<<dim3(n_head, B), dim3(256), 0, s>>>(Q, R, sinks, rel_bias, kc_pool, vc_pool, ks_pool, vs_pool, gate, d_seq_ids, d_positions, (q8kv_q8_1_blk*)out_q8, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx);
     return 0;
 }
