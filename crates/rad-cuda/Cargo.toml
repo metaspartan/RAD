@@ -1,8 +1,8 @@
 [package]
 name = "rad-cuda"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.31.0"
+edition = "2021"
+license = "MIT"
 links = "rad_cuda"
 
 [dependencies]

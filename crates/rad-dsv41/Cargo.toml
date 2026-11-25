@@ -1,0 +1,13 @@
+[package]
+name = "rad-dsv41"
+version = "0.31.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+rad-cuda = { path = "../rad-cuda" }
+anyhow = "1"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
