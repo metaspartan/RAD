@@ -476,6 +476,37 @@ impl InklingEngine {
         let n_slots = cfg.n_slots();
         let mut slots = Vec::with_capacity(n_slots);
         let kv_dim = cfg.n_head_kv * cfg.dh;
+        let mut est_kv_bytes = 0usize;
+        for il in 0..n_slots {
+            let ip = if il < cfg.n_phys {
+                il
+            } else {
+                cfg.core_start + ((il - cfg.n_phys) % (cfg.core_end - cfg.core_start))
+            };
+            let is_swa = cfg.is_swa[ip];
+            let slot_ctx = if is_swa { (cfg.swa_window + 16).min(max_ctx) } else { max_ctx };
+            let kv_bytes = if is_swa {
+                max_seqs * cfg.n_head_kv * slot_ctx * cfg.dh * 2
+            } else {
+                max_seqs * cfg.n_head_kv * slot_ctx * cfg.dh
+            };
+            est_kv_bytes += kv_bytes * 2;
+            if !is_swa {
+                est_kv_bytes += max_seqs * cfg.n_head_kv * slot_ctx * 4;
+            }
+        }
+        let dev_id = rad_hip::get_device().unwrap_or(0);
+        let free_vram = rad_hip::mem_info(dev_id).map(|(f, _)| f).unwrap_or(usize::MAX);
+        let rem_after_kv = free_vram.saturating_sub(est_kv_bytes);
+        let snap_cap = if max_seqs >= 8 && max_ctx <= 32768 && rem_after_kv >= 5_500_000_000 {
+            1024
+        } else if max_seqs >= 8 && max_ctx <= 65536 && rem_after_kv >= 4_000_000_000 {
+            512
+        } else if max_seqs >= 4 && max_ctx <= 65536 && rem_after_kv >= 3_000_000_000 {
+            256
+        } else {
+            128
+        };
         for il in 0..n_slots {
             let ip = if il < cfg.n_phys {
                 il
@@ -505,15 +536,6 @@ impl InklingEngine {
             let mut v_hist = DevBuf::new(max_seqs * kv_dim * 3 * 4).map_err(he)?;
             let mut attn_post_hist = DevBuf::new(max_seqs * cfg.n_embd * 3 * 4).map_err(he)?;
             let mut ffn_post_hist = DevBuf::new(max_seqs * cfg.n_embd * 3 * 4).map_err(he)?;
-            let snap_cap = if max_seqs >= 8 && max_ctx <= 32768 {
-                1024
-            } else if max_seqs >= 8 && max_ctx <= 65536 {
-                512
-            } else if max_seqs >= 4 && max_ctx <= 65536 {
-                256
-            } else {
-                128
-            };
             let k_snap = DevBuf::new(snap_cap * kv_dim * 3 * 4).map_err(he)?;
             let v_snap = DevBuf::new(snap_cap * kv_dim * 3 * 4).map_err(he)?;
             let attn_post_snap = DevBuf::new(snap_cap * cfg.n_embd * 3 * 4).map_err(he)?;
@@ -587,15 +609,7 @@ impl InklingEngine {
         };
 
         let mb = MAX_BATCH;
-        let multi_verify_cap = if max_seqs >= 8 && max_ctx <= 32768 {
-            1024
-        } else if max_seqs >= 8 && max_ctx <= 65536 {
-            512
-        } else if max_seqs >= 4 && max_ctx <= 65536 {
-            256
-        } else {
-            128
-        };
+        let multi_verify_cap = snap_cap;
         let bsc = BatchScratch {
             d_toks: DevBuf::new(mb * 4).map_err(he)?,
             d_pos0: DevBuf::new(4).map_err(he)?,
@@ -2470,7 +2484,7 @@ impl InklingEngine {
                     sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
                 );
             }
-            if multi_k >= 16 && self.cfg.n_head == self.cfg.n_head_kv * 3 && self.cfg.dh == 128 {
+            if multi_k >= 8 && self.cfg.n_head == self.cfg.n_head_kv * 3 && self.cfg.dh == 128 {
                 let n_users = (b / multi_k) as i32;
                 ops::ink_attn_multi_gated_flash_q8kv(
                     s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
@@ -2525,7 +2539,7 @@ impl InklingEngine {
                     sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
                 );
             }
-            if multi_k >= 16 && self.cfg.n_head == self.cfg.n_head_kv * 3 && self.cfg.dh == 128 {
+            if multi_k >= 8 && self.cfg.n_head == self.cfg.n_head_kv * 3 && self.cfg.dh == 128 {
                 let n_users = (b / multi_k) as i32;
                 ops::ink_attn_multi_gated_flash(
                     s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,

@@ -8,7 +8,7 @@ RAD natively runs **Inkling-2-Mini** (26B MoE, 48 looped visits, hybrid SWA + fu
 
 ## Highlights
 
-- **Single-R9700 Speed Records:** **`1,196.5 tok/s`** peak decode (`>1,000 tok/s` across `2K–64K`, **`881.6 tok/s`** @ 128K, **`674.4 tok/s`** @ 256K), **`1,074.8 tok/s`** live `/v1/chat/completions` SSE (`1,073.4 tok/s` at `temp=0.2`), **`3,815.1 agg tok/s`** multi-user (`238.4 tok/s/user` at `B=16`, `3,601.3` / `450.2/user` at `B=8`, `2,840.7` / `710.2/user` at `B=4`), and **`4,217.2 tok/s`** `pp2048` prefill (**`2,046.4 tok/s`** @ 256K, **`5.51×`** `llama.cpp`) with **`1.84 s`** cold load at 256K.
+- **Single-R9700 Speed Records:** **`1,196.5 tok/s`** peak decode (`>1,000 tok/s` across `2K–64K`, **`881.6 tok/s`** @ 128K, **`674.4 tok/s`** @ 256K), **`1,074.8 tok/s`** live `/v1/chat/completions` SSE (`1,073.4 tok/s` at `temp=0.2`), **`3,815.1 agg tok/s`** multi-user (`3,042.8 agg tok/s` / **`322.9 tok/s/user`** live 8-user HTTP SSE at `temp=0.2`, `3,601.3` / `450.2/user` at `B=8`, `2,840.7` / `710.2/user` at `B=4`), and **`4,218.6 tok/s`** `pp2048` prefill (**`2,046.4 tok/s`** @ 256K, **`5.51×`** `llama.cpp`) with **`1.84 s`** cold load at 256K.
 - **RDNA4 (`gfx1201`) Custom HIP Kernels:** Hand-written Wave32 WMMA `Q4_0_SOA × Q8_1` GEMM/MoE, Split-KV WMMA FlashAttention-2, INT8 full-attention KV cache, and HIP graph capture (`B=1`, `K=8..128` verify, and multi-user Flash verify).
 - **Native Speculative Decoding:** Zero-copy [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) + DSpark + hybrid `K=128` longest-prefix lookup (single-user & multi-user, greedy & GPU top-64 sampled).
 - **Agentic & Multimodal Ready:** Native Inkling-2-Mini tool calling, multi-turn prefix caching (`98.9–99.5%` hit rate even across reformatted tool-call JSON via verbatim `tool_call_id` replay, `21–82 ms` cached TTFT/E2E), JSON grammar constraints, and built-in GPU Vision (`mmproj-F16.gguf`).
@@ -27,10 +27,10 @@ Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)**, *
 | Engine / Hardware | Decode (`tok/s`) | `pp2048` Prefill (`tok/s`) | Notes |
 | --- | --- | --- | --- |
 | **Stock `llama.cpp` (R9700 + DSpark)** | `70.5 tok/s` | `765.5 tok/s` | `-fa on -ctk q8_0 -ctv q8_0 --spec-type draft-dspark` |
-| **RAD (R9700, No-Spec `hipGraph`)** | **`110.8 ± 0.7 tok/s`** (`1.57×`) | **`4,217.2 ± 2.8 tok/s`** (**`5.51×`**) | `tg128 @ d=2048 = 101.9 tok/s`; `pp512 = 3,417.0 ± 4.6 tok/s` |
+| **RAD (R9700, No-Spec `hipGraph`)** | **`110.8 ± 0.7 tok/s`** (`1.57×`) | **`4,218.6 ± 2.1 tok/s`** (**`5.51×`**) | `tg128 @ d=2048 = 101.9 tok/s`; `pp512 = 3,417.0 ± 4.6 tok/s` |
 | **Unsloth RTX PRO 6000 Blackwell** | `125.0 tok/s` *(claimed)* | — | 96 GB workstation GPU (~\$8,500) |
-| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`4,217.2 tok/s`** (**`5.51×`**) | `verify=23.7 ms`, `avg_emit=4.27` |
-| **RAD (R9700 + DFlash 2 `K=8`, Pure Gen)** | **`302.2 tok/s`** (**`4.29×`**) | **`4,152.8 ± 2.3 tok/s`** (**`5.42×`**) | **2.42× vs. RTX PRO 6000 Blackwell**, `Math=271.4 tok/s`, `2K Pure Gen=244.7 tok/s`, `Prose=110.9 tok/s` |
+| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`4,218.6 tok/s`** (**`5.51×`**) | `verify=23.7 ms`, `avg_emit=4.27` |
+| **RAD (R9700 + DFlash 2 `K=8`, Pure Gen)** | **`302.2 tok/s`** (**`4.29×`**) | **`4,160.1 ± 1.3 tok/s`** (**`5.43×`**) | **2.42× vs. RTX PRO 6000 Blackwell**, `Math=271.4 tok/s`, `2K Pure Gen=244.7 tok/s`, `Prose=110.9 tok/s` |
 | **RAD (Hybrid DFlash 2 + `K=128`, 2K–256K)** | **`1,196.5 tok/s`** (**`16.97×`**) | **`4,035.4 tok/s`** (**`5.27×`**) | **9.57× vs. RTX PRO 6000 Blackwell**; **`>1,000 tok/s` across 2K–64K**, **`881.6 tok/s`** at 128K, **`674.4 tok/s`** at 256K |
 
 ### Long-Context Decode & Prefill (`2K → 256K`, Single 32 GB R9700)
@@ -59,20 +59,20 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **Cold Load (`ctx=262144`, DFlash 2)** | **1.80 s** | On-GPU `Q4_0_SOA` + `Q8_0` conversion & `hipGraph` capture |
 | **Short Prompt TTFT (`24 tok`)** | **32.7 ± 0.0 ms** | 3-run mean; 8-warp LDS WMMA + high-occupancy `sink_dyn_bf16_smallb_k` |
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **21.2 ms** | Prefix-cache affinity hit + GQA 3:1 Split-KV FlashAttention |
-| **Multi-User Decode (`B=4`, Batched DFlash 2 `K=4`)** | **514.5 agg tok/s** | **`128.6 tok/s/user`** (`ITL 7.8 ms`, 1-launch rewind + unrolled `nt == 8` MoE) |
+| **Multi-User Decode (`B=4`, Batched DFlash 2 `K=8`)** | **538.1 agg tok/s** | **`134.5 tok/s/user`** (`ITL 7.4 ms`, 32-tok `exp2f` SWA + single-launch `grid.z` WMMA) |
 | **Multi-User Decode (`B=4`, Hybrid DFlash 2 + `K=128`)** | **2,840.7 agg tok/s** | **`710.2 tok/s/user`** (`ITL 1.4 ms`, 32-tok `exp2f` Q8KV FlashAttention + `hipGraph`) |
 | **Multi-User Decode (`B=8`, no-spec)** | **643.6 agg tok/s** | **`80.4 tok/s/user`** (`ITL 12.4 ms`, `hipGraph` + GQA-3:1 INT8 KV + `loop_ctrl_down_nt_k<8>`) |
-| **Multi-User Decode (`B=8`, Batched DFlash 2 `K=8`)** | **734.2 agg tok/s** | **`91.8 tok/s/user`** (`ITL 10.9 ms`; `blockIdx.z` MoE + `fused_rg B<=64` + GQA-3:1 INT8 KV) |
+| **Multi-User Decode (`B=8`, Batched DFlash 2 `K=8`)** | **748.8 agg tok/s** | **`93.6 tok/s/user`** (`ITL 10.7 ms`; 32-tok `exp2f` SWA + `grid.z` WMMA FlashAttention) |
 | **Multi-User Decode (`B=8`, Hybrid DFlash 2 + `K=128`)** | **3,601.3 agg tok/s** | **`450.2 tok/s/user`** (`ITL 2.2 ms`, 32-tok `exp2f` Q8KV FlashAttention + `1,024`-tok verify) |
 | **Multi-User Decode (`B=16`, no-spec)** | **926.3 agg tok/s** | **`57.9 tok/s/user`** (`ITL 17.3 ms`, unrolled `nt == 8` MoE + GQA-3:1 INT8 KV) |
-| **Multi-User Decode (`B=16`, Batched DFlash 2 `K=8`)** | **1,118.1 agg tok/s** | **`69.9 tok/s/user`** (`ITL 14.3 ms`) |
+| **Multi-User Decode (`B=16`, Batched DFlash 2 `K=8`)** | **1,174.4 agg tok/s** | **`73.4 tok/s/user`** (`ITL 13.6 ms`, 32-tok `exp2f` SWA + `grid.z` WMMA FlashAttention) |
 | **Multi-User Decode (`B=16`, Hybrid DFlash 2 + `K=64`)** | **3,815.1 agg tok/s** | **`238.4 tok/s/user`** (`ITL 4.2 ms`, 32-tok `exp2f` Q8KV FlashAttention, **90.5% of `pp2048` compute**) |
 | **Multi-User Decode (`B=32`, no-spec)** | **1,277.8 agg tok/s** | **`39.9 tok/s/user`** (`ITL 25.0 ms`; +47% via `blockIdx.z` hot-expert splitting & `fused_rg B<=64`) |
 | **Multi-User Decode (`B=64`, no-spec)** | **1,162.2 agg tok/s** | `18.2 tok/s/user` (8-warp `128×64` LDS WMMA MoE) |
 | **Multi-User Decode (`B=128`, no-spec)** | **1,856.0 agg tok/s** | **`14.5 tok/s/user`** (fused WMMA MoE-to-`Q8_1` + `float4` slot reduction) |
 | **Live SSE API (`/v1/chat/completions`, real code edit)** | **1,074.8 tok/s** | Live HTTP SSE streaming `2,048` Python tokens in `1.91 s` (**`1,073.4 tok/s`** at `temp=0.2` via GPU top-64 sampling) |
-| **Multi-Turn Agentic E2E (`exec` + `write_file` + `read_file`)** | **98.9–99.5% prefix cache** | Verbatim `tool_call_id` replay survives client JSON reformatting (`82.5 ms` T2 E2E), stop-token speculative rewind |
-| **Live SSE API (8-User Concurrent, Hybrid `K=128`, `temp=0.2`)** | **2,017.0 agg tok/s** | **`243.2 tok/s/user`** avg (**`2,853 tok/s`** peak 1s burst, up to **`305.5 tok/s/user`**, `1,657.1` full decode span) |
+| **Multi-Turn Agentic E2E (`exec` + `write_file` + `read_file`)** | **98.9–99.5% prefix cache** | Verbatim `tool_call_id` replay survives client JSON reformatting (`80.8 ms` T2 E2E), stop-token speculative rewind |
+| **Live SSE API (8-User Concurrent, Hybrid `K=128`, `temp=0.2`)** | **3,042.8 agg tok/s** | **`322.9 tok/s/user`** avg (**`2,199.7 agg tok/s`** full decode span, up to **`380.3 tok/s/user`**, 64-tok longest-match lookup + batched DFlash 2 fallback) |
 
 ---
 
@@ -101,7 +101,8 @@ RAD/
 │   ├── rad_longctx.svg        Long-context 2K–256K decode & prefill scaling chart
 │   └── rad_multiuser.svg      Multi-user throughput scaling chart
 └── scripts/
-    └── test_serve.py          End-to-end HTTP, SSE, batch, and WebSocket test suite
+    ├── test_serve.py          End-to-end HTTP, SSE, batch, and WebSocket test suite
+    └── test_e2e_realworld.py  Real-world multi-user SSE, tool-call prefix cache, grammar & disconnect tests
 ```
 
 ---

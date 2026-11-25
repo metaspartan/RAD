@@ -975,18 +975,21 @@ fn ngram_lookup_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<
     let b = history[n - 2];
     let mut best_pos: Option<usize> = None;
     let mut best_len: usize = 0;
+    let mut best_avail: usize = 0;
     let mut i = n.saturating_sub(min_follow + 1);
     while i >= 2 {
         if history[i] == anchor && history[i - 1] == c && history[i - 2] == b {
             let mut mlen = 3usize;
-            let max_m = 16usize.min(i).min(n);
+            let max_m = 64usize.min(i).min(n);
             while mlen < max_m && history[i - mlen] == history[n - mlen] {
                 mlen += 1;
             }
-            if mlen > best_len {
+            let avail = (n - i).min(max_k);
+            if mlen > best_len || (mlen == best_len && avail > best_avail) {
                 best_len = mlen;
                 best_pos = Some(i);
-                if mlen >= 16 {
+                best_avail = avail;
+                if mlen >= 64 && avail >= max_k {
                     break;
                 }
             }
@@ -1196,8 +1199,10 @@ fn run_scheduler(
                                 last_tok = vocab_grammar.select_best_token(&logits, g);
                             }
                         } else if !sampling.is_greedy() {
-                            if let Ok(logits) = engine.read_batch_logits(0) {
-                                last_tok = grammar::sample_from_logits(&logits, &engine.seq_tokens[pf.seq], &mut sampling);
+                            if let Ok((tk_vals, tk_ids)) = engine.read_batch_topk64(1) {
+                                let seq_len = engine.seq_tokens[pf.seq].len();
+                                let recent = &engine.seq_tokens[pf.seq][seq_len.saturating_sub(128)..];
+                                last_tok = grammar::sample_from_topk(&tk_vals[..64], &tk_ids[..64], recent, &mut sampling);
                             }
                         }
                         let _ = pf.job.tx.send(GenEvent::Prefill {
@@ -1398,207 +1403,256 @@ fn run_scheduler(
 
         let any_grammar_only = active.iter().any(|a| a.grammar.is_some());
         if active.len() >= 1 && active.len() <= 16 && !any_grammar_only {
-            if let Some(ref mut d) = drafter {
-                let all_ready = active.iter().all(|a| a.seq < d.max_seqs() && d.seq_ctx_len(a.seq) == engine.seq_pos[a.seq]);
-                if all_ready {
-                    let n_u = active.len();
-                    let max_user_k = (engine.multi_verify_cap / n_u).min(128);
-                    let mut ng_drafts: Option<Vec<Vec<i32>>> = None;
-                    if n_u >= 2 && max_user_k >= 8 {
-                        let mut cands: Vec<Option<Vec<i32>>> = Vec::with_capacity(n_u);
-                        let mut hit_count = 0usize;
-                        let mut max_hit_len = 0usize;
-                        for a in &active {
-                            let rem_kv = engine.max_ctx.saturating_sub(engine.seq_pos[a.seq] as usize);
-                            if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[a.seq], a.next_tok, max_user_k.min(rem_kv)) {
-                                if ng.len() >= 8 {
-                                    hit_count += 1;
-                                    max_hit_len = max_hit_len.max(ng.len());
-                                }
-                                cands.push(Some(ng));
-                            } else {
-                                cands.push(None);
-                            }
+            let n_u = active.len();
+            let max_user_k = (engine.multi_verify_cap / n_u).min(128);
+            let mut ng_drafts: Option<Vec<Vec<i32>>> = None;
+            if n_u >= 2 && max_user_k >= 8 {
+                let mut cands: Vec<Option<Vec<i32>>> = Vec::with_capacity(n_u);
+                let mut hit_count = 0usize;
+                let mut max_hit_len = 0usize;
+                for a in &active {
+                    let rem_kv = engine.max_ctx.saturating_sub(engine.seq_pos[a.seq] as usize);
+                    if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[a.seq], a.next_tok, max_user_k.min(rem_kv)) {
+                        if ng.len() >= 8 {
+                            hit_count += 1;
+                            max_hit_len = max_hit_len.max(ng.len());
                         }
-                        if hit_count * 2 >= n_u {
-                            let bk = ngram_bucket_len(max_hit_len);
-                            if bk >= 8 {
-                                let mut padded: Vec<Vec<i32>> = Vec::with_capacity(n_u);
-                                for (idx, c) in cands.into_iter().enumerate() {
-                                    let mut v = match c {
-                                        Some(ng) if ng.len() >= 8 => ng,
-                                        _ => {
-                                            let su = active[idx].seq;
-                                            let df_k = spec_k.min(bk);
-                                            d.draft_seq(su, active[idx].next_tok, &engine, df_k)
-                                                .unwrap_or_else(|_| vec![active[idx].next_tok])
-                                        }
-                                    };
-                                    if v.len() > bk {
-                                        v.truncate(bk);
-                                    } else if v.len() < bk {
-                                        let pad = *v.last().unwrap_or(&active[idx].next_tok);
-                                        v.resize(bk, pad);
-                                    }
-                                    padded.push(v);
-                                }
-                                ng_drafts = Some(padded);
-                            }
-                        }
-                    }
-                    let multi_k = if let Some(ref ng) = ng_drafts {
-                        ng[0].len()
-                    } else if n_u == 1 {
-                        spec_k
+                        cands.push(Some(ng));
                     } else {
-                        spec_k.min(max_user_k).max(4)
-                    };
-                    let any_sampling = active.iter().any(|a| !a.sampling.is_greedy());
-                    let seq_ids: Vec<i32> = active.iter().map(|a| a.seq as i32).collect();
-                    let anchors: Vec<i32> = active.iter().map(|a| a.next_tok).collect();
-                    let pos_before: Vec<i32> = active.iter().map(|a| engine.seq_pos[a.seq]).collect();
-                    let t_step = Instant::now();
-                    let res = (|| -> anyhow::Result<Vec<Vec<i32>>> {
-                        let drafts = match ng_drafts {
-                            Some(ng) => ng,
-                            None => d.draft_multi(&seq_ids, &anchors, &engine, multi_k)?,
-                        };
-                        let preds = engine.verify_multi(&seq_ids, &drafts)?;
-                        let topk_opt = if any_sampling {
-                            Some(engine.read_batch_topk64(n_u * multi_k)?)
-                        } else {
-                            None
-                        };
-                        let mut emits = vec![0usize; active.len()];
-                        let mut outs = Vec::with_capacity(active.len());
-                        for u in 0..active.len() {
-                            let su = seq_ids[u] as usize;
-                            let mut n_acc = 1usize;
-                            let mut last_pred = preds[u][0];
-                            if let (Some((ref tk_vals, ref tk_ids)), true) = (&topk_opt, !active[u].sampling.is_greedy()) {
-                                let seq_len = engine.seq_tokens[su].len();
-                                let mut recent: Vec<i32> = engine.seq_tokens[su][seq_len.saturating_sub(128)..].to_vec();
-                                for j in 0..multi_k {
-                                    recent.push(drafts[u][j]);
-                                    let off = (u * multi_k + j) * 64;
-                                    let pred = grammar::sample_from_topk(
-                                        &tk_vals[off..off + 64],
-                                        &tk_ids[off..off + 64],
-                                        &recent,
-                                        &mut active[u].sampling,
-                                    );
-                                    last_pred = pred;
-                                    if pred == 200006 || pred == 199999 {
-                                        break;
-                                    }
-                                    if j + 1 < multi_k && pred == drafts[u][j + 1] {
-                                        n_acc += 1;
-                                    } else {
-                                        break;
-                                    }
+                        cands.push(None);
+                    }
+                }
+                if hit_count * 2 >= n_u {
+                    let bk = ngram_bucket_len(max_hit_len);
+                    if bk >= 8 {
+                        let mut miss_idx: Vec<usize> = Vec::new();
+                        let mut miss_seqs: Vec<i32> = Vec::new();
+                        let mut miss_anchors: Vec<i32> = Vec::new();
+                        if let Some(ref d) = drafter {
+                            for (idx, c) in cands.iter().enumerate() {
+                                let su = active[idx].seq;
+                                if !matches!(c, Some(ng) if ng.len() >= 8)
+                                    && su < d.max_seqs()
+                                    && d.seq_ctx_len(su) == engine.seq_pos[su]
+                                {
+                                    miss_idx.push(idx);
+                                    miss_seqs.push(su as i32);
+                                    miss_anchors.push(active[idx].next_tok);
                                 }
+                            }
+                        }
+                        let df_k = spec_k.min(bk);
+                        let mut miss_drafts: Vec<Vec<i32>> = if let Some(ref mut d) = drafter {
+                            if miss_seqs.len() >= 2 {
+                                d.draft_multi(&miss_seqs, &miss_anchors, &engine, df_k)
+                                    .unwrap_or_else(|_| miss_anchors.iter().map(|&a| vec![a]).collect())
+                            } else if miss_seqs.len() == 1 {
+                                vec![d.draft_seq(miss_seqs[0] as usize, miss_anchors[0], &engine, df_k)
+                                    .unwrap_or_else(|_| vec![miss_anchors[0]])]
                             } else {
-                                for j in 0..(multi_k - 1) {
-                                    if preds[u][j] == 200006 || preds[u][j] == 199999 {
-                                        break;
-                                    }
-                                    if preds[u][j] == drafts[u][j + 1] {
-                                        n_acc += 1;
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let mut miss_cursor = 0usize;
+                        let mut padded: Vec<Vec<i32>> = Vec::with_capacity(n_u);
+                        for (idx, c) in cands.into_iter().enumerate() {
+                            let mut v = match c {
+                                Some(ng) if ng.len() >= 8 => ng,
+                                _ => {
+                                    if miss_cursor < miss_idx.len() && miss_idx[miss_cursor] == idx {
+                                        let dv = std::mem::take(&mut miss_drafts[miss_cursor]);
+                                        miss_cursor += 1;
+                                        dv
                                     } else {
-                                        break;
+                                        vec![active[idx].next_tok]
                                     }
                                 }
-                                last_pred = preds[u][n_acc - 1];
+                            };
+                            if v.len() > bk {
+                                v.truncate(bk);
+                            } else if v.len() < bk {
+                                let pad = *v.last().unwrap_or(&active[idx].next_tok);
+                                v.resize(bk, pad);
                             }
-                            emits[u] = n_acc;
-                            let mut tok_out = Vec::with_capacity(n_acc);
-                            for j in 1..n_acc {
-                                tok_out.push(drafts[u][j]);
-                            }
-                            tok_out.push(last_pred);
-                            outs.push(tok_out);
+                            padded.push(v);
                         }
-                        engine.rewind_verify_multi(&seq_ids, &emits, multi_k)?;
-                        for u in 0..active.len() {
-                            let su = seq_ids[u] as usize;
-                            d.inject_batch_seq_async(su, &engine, u * multi_k, pos_before[u], emits[u])?;
-                            for j in 0..emits[u] {
-                                engine.seq_tokens[su].push(drafts[u][j]);
-                            }
-                            let _ = engine.paged_kv.ensure_tokens(su, engine.seq_pos[su] as usize, &engine.seq_tokens[su]);
-                        }
-                        d.sync();
-                        Ok(outs)
-                    })();
-                    let step_s = t_step.elapsed().as_secs_f64();
-                    sync_kv_metrics(&engine, &metrics);
-                    match res {
-                        Ok(all_outs) => {
-                            let tot_out: usize = all_outs.iter().map(|v| v.len()).sum();
-                            metrics.spec_rounds_total.fetch_add(1, Ordering::Relaxed);
-                            metrics.spec_accepted_tokens_total.fetch_add(tot_out as u64, Ordering::Relaxed);
-                            metrics.decode_us_total.fetch_add((step_s * 1e6) as u64, Ordering::Relaxed);
-                            if tot_out > 0 {
-                                metrics.observe_itl(step_s / (tot_out as f64 / active.len().max(1) as f64));
-                            }
-                            let mut keep = Vec::with_capacity(active.len());
-                            for (mut slot, toks_out) in active.into_iter().zip(all_outs.into_iter()) {
-                                let mut finished = false;
-                                let mut last_tok = slot.next_tok;
-                                for nxt in toks_out {
-                                    let is_stop = nxt == 200006 || nxt == 199999;
-                                    if is_stop || slot.tx.is_closed() {
-                                        let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
-                                        let _ = slot.tx.send(GenEvent::Done {
-                                            finish_reason: "stop",
-                                            pred_n: slot.emitted,
-                                            dec_ms,
-                                        });
-                                        free[slot.seq] = true;
-                                        finished = true;
-                                        break;
-                                    }
-                                    slot.emitted += 1;
-                                    metrics.generated_tokens_total.fetch_add(1, Ordering::Relaxed);
-                                    let _ = slot.tx.send(GenEvent::Token(nxt as u32));
-                                    last_tok = nxt;
-                                    if slot.emitted >= slot.max_tokens {
-                                        let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
-                                        let _ = slot.tx.send(GenEvent::Done {
-                                            finish_reason: "length",
-                                            pred_n: slot.emitted,
-                                            dec_ms,
-                                        });
-                                        free[slot.seq] = true;
-                                        finished = true;
-                                        break;
-                                    }
+                        ng_drafts = Some(padded);
+                    }
+                }
+            }
+            let use_drafter_multi = ng_drafts.is_none()
+                && drafter.as_ref().map(|d| {
+                    active.iter().all(|a| a.seq < d.max_seqs() && d.seq_ctx_len(a.seq) == engine.seq_pos[a.seq])
+                }).unwrap_or(false);
+            if ng_drafts.is_some() || use_drafter_multi {
+                let multi_k = if let Some(ref ng) = ng_drafts {
+                    ng[0].len()
+                } else {
+                    spec_k.min(max_user_k).max(4)
+                };
+                let any_sampling = active.iter().any(|a| !a.sampling.is_greedy());
+                let seq_ids: Vec<i32> = active.iter().map(|a| a.seq as i32).collect();
+                let anchors: Vec<i32> = active.iter().map(|a| a.next_tok).collect();
+                let pos_before: Vec<i32> = active.iter().map(|a| engine.seq_pos[a.seq]).collect();
+                let t_step = Instant::now();
+                let res = (|| -> anyhow::Result<Vec<Vec<i32>>> {
+                    let drafts = match ng_drafts {
+                        Some(ng) => ng,
+                        None => drafter.as_mut().unwrap().draft_multi(&seq_ids, &anchors, &engine, multi_k)?,
+                    };
+                    let preds = engine.verify_multi(&seq_ids, &drafts)?;
+                    let topk_opt = if any_sampling {
+                        Some(engine.read_batch_topk64(n_u * multi_k)?)
+                    } else {
+                        None
+                    };
+                    let mut emits = vec![0usize; active.len()];
+                    let mut outs = Vec::with_capacity(active.len());
+                    for u in 0..active.len() {
+                        let su = seq_ids[u] as usize;
+                        let mut n_acc = 1usize;
+                        let mut last_pred = preds[u][0];
+                        if let (Some((ref tk_vals, ref tk_ids)), true) = (&topk_opt, !active[u].sampling.is_greedy()) {
+                            let seq_len = engine.seq_tokens[su].len();
+                            let mut recent: Vec<i32> = engine.seq_tokens[su][seq_len.saturating_sub(128)..].to_vec();
+                            for j in 0..multi_k {
+                                recent.push(drafts[u][j]);
+                                let off = (u * multi_k + j) * 64;
+                                let pred = grammar::sample_from_topk(
+                                    &tk_vals[off..off + 64],
+                                    &tk_ids[off..off + 64],
+                                    &recent,
+                                    &mut active[u].sampling,
+                                );
+                                last_pred = pred;
+                                if pred == 200006 || pred == 199999 {
+                                    break;
                                 }
-                                if !finished {
-                                    slot.next_tok = last_tok;
-                                    keep.push(slot);
+                                if j + 1 < multi_k && pred == drafts[u][j + 1] {
+                                    n_acc += 1;
+                                } else {
+                                    break;
                                 }
                             }
-                            active = keep;
-                        }
-                        Err(e) => {
-                            let msg = format!("{e}");
-                            for slot in active.drain(..) {
-                                let _ = slot.tx.send(GenEvent::Error(msg.clone()));
-                                free[slot.seq] = true;
+                        } else {
+                            for j in 0..(multi_k - 1) {
+                                if preds[u][j] == 200006 || preds[u][j] == 199999 {
+                                    break;
+                                }
+                                if preds[u][j] == drafts[u][j + 1] {
+                                    n_acc += 1;
+                                } else {
+                                    break;
+                                }
                             }
+                            last_pred = preds[u][n_acc - 1];
+                        }
+                        emits[u] = n_acc;
+                        let mut tok_out = Vec::with_capacity(n_acc);
+                        for j in 1..n_acc {
+                            tok_out.push(drafts[u][j]);
+                        }
+                        tok_out.push(last_pred);
+                        outs.push(tok_out);
+                    }
+                    engine.rewind_verify_multi(&seq_ids, &emits, multi_k)?;
+                    let mut injected_any = false;
+                    for u in 0..active.len() {
+                        let su = seq_ids[u] as usize;
+                        if let Some(ref mut d) = drafter {
+                            if su < d.max_seqs() && d.seq_ctx_len(su) == pos_before[u] {
+                                d.inject_batch_seq_async(su, &engine, u * multi_k, pos_before[u], emits[u])?;
+                                injected_any = true;
+                            }
+                        }
+                        for j in 0..emits[u] {
+                            engine.seq_tokens[su].push(drafts[u][j]);
+                        }
+                        let _ = engine.paged_kv.ensure_tokens(su, engine.seq_pos[su] as usize, &engine.seq_tokens[su]);
+                    }
+                    if injected_any {
+                        if let Some(ref mut d) = drafter {
+                            d.sync();
                         }
                     }
-                    continue;
+                    Ok(outs)
+                })();
+                let step_s = t_step.elapsed().as_secs_f64();
+                sync_kv_metrics(&engine, &metrics);
+                match res {
+                    Ok(all_outs) => {
+                        let tot_out: usize = all_outs.iter().map(|v| v.len()).sum();
+                        metrics.spec_rounds_total.fetch_add(1, Ordering::Relaxed);
+                        metrics.spec_accepted_tokens_total.fetch_add(tot_out as u64, Ordering::Relaxed);
+                        metrics.decode_us_total.fetch_add((step_s * 1e6) as u64, Ordering::Relaxed);
+                        if tot_out > 0 {
+                            metrics.observe_itl(step_s / (tot_out as f64 / active.len().max(1) as f64));
+                        }
+                        let mut keep = Vec::with_capacity(active.len());
+                        for (mut slot, toks_out) in active.into_iter().zip(all_outs.into_iter()) {
+                            let mut finished = false;
+                            let mut last_tok = slot.next_tok;
+                            for nxt in toks_out {
+                                let is_stop = nxt == 200006 || nxt == 199999;
+                                if is_stop || slot.tx.is_closed() {
+                                    let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
+                                    let _ = slot.tx.send(GenEvent::Done {
+                                        finish_reason: "stop",
+                                        pred_n: slot.emitted,
+                                        dec_ms,
+                                    });
+                                    free[slot.seq] = true;
+                                    finished = true;
+                                    break;
+                                }
+                                slot.emitted += 1;
+                                metrics.generated_tokens_total.fetch_add(1, Ordering::Relaxed);
+                                let _ = slot.tx.send(GenEvent::Token(nxt as u32));
+                                last_tok = nxt;
+                                if slot.emitted >= slot.max_tokens {
+                                    let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
+                                    let _ = slot.tx.send(GenEvent::Done {
+                                        finish_reason: "length",
+                                        pred_n: slot.emitted,
+                                        dec_ms,
+                                    });
+                                    free[slot.seq] = true;
+                                    finished = true;
+                                    break;
+                                }
+                            }
+                            if !finished {
+                                slot.next_tok = last_tok;
+                                keep.push(slot);
+                            }
+                        }
+                        active = keep;
+                    }
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        for slot in active.drain(..) {
+                            let _ = slot.tx.send(GenEvent::Error(msg.clone()));
+                            free[slot.seq] = true;
+                        }
+                    }
                 }
+                continue;
             }
         }
 
         let seq_ids: Vec<i32> = active.iter().map(|a| a.seq as i32).collect();
         let toks: Vec<i32> = active.iter().map(|a| a.next_tok).collect();
+        let any_step_sampling = active.iter().any(|a| a.grammar.is_none() && !a.sampling.is_greedy());
         let t_step = Instant::now();
         match engine.step_multi(&seq_ids, &toks) {
             Ok(nexts) => {
+                let topk_opt = if any_step_sampling && active.len() > 1 {
+                    engine.read_batch_topk64(active.len()).ok()
+                } else {
+                    None
+                };
                 let step_s = t_step.elapsed().as_secs_f64();
                 metrics.decode_us_total.fetch_add((step_s * 1e6) as u64, Ordering::Relaxed);
                 metrics.observe_itl(step_s);
@@ -1609,7 +1663,12 @@ fn run_scheduler(
                             nxt = vocab_grammar.select_best_token(&logits, g);
                         }
                     } else if !slot.sampling.is_greedy() {
-                        if let Ok(logits) = engine.read_batch_logits(u) {
+                        if let Some((ref tk_vals, ref tk_ids)) = topk_opt {
+                            let off = u * 64;
+                            let seq_len = engine.seq_tokens[slot.seq].len();
+                            let recent = &engine.seq_tokens[slot.seq][seq_len.saturating_sub(128)..];
+                            nxt = grammar::sample_from_topk(&tk_vals[off..off + 64], &tk_ids[off..off + 64], recent, &mut slot.sampling);
+                        } else if let Ok(logits) = engine.read_batch_logits(u) {
                             nxt = grammar::sample_from_logits(&logits, &engine.seq_tokens[slot.seq], &mut slot.sampling);
                         }
                     }

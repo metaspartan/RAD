@@ -2309,7 +2309,25 @@ extern "C" __global__ void logits_topk64_batch_k(const float* __restrict__ logit
     const float* lg = logits + (size_t)bt * vocab_padded;
     float tv[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
     int ti[4] = {0, 0, 0, 0};
-    for (int i = tid; i < n_unpadded; i += 256) {
+    const float4* lg4 = reinterpret_cast<const float4*>(lg);
+    int n4 = n_unpadded >> 2;
+    for (int i4 = tid; i4 < n4; i4 += 256) {
+        float4 v4 = lg4[i4];
+        int base = i4 << 2;
+        float vals[4] = {v4.x, v4.y, v4.z, v4.w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            float v = vals[k];
+            if (v > tv[3]) {
+                tv[3] = v;
+                ti[3] = base + k;
+                if (tv[3] > tv[2]) { float fv = tv[2]; tv[2] = tv[3]; tv[3] = fv; int fi = ti[2]; ti[2] = ti[3]; ti[3] = fi; }
+                if (tv[2] > tv[1]) { float fv = tv[1]; tv[1] = tv[2]; tv[2] = fv; int fi = ti[1]; ti[1] = ti[2]; ti[2] = fi; }
+                if (tv[1] > tv[0]) { float fv = tv[0]; tv[0] = tv[1]; tv[1] = fv; int fi = ti[0]; ti[0] = ti[1]; ti[1] = fi; }
+            }
+        }
+    }
+    for (int i = (n4 << 2) + tid; i < n_unpadded; i += 256) {
         float v = lg[i];
         if (v > tv[3]) {
             tv[3] = v;
