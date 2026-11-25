@@ -541,6 +541,123 @@ impl Dsv41Engine {
         Ok(out[0])
     }
 
+    pub fn profile_step(&mut self, token_id: i32, comm: &mut Tp2Comm) -> Result<()> {
+        let tc = self.cfg.text_config.clone();
+        let d = tc.hidden_size;
+        let n_heads_local = tc.num_attention_heads / self.world;
+        let heads_per_grp = tc.num_attention_heads / tc.o_groups;
+        let stream: CudaStream = std::ptr::null_mut();
+        let start_pos = self.pos as i32;
+        let attn_scale = 1.0f32 / (tc.head_dim as f32).sqrt();
+        let sync_t = || -> f64 {
+            let _ = rad_cuda::sync_device();
+            0.0
+        };
+        self.d_tok_ids.copy_from(&token_id.to_le_bytes(), None).map_err(CudaFail)?;
+        unsafe {
+            cuda_ops::rad_cuda_embed_to_mhc_f16(self.embed.ptr, self.d_tok_ids.ptr as *const i32, self.d_streams.ptr, 1, d as i32, stream);
+        }
+        let _ = sync_t();
+        let lw = &self.layers[0];
+        let t0 = std::time::Instant::now();
+        unsafe {
+            cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_attn_fn.ptr, lw.hc_attn_base.ptr, lw.hc_attn_scale.ptr, self.d_h_coeff.ptr, self.d_branch_in.ptr, 1, d as i32, tc.hc_eps, stream);
+            cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.attn_norm.ptr, self.d_normed.ptr, 1, d as i32, tc.rms_norm_eps, stream);
+        }
+        let _ = sync_t();
+        let t_mhc1 = t0.elapsed().as_secs_f64() * 1e6;
+
+        let t1 = std::time::Instant::now();
+        unsafe {
+            self.exl3_proj(self.d_normed.ptr, &lw.wq_a, self.d_q_lora.ptr, 1, 0, stream);
+            cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_q_lora.ptr, lw.q_norm.ptr, self.d_q_normed.ptr, 1, tc.q_lora_rank as i32, tc.rms_norm_eps, stream);
+            self.exl3_proj(self.d_q_normed.ptr, &lw.wq_b, self.d_q.ptr, 1, 0, stream);
+            self.exl3_proj(self.d_normed.ptr, &lw.wkv, self.d_kv.ptr, 1, 0, stream);
+            cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, lw.kv_norm.ptr, self.d_kv_normed.ptr, 1, tc.head_dim as i32, tc.rms_norm_eps, stream);
+            cuda_ops::rad_cuda_rope_yarn_f16(self.d_q.ptr, self.d_kv_normed.ptr, 1, n_heads_local as i32, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 1.0f32, stream);
+            cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv_normed.ptr, self.d_kv_normed.ptr, self.kv_caches[0].k_cache.ptr, self.kv_caches[0].v_cache.ptr, 1, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
+        }
+        let _ = sync_t();
+        let t_qkv = t1.elapsed().as_secs_f64() * 1e6;
+
+        let t2 = std::time::Instant::now();
+        unsafe {
+            let sink_ptr = (lw.attn_sink.ptr as *const f32).add(self.rank * n_heads_local);
+            cuda_ops::rad_cuda_mqa_attn_sink_causal_f16(self.d_q.ptr, self.kv_caches[0].k_cache.ptr, self.kv_caches[0].v_cache.ptr, sink_ptr, self.d_attn_out.ptr, 1, n_heads_local as i32, start_pos, self.max_ctx as i32, tc.head_dim as i32, attn_scale, stream);
+            cuda_ops::rad_cuda_rope_yarn_f16(self.d_attn_out.ptr, std::ptr::null_mut(), 1, n_heads_local as i32, 0, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, -1.0f32, stream);
+        }
+        let _ = sync_t();
+        let t_attn = t2.elapsed().as_secs_f64() * 1e6;
+
+        let t3 = std::time::Instant::now();
+        unsafe {
+            for (gi, wo_slice) in lw.wo_a_slices.iter().enumerate() {
+                let x_ptr = (self.d_attn_out.ptr as *const u8).add(gi * heads_per_grp * tc.head_dim * 2) as *const c_void;
+                let y_ptr = (self.d_wo_mid.ptr as *mut u8).add(gi * tc.o_lora_rank * 2) as *mut c_void;
+                self.exl3_proj(x_ptr, wo_slice, y_ptr, 1, 0, stream);
+            }
+            self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, self.d_branch_out.ptr, 1, 0, stream);
+        }
+        let _ = sync_t();
+        let t_wo = t3.elapsed().as_secs_f64() * 1e6;
+
+        let t4 = std::time::Instant::now();
+        self.all_reduce_branch(1, comm)?;
+        let _ = sync_t();
+        let t_ar1 = t4.elapsed().as_secs_f64() * 1e6;
+
+        let lw = &self.layers[0];
+        let t5 = std::time::Instant::now();
+        unsafe {
+            cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(self.d_streams.ptr, self.d_branch_out.ptr, self.d_h_coeff.ptr as *const f32, 1, d as i32, tc.hc_sinkhorn_iters as i32, tc.hc_eps, stream);
+            cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_ffn_fn.ptr, lw.hc_ffn_base.ptr, lw.hc_ffn_scale.ptr, self.d_h_coeff.ptr, self.d_branch_in.ptr, 1, d as i32, tc.hc_eps, stream);
+            cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.ffn_norm.ptr, self.d_normed.ptr, 1, d as i32, tc.rms_norm_eps, stream);
+            cuda_ops::rad_cuda_moe_route_sqrtsoftplus(self.d_normed.ptr, lw.gate_w.ptr, lw.gate_bias.ptr, self.d_gate_raw.ptr, self.d_gate_sel.ptr, self.d_topk_ids.ptr, self.d_topk_weights.ptr, 1, tc.n_routed_experts as i32, d as i32, tc.num_experts_per_tok as i32, tc.routed_scaling_factor, stream);
+        }
+        let _ = sync_t();
+        let t_route = t5.elapsed().as_secs_f64() * 1e6;
+
+        let t6 = std::time::Instant::now();
+        unsafe {
+            self.exl3_proj(self.d_normed.ptr, &lw.shared_w1, self.d_shared_g.ptr, 1, 0, stream);
+            self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, 1, 0, stream);
+            cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_shared_g.ptr, self.d_shared_u.ptr, self.d_shared_g.ptr, (tc.moe_intermediate_size / self.world) as i32, tc.swiglu_limit, stream);
+            self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, 1, 0, stream);
+        }
+        let _ = sync_t();
+        let t_shared = t6.elapsed().as_secs_f64() * 1e6;
+
+        let t7 = std::time::Instant::now();
+        unsafe {
+            let tk = tc.num_experts_per_tok as i32;
+            let inter = tc.moe_intermediate_size as i32;
+            let bits = lw.experts[0].w1.bits as i32;
+            let exp_start = lw.expert_start as i32;
+            let n_local = lw.experts.len() as i32;
+            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, tk, 1, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, stream);
+            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_up.ptr, tk, 1, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, stream);
+            cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_moe_gate.ptr, self.d_moe_up.ptr, self.d_moe_act.ptr, tk * inter, tc.swiglu_limit, stream);
+            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_outs.ptr, tk, 1, inter, d as i32, bits, self.wht_scale, 1, exp_start, n_local, stream);
+            cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, self.d_branch_out.ptr, 1, tk, d as i32, stream);
+        }
+        let _ = sync_t();
+        let t_moe = t7.elapsed().as_secs_f64() * 1e6;
+
+        let t8 = std::time::Instant::now();
+        self.all_reduce_branch(1, comm)?;
+        let _ = sync_t();
+        let t_ar2 = t8.elapsed().as_secs_f64() * 1e6;
+
+        if self.rank == 0 {
+            let tot = t_mhc1 + t_qkv + t_attn + t_wo + t_ar1 + t_route + t_shared + t_moe + t_ar2;
+            println!(
+                "PROFILE L0 (us): mhc1={t_mhc1:.0} qkv={t_qkv:.0} attn={t_attn:.0} wo={t_wo:.0} ar1={t_ar1:.0} route={t_route:.0} shared={t_shared:.0} moe={t_moe:.0} ar2={t_ar2:.0} | SUM={tot:.0} us ({:.1} ms x40)",
+                tot * 40.0 / 1000.0
+            );
+        }
+        Ok(())
+    }
+
     pub fn prefill_tokens(&mut self, tokens: &[i32], comm: &mut Tp2Comm) -> Result<i32> {
         if tokens.is_empty() {
             return Ok(self.cfg.bos_token_id);

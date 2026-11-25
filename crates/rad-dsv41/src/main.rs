@@ -144,6 +144,9 @@ fn worker_loop(eng: &mut Dsv41Engine, comm: &mut Tp2Comm) -> Result<()> {
                 comm.broadcast_u32(&mut pval)?;
                 eng.pos = pval as usize;
             }
+            4 => {
+                eng.profile_step(eng.cfg.bos_token_id, comm)?;
+            }
             99 => break,
             _ => {}
         }
@@ -189,6 +192,9 @@ fn run_bench_layer(model_dir: &PathBuf, max_ctx: usize, max_layers: usize, comm:
         1000.0 / dt_ms,
         tok
     );
+    let mut pcmd = 4u32;
+    comm.broadcast_u32(&mut pcmd)?;
+    eng.profile_step(eng.cfg.bos_token_id, comm)?;
     let mut quit = 99u32;
     let _ = comm.broadcast_u32(&mut quit);
     Ok(())
