@@ -77,6 +77,31 @@ impl Tp2Comm {
         Ok(())
     }
 
+    pub fn all_reduce_sum_f16(&mut self, data: &mut [u16]) -> std::io::Result<()> {
+        let Some(ref mut s) = self.stream else {
+            return Ok(());
+        };
+        let n = data.len();
+        let n_bytes = n * 2;
+        if self.peer_buf.len() * 4 < n_bytes {
+            self.peer_buf.resize((n_bytes + 3) / 4, 0.0);
+        }
+        let send_bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, n_bytes) };
+        let recv_bytes = unsafe { std::slice::from_raw_parts_mut(self.peer_buf.as_mut_ptr() as *mut u8, n_bytes) };
+        if self.rank == 0 {
+            s.write_all(send_bytes)?;
+            s.read_exact(recv_bytes)?;
+        } else {
+            s.read_exact(recv_bytes)?;
+            s.write_all(send_bytes)?;
+        }
+        let peer_u16 = unsafe { std::slice::from_raw_parts(self.peer_buf.as_ptr() as *const u16, n) };
+        for i in 0..n {
+            data[i] = f32_to_f16_fast(f16_to_f32_fast(data[i]) + f16_to_f32_fast(peer_u16[i]));
+        }
+        Ok(())
+    }
+
     pub fn broadcast_u32(&mut self, val: &mut u32) -> std::io::Result<()> {
         let Some(ref mut s) = self.stream else {
             return Ok(());
@@ -89,5 +114,43 @@ impl Tp2Comm {
             *val = u32::from_le_bytes(buf);
         }
         Ok(())
+    }
+}
+
+fn f16_to_f32_fast(bits: u16) -> f32 {
+    let s = ((bits >> 15) & 1) as u32;
+    let e = ((bits >> 10) & 0x1f) as u32;
+    let f = (bits & 0x3ff) as u32;
+    let out = if e == 0 {
+        if f == 0 {
+            s << 31
+        } else {
+            let mut m = f;
+            let mut exp = 127 - 14;
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                exp -= 1;
+            }
+            (s << 31) | (exp << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if e == 31 {
+        (s << 31) | 0x7f800000 | (f << 13)
+    } else {
+        (s << 31) | ((e + 112) << 23) | (f << 13)
+    };
+    f32::from_bits(out)
+}
+
+fn f32_to_f16_fast(val: f32) -> u16 {
+    let b = val.to_bits();
+    let s = ((b >> 16) & 0x8000) as u16;
+    let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let f = b & 0x7fffff;
+    if e <= 0 {
+        s
+    } else if e >= 31 {
+        s | 0x7c00
+    } else {
+        s | ((e as u16) << 10) | ((f >> 13) as u16)
     }
 }

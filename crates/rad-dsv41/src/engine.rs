@@ -248,13 +248,7 @@ impl Dsv41Engine {
                 rad_cuda::sync_device().map_err(CudaFail)?;
                 let raw_bytes = unsafe { std::slice::from_raw_parts_mut(f16_tmp.as_mut_ptr() as *mut u8, d * 2) };
                 self.d_branch_out.copy_to_host(raw_bytes).map_err(CudaFail)?;
-                for i in 0..d {
-                    ar_buf[i] = f16_to_f32(f16_tmp[i]);
-                }
-                comm.all_reduce_sum_f32(&mut ar_buf)?;
-                for i in 0..d {
-                    f16_tmp[i] = f32_to_f16(ar_buf[i]);
-                }
+                comm.all_reduce_sum_f16(&mut f16_tmp)?;
                 let raw_in = unsafe { std::slice::from_raw_parts(f16_tmp.as_ptr() as *const u8, d * 2) };
                 self.d_branch_out.copy_from(raw_in, None).map_err(CudaFail)?;
             }
@@ -362,13 +356,7 @@ impl Dsv41Engine {
                 rad_cuda::sync_device().map_err(CudaFail)?;
                 let raw_bytes = unsafe { std::slice::from_raw_parts_mut(f16_tmp.as_mut_ptr() as *mut u8, d * 2) };
                 self.d_branch_out.copy_to_host(raw_bytes).map_err(CudaFail)?;
-                for i in 0..d {
-                    ar_buf[i] = f16_to_f32(f16_tmp[i]);
-                }
-                comm.all_reduce_sum_f32(&mut ar_buf)?;
-                for i in 0..d {
-                    f16_tmp[i] = f32_to_f16(ar_buf[i]);
-                }
+                comm.all_reduce_sum_f16(&mut f16_tmp)?;
                 let raw_in = unsafe { std::slice::from_raw_parts(f16_tmp.as_ptr() as *const u8, d * 2) };
                 self.d_branch_out.copy_from(raw_in, None).map_err(CudaFail)?;
             }
