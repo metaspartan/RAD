@@ -1417,18 +1417,20 @@ fn run_scheduler(
                         };
                         let dk = draft.len();
                         let verified = engine.verify_batch_seq(seq, &draft)?;
+                        let rem_emit = slot.max_tokens.saturating_sub(slot.emitted).max(1);
+                        let acc_lim = dk.min(rem_emit);
                         let mut n_acc = 1usize;
                         let mut last_pred = verified[0];
                         if needs_logits {
                             if let Some(ref mut g) = slot.grammar {
-                                for j in 0..dk {
+                                for j in 0..acc_lim {
                                     let logits = engine.read_batch_logits(j)?;
                                     let pred = vocab_grammar.select_best_token(&logits, g);
                                     last_pred = pred;
                                     if pred == 200006 || pred == 199999 {
                                         break;
                                     }
-                                    if j + 1 < dk && pred == draft[j + 1] {
+                                    if j + 1 < acc_lim && pred == draft[j + 1] {
                                         n_acc += 1;
                                     } else {
                                         break;
@@ -1438,7 +1440,7 @@ fn run_scheduler(
                                 let (tk_vals, tk_ids) = engine.read_batch_topk64(dk)?;
                                 let seq_len = engine.seq_tokens[seq].len();
                                 let mut recent: Vec<i32> = engine.seq_tokens[seq][seq_len.saturating_sub(128)..].to_vec();
-                                for j in 0..dk {
+                                for j in 0..acc_lim {
                                     recent.push(draft[j]);
                                     let off = j * 64;
                                     let pred = grammar::sample_from_topk(
@@ -1451,7 +1453,7 @@ fn run_scheduler(
                                     if pred == 200006 || pred == 199999 {
                                         break;
                                     }
-                                    if j + 1 < dk && pred == draft[j + 1] {
+                                    if j + 1 < acc_lim && pred == draft[j + 1] {
                                         n_acc += 1;
                                     } else {
                                         break;
@@ -1459,7 +1461,7 @@ fn run_scheduler(
                                 }
                             }
                         } else {
-                            for j in 0..(dk - 1) {
+                            for j in 0..(acc_lim - 1) {
                                 if verified[j] == 200006 || verified[j] == 199999 {
                                     break;
                                 }
@@ -1616,12 +1618,14 @@ fn run_scheduler(
                                 let mut outs = Vec::with_capacity(miss_seqs.len());
                                 for (u, &mi) in miss_idx.iter().enumerate() {
                                     let su = miss_seqs[u] as usize;
+                                    let rem_emit = active[mi].max_tokens.saturating_sub(active[mi].emitted).max(1);
+                                    let acc_lim = cu_k.min(rem_emit);
                                     let mut n_acc = 1usize;
                                     let mut last_pred = preds[u][0];
                                     if let (Some((ref tk_vals, ref tk_ids)), true) = (&topk_opt, !active[mi].sampling.is_greedy()) {
                                         let seq_len = engine.seq_tokens[su].len();
                                         let mut recent: Vec<i32> = engine.seq_tokens[su][seq_len.saturating_sub(128)..].to_vec();
-                                        for j in 0..cu_k {
+                                        for j in 0..acc_lim {
                                             recent.push(drafts[u][j]);
                                             let off = (u * cu_k + j) * 64;
                                             let pred = grammar::sample_from_topk(
@@ -1634,14 +1638,14 @@ fn run_scheduler(
                                             if pred == 200006 || pred == 199999 {
                                                 break;
                                             }
-                                            if j + 1 < cu_k && pred == drafts[u][j + 1] {
+                                            if j + 1 < acc_lim && pred == drafts[u][j + 1] {
                                                 n_acc += 1;
                                             } else {
                                                 break;
                                             }
                                         }
                                     } else {
-                                        for j in 0..(cu_k - 1) {
+                                        for j in 0..(acc_lim - 1) {
                                             if preds[u][j] == 200006 || preds[u][j] == 199999 {
                                                 break;
                                             }
@@ -1810,12 +1814,14 @@ fn run_scheduler(
                     let mut outs = Vec::with_capacity(active.len());
                     for u in 0..active.len() {
                         let su = seq_ids[u] as usize;
+                        let rem_emit = active[u].max_tokens.saturating_sub(active[u].emitted).max(1);
+                        let acc_lim = multi_k.min(rem_emit);
                         let mut n_acc = 1usize;
                         let mut last_pred = preds[u][0];
                         if let (Some((ref tk_vals, ref tk_ids)), true) = (&topk_opt, !active[u].sampling.is_greedy()) {
                             let seq_len = engine.seq_tokens[su].len();
                             let mut recent: Vec<i32> = engine.seq_tokens[su][seq_len.saturating_sub(128)..].to_vec();
-                            for j in 0..multi_k {
+                            for j in 0..acc_lim {
                                 recent.push(drafts[u][j]);
                                 let off = (u * multi_k + j) * 64;
                                 let pred = grammar::sample_from_topk(
@@ -1828,14 +1834,14 @@ fn run_scheduler(
                                 if pred == 200006 || pred == 199999 {
                                     break;
                                 }
-                                if j + 1 < multi_k && pred == drafts[u][j + 1] {
+                                if j + 1 < acc_lim && pred == drafts[u][j + 1] {
                                     n_acc += 1;
                                 } else {
                                     break;
                                 }
                             }
                         } else {
-                            for j in 0..(multi_k - 1) {
+                            for j in 0..(acc_lim - 1) {
                                 if preds[u][j] == 200006 || preds[u][j] == 199999 {
                                     break;
                                 }

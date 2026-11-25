@@ -643,23 +643,25 @@ extern "C" __global__ void kv_conv_qkvr_store_multi_snap_q8kv_k(float* __restric
 
 __device__ float g_q8kv_b8_split_buf[24 * 96 * 64 * 130];
 
-extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restrict__ Q,
-                                                           const float* __restrict__ R,
-                                                           const float* __restrict__ sinks,
-                                                           const float* __restrict__ rel_bias,
-                                                           const int8_t* __restrict__ k_cache,
-                                                           const int8_t* __restrict__ v_cache,
-                                                           const __half* __restrict__ k_scale,
-                                                           const __half* __restrict__ v_scale,
-                                                           const int* __restrict__ d_pos0,
-                                                           float* __restrict__ split_buf,
-                                                           int n_head, int n_head_kv,
-                                                           int dh, int d_rel,
-                                                           int rel_extent, int max_ctx, int B, int n_splits) {
+template <bool MULTI>
+__global__ void attn_b8_gqa3_flash_split_q8kv_t(const float* __restrict__ Q,
+                                                const float* __restrict__ R,
+                                                const float* __restrict__ sinks,
+                                                const float* __restrict__ rel_bias,
+                                                const int8_t* __restrict__ k_cache,
+                                                const int8_t* __restrict__ v_cache,
+                                                const __half* __restrict__ k_scale,
+                                                const __half* __restrict__ v_scale,
+                                                const int* __restrict__ d_pos0,
+                                                const int* __restrict__ d_seq_ids,
+                                                float* __restrict__ split_buf,
+                                                int n_head, int n_head_kv,
+                                                int dh, int d_rel,
+                                                int rel_extent, int max_ctx, int B, int K_stride, int n_splits) {
     int kv_h = blockIdx.x;
     int sp = blockIdx.y;
     int qb = blockIdx.z;
-    int q_off = qb * 16;
+    int q_off = MULTI ? (qb * K_stride) : (qb * 16);
     int wid = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int col = lane & 15;
@@ -667,17 +669,19 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restri
     int tg = wid / 3;
     int g = wid % 3;
     int h = kv_h * 3 + g;
-    int pos0 = *d_pos0;
+    int seq = MULTI ? d_seq_ids[q_off] : 0;
+    int pos0 = MULTI ? d_pos0[q_off] : *d_pos0;
     int q_dim = n_head * dh;
     int r_dim = n_head * d_rel;
 
     int q_idx = q_off + col;
-    bool vq = (q_idx < B);
-    int pos_q = pos0 + q_idx;
-    int n_q_tile = min(16, B - q_off);
-    int t_max = pos0 + q_off + n_q_tile;
+    bool vq = MULTI ? (col < K_stride) : (q_idx < B);
+    int pos_q = MULTI ? (pos0 + col) : (pos0 + q_idx);
+    int min_pos_q = MULTI ? pos0 : (pos0 + q_off);
+    int n_q_tile = MULTI ? K_stride : min(16, B - q_off);
+    int t_max = min_pos_q + n_q_tile;
     int b_stride = (B > 64) ? 128 : 64;
-    int eff_splits = min(n_splits, max(16, (pos0 + B + 255) >> 8));
+    int eff_splits = MULTI ? n_splits : min(n_splits, max(16, (pos0 + B + 255) >> 8));
     if (sp >= eff_splits) return;
 
     int total_tiles = (t_max + 15) / 16;
@@ -731,10 +735,11 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restri
 #pragma unroll
     for (int db = 0; db < 8; ++db) o_acc[db] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
-    const int8_t* kc_h = k_cache + (size_t)kv_h * max_ctx * dh;
-    const int8_t* vc_h = v_cache + (size_t)kv_h * max_ctx * dh;
-    const __half* ks_h = k_scale + (size_t)kv_h * max_ctx;
-    const __half* vs_h = v_scale + (size_t)kv_h * max_ctx;
+    size_t seq_off = MULTI ? ((size_t)seq * n_head_kv * max_ctx) : 0;
+    const int8_t* kc_h = k_cache + (seq_off + (size_t)kv_h * max_ctx) * dh;
+    const int8_t* vc_h = v_cache + (seq_off + (size_t)kv_h * max_ctx) * dh;
+    const __half* ks_h = k_scale + seq_off + (size_t)kv_h * max_ctx;
+    const __half* vs_h = v_scale + seq_off + (size_t)kv_h * max_ctx;
 
     __shared__ union {
         struct {
@@ -795,7 +800,7 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restri
 
             float local_max = -1e30f;
             float sc_arr[8];
-            bool tile_all_far = ((pos0 + q_off) - (tile + n_kv - 1) >= rel_extent) && (tile + n_kv - 1 <= pos0 + q_off);
+            bool tile_all_far = (min_pos_q - (tile + n_kv - 1) >= rel_extent) && (tile + n_kv - 1 <= min_pos_q);
             if (tile_all_far) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
@@ -1143,7 +1148,7 @@ extern "C" __global__ void attn_b8_flash_reduce_q8kv_k(const float* __restrict__
     int lane = threadIdx.x & 31;
     int d = wid * 32 + lane;
     int q_dim = n_head * 128;
-    int eff_splits = min(n_splits, max(16, (*d_pos0 + B + 255) >> 8));
+    int eff_splits = d_pos0 ? min(n_splits, max(16, (*d_pos0 + B + 255) >> 8)) : n_splits;
 
     float gm = -1e30f;
     for (int sp = 0; sp < eff_splits; ++sp) {
@@ -1226,6 +1231,7 @@ extern "C" __global__ void attn_decode_gqa_splitkv_q8kv_k(const float* __restric
     const __half* ks_h = k_scale + (size_t)kv_h * max_ctx;
     const __half* vs_h = v_scale + (size_t)kv_h * max_ctx;
 
+    constexpr float kLog2e = 1.4426950408889634f;
     for (int t = ts + wid; t < te; t += 8) {
         uint32_t k4 = reinterpret_cast<const uint32_t*>(kc_h + (size_t)t * dh)[lane];
         uint32_t v4 = reinterpret_cast<const uint32_t*>(vc_h + (size_t)t * dh)[lane];
@@ -1248,16 +1254,23 @@ extern "C" __global__ void attn_decode_gqa_splitkv_q8kv_k(const float* __restric
             float score = __shfl(q8kv_warp_sum32(dot), 0, 32) * ks;
             if (has_rb) score += __shfl(q8kv_warp_sum32(rb_l * rv[g]), 0, 32);
             score -= sk[g];
-            float m_new = fmaxf(m[g], score);
-            float alpha = (m[g] > -1e20f) ? expf(m[g] - m_new) : 0.0f;
-            float p = expf(score - m_new);
-            l[g] = l[g] * alpha + p;
-            m[g] = m_new;
-            float pvs = p * vs;
-            o0[g] = fmaf(pvs, v0, o0[g] * alpha);
-            o1[g] = fmaf(pvs, v1, o1[g] * alpha);
-            o2[g] = fmaf(pvs, v2, o2[g] * alpha);
-            o3[g] = fmaf(pvs, v3, o3[g] * alpha);
+            if (score > m[g]) {
+                float alpha = (m[g] > -1e20f) ? exp2f((m[g] - score) * kLog2e) : 0.0f;
+                l[g] = l[g] * alpha + 1.0f;
+                m[g] = score;
+                o0[g] = fmaf(vs, v0, o0[g] * alpha);
+                o1[g] = fmaf(vs, v1, o1[g] * alpha);
+                o2[g] = fmaf(vs, v2, o2[g] * alpha);
+                o3[g] = fmaf(vs, v3, o3[g] * alpha);
+            } else {
+                float p = exp2f((score - m[g]) * kLog2e);
+                l[g] += p;
+                float pvs = p * vs;
+                o0[g] = fmaf(pvs, v0, o0[g]);
+                o1[g] = fmaf(pvs, v1, o1[g]);
+                o2[g] = fmaf(pvs, v2, o2[g]);
+                o3[g] = fmaf(pvs, v3, o3[g]);
+            }
         }
     }
 
@@ -1913,6 +1926,7 @@ extern "C" __global__ void inkling_attn_multi_gqa3_q8_q8kv_k(const float* __rest
     const __half* ks_h = k_scale_pool + (size_t)seq * seq_sc_stride + (size_t)kv_h * max_ctx;
     const __half* vs_h = v_scale_pool + (size_t)seq * seq_sc_stride + (size_t)kv_h * max_ctx;
 
+    constexpr float kLog2e = 1.4426950408889634f;
     for (int t = wid; t < t_end; t += 8) {
         uint32_t k4 = reinterpret_cast<const uint32_t*>(kc_h + (size_t)t * dh)[lane];
         uint32_t v4 = reinterpret_cast<const uint32_t*>(vc_h + (size_t)t * dh)[lane];
@@ -1935,16 +1949,23 @@ extern "C" __global__ void inkling_attn_multi_gqa3_q8_q8kv_k(const float* __rest
             float score = __shfl(q8kv_warp_sum32(dot), 0, 32) * ks;
             if (has_rb) score += __shfl(q8kv_warp_sum32(rb_l * rv[g]), 0, 32);
             score -= sk[g];
-            float m_new = fmaxf(m[g], score);
-            float alpha = (m[g] > -1e20f) ? expf(m[g] - m_new) : 0.0f;
-            float p = expf(score - m_new);
-            l[g] = l[g] * alpha + p;
-            m[g] = m_new;
-            float pvs = p * vs;
-            o0[g] = fmaf(pvs, v0, o0[g] * alpha);
-            o1[g] = fmaf(pvs, v1, o1[g] * alpha);
-            o2[g] = fmaf(pvs, v2, o2[g] * alpha);
-            o3[g] = fmaf(pvs, v3, o3[g] * alpha);
+            if (score > m[g]) {
+                float alpha = (m[g] > -1e20f) ? exp2f((m[g] - score) * kLog2e) : 0.0f;
+                l[g] = l[g] * alpha + 1.0f;
+                m[g] = score;
+                o0[g] = fmaf(vs, v0, o0[g] * alpha);
+                o1[g] = fmaf(vs, v1, o1[g] * alpha);
+                o2[g] = fmaf(vs, v2, o2[g] * alpha);
+                o3[g] = fmaf(vs, v3, o3[g] * alpha);
+            } else {
+                float p = exp2f((score - m[g]) * kLog2e);
+                l[g] += p;
+                float pvs = p * vs;
+                o0[g] = fmaf(pvs, v0, o0[g]);
+                o1[g] = fmaf(pvs, v1, o1[g]);
+                o2[g] = fmaf(pvs, v2, o2[g]);
+                o3[g] = fmaf(pvs, v3, o3[g]);
+            }
         }
     }
 
@@ -2017,7 +2038,7 @@ extern "C" int ink_attn_b8_flash_q8_q8kv(hipStream_t s, const float* Q, const fl
         int nthreads = (B <= 48) ? 288 : 384;
         attn_b48_gqa3_flash_split_q8kv_k<<<dim3(n_head_kv, n_splits, (B + 63) / 64), dim3(nthreads), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, d_pos0, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B, n_splits);
     } else {
-        attn_b8_gqa3_flash_split_q8kv_k<<<dim3(n_head_kv, n_splits, (B + 15) / 16), dim3(192), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, d_pos0, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B, n_splits);
+        attn_b8_gqa3_flash_split_q8kv_t<false><<<dim3(n_head_kv, n_splits, (B + 15) / 16), dim3(192), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, d_pos0, nullptr, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B, 16, n_splits);
     }
     attn_b8_flash_reduce_q8kv_k<<<dim3(n_head, B), dim3(128), 0, s>>>(sbuf, gate, d_pos0, (q8kv_q8_1_blk*)out_q8, n_head, B, b_stride, n_splits);
     return 0;
@@ -2038,6 +2059,19 @@ extern "C" int ink_attn_batch_gated_flash_q8kv(hipStream_t s, const float* Q, co
         return 0;
     }
     attn_batch_gated_flash_q8kv_k<<<dim3(n_head, (B + 63) / 64), dim3(128), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, gate, d_pos0, out, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B);
+    return 0;
+}
+
+extern "C" int ink_attn_multi_b8_flash_q8_q8kv(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const int8_t* kc_pool, const int8_t* vc_pool, const __half* ks_pool, const __half* vs_pool, const float* gate, const int* d_seq_ids, const int* d_positions, void* out_q8, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int max_ctx, int n_users, int K) {
+    int B = n_users * K;
+    int b_stride = (B > 64) ? 128 : 64;
+    int max_sp = (B > 64) ? 48 : 96;
+    int n_splits = (max_ctx > 32768) ? ((n_users <= 4) ? 32 : 16) : ((max_ctx > 4096) ? ((n_users <= 4) ? 16 : 8) : ((n_users <= 4) ? 8 : 4));
+    if (n_splits > max_sp) n_splits = max_sp;
+    float* sbuf = nullptr;
+    (void)hipGetSymbolAddress((void**)&sbuf, HIP_SYMBOL(g_q8kv_b8_split_buf));
+    attn_b8_gqa3_flash_split_q8kv_t<true><<<dim3(n_head_kv, n_splits, n_users), dim3(192), 0, s>>>(Q, R, sinks, rel_bias, kc_pool, vc_pool, ks_pool, vs_pool, d_positions, d_seq_ids, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B, K, n_splits);
+    attn_b8_flash_reduce_q8kv_k<<<dim3(n_head, B), dim3(128), 0, s>>>(sbuf, gate, nullptr, (q8kv_q8_1_blk*)out_q8, n_head, B, b_stride, n_splits);
     return 0;
 }
 

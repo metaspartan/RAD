@@ -2485,7 +2485,19 @@ impl InklingEngine {
                     sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
                 );
             }
-            if multi_k >= 8 && self.cfg.n_head == self.cfg.n_head_kv * 3 && self.cfg.dh == 128 {
+            if multi_k >= 2 && multi_k <= 16 && b <= 128 && self.cfg.n_head == self.cfg.n_head_kv * 3 && self.cfg.dh == 128 {
+                let n_users = (b / multi_k) as i32;
+                ops::ink_attn_multi_b8_flash_q8_q8kv(
+                    s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
+                    sl.k_cache.ptr as *const i8, sl.v_cache.ptr as *const i8,
+                    ks.ptr as *const u16, vs.ptr as *const u16,
+                    gate_out, self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
+                    self.bsc.xq.ptr,
+                    self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                    self.cfg.rel_extent as i32, sl.max_ctx as i32, n_users, multi_k as i32,
+                );
+                attn_already_q8 = true;
+            } else if multi_k >= 8 && self.cfg.n_head == self.cfg.n_head_kv * 3 && self.cfg.dh == 128 {
                 let n_users = (b / multi_k) as i32;
                 ops::ink_attn_multi_gated_flash_q8kv(
                     s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
