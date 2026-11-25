@@ -2,6 +2,7 @@ mod config;
 mod cuda_ops;
 mod engine;
 mod safetensors;
+mod server;
 mod weights;
 
 use anyhow::Result;
@@ -11,8 +12,12 @@ use engine::Dsv41Engine;
 use rad_cuda::comm::Tp2Comm;
 use rad_cuda::{CudaBuf, CudaFail};
 use safetensors::SafetensorsIndex;
+use server::{build_router, ServeEvent, ServeJob, ServerState};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
+use tokenizers::Tokenizer;
+use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
 #[command(name = "rad-dsv41", about = "RAD CUDA DeepSeek-V4.1-Flash EXL3 Engine")]
@@ -23,9 +28,21 @@ struct Cli {
     bench_exl3: bool,
     #[arg(long, default_value_t = false)]
     bench_layer: bool,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = false)]
+    serve: bool,
+    #[arg(long, default_value = "0.0.0.0")]
+    host: String,
+    #[arg(long, default_value_t = 8888)]
+    port: u16,
+    #[arg(long, default_value = "deepseek-v4-flash-vision-exp")]
+    name: String,
+    #[arg(long)]
+    api_key: Option<String>,
+    #[arg(long)]
+    api_key_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 40)]
     max_layers: usize,
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, default_value_t = 8192)]
     max_ctx: usize,
     #[arg(long, default_value_t = 0)]
     rank: usize,
@@ -129,6 +146,134 @@ fn run_bench_layer(model_dir: &PathBuf, max_ctx: usize, max_layers: usize, comm:
     Ok(())
 }
 
+fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
+    let t_load = Instant::now();
+    let mut eng = Dsv41Engine::load(&cli.model, cli.max_ctx, comm.rank, comm.world_size(), Some(cli.max_layers))?;
+    let tok_path = cli.model.join("tokenizer.json");
+    let tok = Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
+    let eos = eng.cfg.eos_token_id;
+    println!(
+        "rad-dsv41 serve ready in {:.2}s (rank={}/{}, layers={}, ctx={}, port={})",
+        t_load.elapsed().as_secs_f64(),
+        eng.rank,
+        eng.world,
+        eng.layers.len(),
+        cli.max_ctx,
+        cli.port
+    );
+
+    if comm.rank != 0 {
+        loop {
+            let mut cmd = 0u32;
+            if comm.broadcast_u32(&mut cmd).is_err() {
+                break;
+            }
+            if cmd == 0 {
+                eng.pos = 0;
+            } else {
+                let _ = eng.step_decode((cmd - 1) as i32, &mut comm);
+            }
+        }
+        return Ok(());
+    }
+
+    let mut api_keys = Vec::new();
+    if let Some(ref k) = cli.api_key {
+        if !k.trim().is_empty() {
+            api_keys.push(k.trim().to_string());
+        }
+    }
+    if let Some(ref kf) = cli.api_key_file {
+        if let Ok(s) = std::fs::read_to_string(kf) {
+            if !s.trim().is_empty() {
+                api_keys.push(s.trim().to_string());
+            }
+        }
+    }
+
+    let (job_tx, mut job_rx) = mpsc::unbounded_channel::<ServeJob>();
+    std::thread::spawn(move || {
+        while let Some(job) = job_rx.blocking_recv() {
+            let enc = match tok.encode(job.prompt, true) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = job.tx.send(ServeEvent::Error(format!("{e}")));
+                    continue;
+                }
+            };
+            let ids = enc.get_ids();
+            let prompt_n = ids.len();
+            eng.pos = 0;
+            let mut reset_cmd = 0u32;
+            let _ = comm.broadcast_u32(&mut reset_cmd);
+            let mut next_tok = eng.cfg.bos_token_id;
+            for &id in ids {
+                let mut tcmd = id + 1;
+                let _ = comm.broadcast_u32(&mut tcmd);
+                match eng.step_decode(id as i32, &mut comm) {
+                    Ok(nt) => next_tok = nt,
+                    Err(e) => {
+                        let _ = job.tx.send(ServeEvent::Error(format!("{e}")));
+                        next_tok = eos;
+                        break;
+                    }
+                }
+            }
+            let mut gen_ids: Vec<u32> = Vec::new();
+            let mut prev_str = String::new();
+            let mut finish_reason = "length";
+            for _ in 0..job.max_tokens {
+                if next_tok == eos || job.tx.is_closed() {
+                    finish_reason = "stop";
+                    break;
+                }
+                gen_ids.push(next_tok as u32);
+                if let Ok(cur) = tok.decode(&gen_ids, true) {
+                    if cur.len() > prev_str.len() && cur.is_char_boundary(prev_str.len()) {
+                        let delta = cur[prev_str.len()..].to_string();
+                        prev_str = cur;
+                        if job.tx.send(ServeEvent::Token(delta)).is_err() {
+                            finish_reason = "stop";
+                            break;
+                        }
+                    }
+                }
+                let mut tcmd = (next_tok as u32) + 1;
+                let _ = comm.broadcast_u32(&mut tcmd);
+                match eng.step_decode(next_tok, &mut comm) {
+                    Ok(nt) => next_tok = nt,
+                    Err(e) => {
+                        let _ = job.tx.send(ServeEvent::Error(format!("{e}")));
+                        break;
+                    }
+                }
+            }
+            let _ = job.tx.send(ServeEvent::Done {
+                prompt_n,
+                pred_n: gen_ids.len(),
+                finish_reason,
+            });
+        }
+    });
+
+    let state = Arc::new(ServerState {
+        model_name: cli.name.clone(),
+        api_keys,
+        max_ctx: cli.max_ctx,
+        world_size: 1,
+        job_tx,
+    });
+    let app = build_router(state);
+    let addr = format!("{}:{}", cli.host, cli.port);
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(listener, app).await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     rad_cuda::set_device(0).map_err(CudaFail)?;
@@ -141,6 +286,9 @@ fn main() -> Result<()> {
     }
     if cli.bench_layer {
         run_bench_layer(&cli.model, cli.max_ctx, cli.max_layers, &mut comm)?;
+    }
+    if cli.serve {
+        run_serve(&cli, comm)?;
     }
     Ok(())
 }
