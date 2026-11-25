@@ -1038,6 +1038,7 @@ fn run_scheduler(
     let mut prefilling: VecDeque<PrefillSlot> = VecDeque::new();
     let mut pending: VecDeque<GenJob> = VecDeque::new();
     let spec_k = drafter.as_ref().map(|d| d.spec_k()).unwrap_or(4);
+    let mut catchup_streak = 0usize;
     sync_kv_metrics(&engine, &metrics);
 
     loop {
@@ -1149,7 +1150,9 @@ fn run_scheduler(
             }
         }
 
-        let mut pf_budget = if active.is_empty() || prefilling.len() > active.len() { 8192 } else { prefill_chunk_size.max(64).min(1024) };
+        let mut pf_budget = if active.is_empty() { 16384 } else if prefilling.len() > active.len() { 8192 } else { prefill_chunk_size.max(64).min(1024) };
+        let mut burst_ready: Vec<(PrefillSlot, i32, Option<grammar::JsonGrammarState>, grammar::SamplingParams)> = Vec::new();
+        let mut pf_injected_any = false;
         while pf_budget > 0 {
             let Some(mut pf) = prefilling.pop_front() else { break; };
             let end = (pf.offset + pf_budget.min(1024)).min(pf.job.prompt_ids.len());
@@ -1167,7 +1170,8 @@ fn run_scheduler(
                                         let s0 = inj_start.saturating_sub(pf.offset);
                                         let cnt = chunk.len() - s0;
                                         let (fptr, mb) = engine.batch_dspark_feats_ptr();
-                                        let _ = df.inject_target_feats_batch_seq(pf.seq, fptr, mb, s0, pos0 + s0 as i32, cnt);
+                                        let _ = df.inject_target_feats_batch_seq_async(pf.seq, fptr, mb, s0, pos0 + s0 as i32, cnt);
+                                        pf_injected_any = true;
                                     } else {
                                         df.advance_ctx_len_seq(pf.seq, pos0 + chunk.len() as i32);
                                     }
@@ -1187,11 +1191,6 @@ fn run_scheduler(
                             break;
                         }
                     } else {
-                        let pp_s = pf.started_at.elapsed().as_secs_f64();
-                        let pp_ms = pp_s * 1000.0;
-                        metrics.prompt_tokens_total.fetch_add(pf.job.prompt_ids.len() as u64, Ordering::Relaxed);
-                        metrics.prefill_us_total.fetch_add((pp_s * 1e6) as u64, Ordering::Relaxed);
-                        metrics.observe_ttft(pp_s);
                         let mut gram = if pf.job.json_grammar { Some(grammar::JsonGrammarState::new_json()) } else { None };
                         let mut sampling = pf.job.sampling;
                         if let Some(ref mut g) = gram {
@@ -1205,45 +1204,58 @@ fn run_scheduler(
                                 last_tok = grammar::sample_from_topk(&tk_vals[..64], &tk_ids[..64], recent, &mut sampling);
                             }
                         }
-                        let _ = pf.job.tx.send(GenEvent::Prefill {
-                            prompt_n: pf.job.prompt_ids.len(),
-                            cached_n: pf.cached_n,
-                            pp_ms,
-                        });
-                        if pf.job.max_tokens == 0 || last_tok == 200006 || last_tok == 199999 {
-                            let _ = pf.job.tx.send(GenEvent::Done {
-                                finish_reason: if pf.job.max_tokens == 0 { "length" } else { "stop" },
-                                pred_n: 0,
-                                dec_ms: 0.0,
-                            });
-                            free[pf.seq] = true;
-                        } else {
-                            let _ = pf.job.tx.send(GenEvent::Token(last_tok as u32));
-                            metrics.generated_tokens_total.fetch_add(1, Ordering::Relaxed);
-                            if pf.job.max_tokens == 1 {
-                                let _ = pf.job.tx.send(GenEvent::Done { finish_reason: "length", pred_n: 1, dec_ms: 0.0 });
-                                free[pf.seq] = true;
-                            } else {
-                                let now = Instant::now();
-                                active.push(ActiveSlot {
-                                    seq: pf.seq,
-                                    next_tok: last_tok,
-                                    max_tokens: pf.job.max_tokens,
-                                    emitted: 1,
-                                    enable_thinking: pf.job.enable_thinking,
-                                    grammar: gram,
-                                    sampling,
-                                    started_at: now,
-                                    last_tok_at: now,
-                                    tx: pf.job.tx,
-                                });
-                            }
-                        }
+                        burst_ready.push((pf, last_tok, gram, sampling));
                     }
                 }
                 Err(e) => {
                     let _ = pf.job.tx.send(GenEvent::Error(format!("{e}")));
                     free[pf.seq] = true;
+                }
+            }
+        }
+        if pf_injected_any {
+            if let Some(ref mut d) = drafter {
+                d.sync();
+            }
+        }
+        for (pf, last_tok, gram, sampling) in burst_ready {
+            let pp_s = pf.started_at.elapsed().as_secs_f64();
+            let pp_ms = pp_s * 1000.0;
+            metrics.prompt_tokens_total.fetch_add(pf.job.prompt_ids.len() as u64, Ordering::Relaxed);
+            metrics.prefill_us_total.fetch_add((pp_s * 1e6) as u64, Ordering::Relaxed);
+            metrics.observe_ttft(pp_s);
+            let _ = pf.job.tx.send(GenEvent::Prefill {
+                prompt_n: pf.job.prompt_ids.len(),
+                cached_n: pf.cached_n,
+                pp_ms,
+            });
+            if pf.job.max_tokens == 0 || last_tok == 200006 || last_tok == 199999 {
+                let _ = pf.job.tx.send(GenEvent::Done {
+                    finish_reason: if pf.job.max_tokens == 0 { "length" } else { "stop" },
+                    pred_n: 0,
+                    dec_ms: 0.0,
+                });
+                free[pf.seq] = true;
+            } else {
+                let _ = pf.job.tx.send(GenEvent::Token(last_tok as u32));
+                metrics.generated_tokens_total.fetch_add(1, Ordering::Relaxed);
+                if pf.job.max_tokens == 1 {
+                    let _ = pf.job.tx.send(GenEvent::Done { finish_reason: "length", pred_n: 1, dec_ms: 0.0 });
+                    free[pf.seq] = true;
+                } else {
+                    let now = Instant::now();
+                    active.push(ActiveSlot {
+                        seq: pf.seq,
+                        next_tok: last_tok,
+                        max_tokens: pf.job.max_tokens,
+                        emitted: 1,
+                        enable_thinking: pf.job.enable_thinking,
+                        grammar: gram,
+                        sampling,
+                        started_at: now,
+                        last_tok_at: now,
+                        tx: pf.job.tx,
+                    });
                 }
             }
         }
@@ -1428,10 +1440,11 @@ fn run_scheduler(
                         let mut miss_idx: Vec<usize> = Vec::new();
                         let mut miss_seqs: Vec<i32> = Vec::new();
                         let mut miss_anchors: Vec<i32> = Vec::new();
+                        let min_strong_ng = if bk >= 64 { 32 } else { 8 };
                         if let Some(ref d) = drafter {
                             for (idx, c) in cands.iter().enumerate() {
                                 let su = active[idx].seq;
-                                if !matches!(c, Some(ng) if ng.len() >= 8)
+                                if !matches!(c, Some(ng) if ng.len() >= min_strong_ng)
                                     && su < d.max_seqs()
                                     && d.seq_ctx_len(su) == engine.seq_pos[su]
                                 {
@@ -1441,6 +1454,154 @@ fn run_scheduler(
                                 }
                             }
                         }
+                        if !miss_seqs.is_empty() && miss_seqs.len() <= 3 && bk >= 32 && catchup_streak < 12 && drafter.is_some() {
+                            let cu_k = spec_k.min(max_user_k).max(4);
+                            let any_cu_sampling = miss_idx.iter().any(|&mi| !active[mi].sampling.is_greedy());
+                            let cu_pos_before: Vec<i32> = miss_seqs.iter().map(|&s| engine.seq_pos[s as usize]).collect();
+                            let t_cu = Instant::now();
+                            let cu_res = (|| -> anyhow::Result<Vec<Vec<i32>>> {
+                                let d = drafter.as_mut().unwrap();
+                                let drafts = if miss_seqs.len() == 1 {
+                                    vec![d.draft_seq(miss_seqs[0] as usize, miss_anchors[0], &engine, cu_k)?]
+                                } else {
+                                    d.draft_multi(&miss_seqs, &miss_anchors, &engine, cu_k)?
+                                };
+                                let preds = if miss_seqs.len() == 1 {
+                                    vec![engine.verify_batch_seq(miss_seqs[0] as usize, &drafts[0])?]
+                                } else {
+                                    engine.verify_multi(&miss_seqs, &drafts)?
+                                };
+                                let topk_opt = if any_cu_sampling {
+                                    Some(engine.read_batch_topk64(miss_seqs.len() * cu_k)?)
+                                } else {
+                                    None
+                                };
+                                let mut emits = vec![0usize; miss_seqs.len()];
+                                let mut outs = Vec::with_capacity(miss_seqs.len());
+                                for (u, &mi) in miss_idx.iter().enumerate() {
+                                    let su = miss_seqs[u] as usize;
+                                    let mut n_acc = 1usize;
+                                    let mut last_pred = preds[u][0];
+                                    if let (Some((ref tk_vals, ref tk_ids)), true) = (&topk_opt, !active[mi].sampling.is_greedy()) {
+                                        let seq_len = engine.seq_tokens[su].len();
+                                        let mut recent: Vec<i32> = engine.seq_tokens[su][seq_len.saturating_sub(128)..].to_vec();
+                                        for j in 0..cu_k {
+                                            recent.push(drafts[u][j]);
+                                            let off = (u * cu_k + j) * 64;
+                                            let pred = grammar::sample_from_topk(
+                                                &tk_vals[off..off + 64],
+                                                &tk_ids[off..off + 64],
+                                                &recent,
+                                                &mut active[mi].sampling,
+                                            );
+                                            last_pred = pred;
+                                            if pred == 200006 || pred == 199999 {
+                                                break;
+                                            }
+                                            if j + 1 < cu_k && pred == drafts[u][j + 1] {
+                                                n_acc += 1;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        for j in 0..(cu_k - 1) {
+                                            if preds[u][j] == 200006 || preds[u][j] == 199999 {
+                                                break;
+                                            }
+                                            if preds[u][j] == drafts[u][j + 1] {
+                                                n_acc += 1;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        last_pred = preds[u][n_acc - 1];
+                                    }
+                                    emits[u] = n_acc;
+                                    let mut tok_out = Vec::with_capacity(n_acc);
+                                    for j in 1..n_acc {
+                                        tok_out.push(drafts[u][j]);
+                                    }
+                                    tok_out.push(last_pred);
+                                    outs.push(tok_out);
+                                }
+                                if miss_seqs.len() == 1 {
+                                    engine.rewind_verify_seq_to(miss_seqs[0] as usize, emits[0], cu_k)?;
+                                    d.inject_batch_seq_async(miss_seqs[0] as usize, &engine, 0, cu_pos_before[0], emits[0])?;
+                                    for j in 0..emits[0] {
+                                        engine.seq_tokens[miss_seqs[0] as usize].push(drafts[0][j]);
+                                    }
+                                    let _ = engine.paged_kv.ensure_tokens(miss_seqs[0] as usize, engine.seq_pos[miss_seqs[0] as usize] as usize, &engine.seq_tokens[miss_seqs[0] as usize]);
+                                } else {
+                                    engine.rewind_verify_multi(&miss_seqs, &emits, cu_k)?;
+                                    for u in 0..miss_seqs.len() {
+                                        let su = miss_seqs[u] as usize;
+                                        d.inject_batch_seq_async(su, &engine, u * cu_k, cu_pos_before[u], emits[u])?;
+                                        for j in 0..emits[u] {
+                                            engine.seq_tokens[su].push(drafts[u][j]);
+                                        }
+                                        let _ = engine.paged_kv.ensure_tokens(su, engine.seq_pos[su] as usize, &engine.seq_tokens[su]);
+                                    }
+                                }
+                                d.sync();
+                                Ok(outs)
+                            })();
+                            let cu_s = t_cu.elapsed().as_secs_f64();
+                            sync_kv_metrics(&engine, &metrics);
+                            if let Ok(cu_outs) = cu_res {
+                                let tot_out: usize = cu_outs.iter().map(|v| v.len()).sum();
+                                metrics.spec_rounds_total.fetch_add(1, Ordering::Relaxed);
+                                metrics.spec_accepted_tokens_total.fetch_add(tot_out as u64, Ordering::Relaxed);
+                                metrics.decode_us_total.fetch_add((cu_s * 1e6) as u64, Ordering::Relaxed);
+                                let mut finished_set = vec![false; active.len()];
+                                for (u, &mi) in miss_idx.iter().enumerate() {
+                                    let slot = &mut active[mi];
+                                    let mut last_tok = slot.next_tok;
+                                    for &nxt in &cu_outs[u] {
+                                        let is_stop = nxt == 200006 || nxt == 199999;
+                                        if is_stop || slot.tx.is_closed() {
+                                            let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
+                                            let _ = slot.tx.send(GenEvent::Done {
+                                                finish_reason: "stop",
+                                                pred_n: slot.emitted,
+                                                dec_ms,
+                                            });
+                                            free[slot.seq] = true;
+                                            finished_set[mi] = true;
+                                            break;
+                                        }
+                                        slot.emitted += 1;
+                                        metrics.generated_tokens_total.fetch_add(1, Ordering::Relaxed);
+                                        let _ = slot.tx.send(GenEvent::Token(nxt as u32));
+                                        last_tok = nxt;
+                                        if slot.emitted >= slot.max_tokens {
+                                            let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
+                                            let _ = slot.tx.send(GenEvent::Done {
+                                                finish_reason: "length",
+                                                pred_n: slot.emitted,
+                                                dec_ms,
+                                            });
+                                            free[slot.seq] = true;
+                                            finished_set[mi] = true;
+                                            break;
+                                        }
+                                    }
+                                    if !finished_set[mi] {
+                                        slot.next_tok = last_tok;
+                                    }
+                                }
+                                let mut keep = Vec::with_capacity(active.len());
+                                for (idx, slot) in active.into_iter().enumerate() {
+                                    if !finished_set[idx] {
+                                        keep.push(slot);
+                                    }
+                                }
+                                active = keep;
+                                catchup_streak += 1;
+                                continue;
+                            }
+                        }
+                        catchup_streak = 0;
                         let df_k = spec_k.min(bk);
                         let mut miss_drafts: Vec<Vec<i32>> = if let Some(ref mut d) = drafter {
                             if miss_seqs.len() >= 2 {
@@ -1459,7 +1620,7 @@ fn run_scheduler(
                         let mut padded: Vec<Vec<i32>> = Vec::with_capacity(n_u);
                         for (idx, c) in cands.into_iter().enumerate() {
                             let mut v = match c {
-                                Some(ng) if ng.len() >= 8 => ng,
+                                Some(ng) if ng.len() >= min_strong_ng => ng,
                                 _ => {
                                     if miss_cursor < miss_idx.len() && miss_idx[miss_cursor] == idx {
                                         let dv = std::mem::take(&mut miss_drafts[miss_cursor]);
