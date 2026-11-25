@@ -516,7 +516,26 @@ def test_tool_loop_breaker_and_post_loop_prose(base_url, headers):
     )
     assert st4 == 200
     assert not (d4["choices"][0]["message"].get("tool_calls") or []), f"tool_choice=none emitted tool call: {d4}"
-    print("[PASS] alternating_tool_loop_and_tool_choice_none")
+
+    st5, d5 = post_json(
+        f"{base_url}/v1/chat/completions",
+        {
+            "model": "inkling-2-mini",
+            "messages": [{"role": "user", "content": "Print hello using python."}],
+            "tools": tools,
+            "tool_choice": {"type": "function", "function": {"name": "exec"}},
+            "max_tokens": 128,
+            "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        headers,
+    )
+    assert st5 == 200
+    m5 = d5["choices"][0]["message"]
+    tcs5 = m5.get("tool_calls") or []
+    assert len(tcs5) >= 1 and tcs5[0]["function"]["name"] == "exec", f"forced tool_choice failed: {m5}"
+    assert "[3" not in (m5.get("content") or ""), f"forced tool_choice emitted garbage: {m5}"
+    print("[PASS] alternating_tool_loop_and_tool_choice_none_and_forced")
 
 
 def main():

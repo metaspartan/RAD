@@ -226,7 +226,7 @@ pub(crate) async fn chat_completions(
         }
     }
     let response_json = req.response_format.as_ref().and_then(|rf| rf.get("type")).and_then(|t| t.as_str()).map(|t| t == "json_object" || t == "json_schema").unwrap_or(false);
-    let json_grammar = force_tool_json || response_json;
+    let json_grammar = response_json;
     let initial_thinking = enable_thinking && !json_grammar;
     let include_usage = req.stream_options.as_ref().and_then(|o| o.include_usage).unwrap_or(false);
     let stop_seqs: Vec<String> = req.stop.map(|s| s.into_vec()).unwrap_or_default();
@@ -248,12 +248,12 @@ pub(crate) async fn chat_completions(
     apply_tool_loop_guard(&mut prompt, &mut sampling, loop_repeats);
     if force_tool_json {
         let extra = if let Some(ref fn_name) = forced_tool_name {
-            format!("<|message_system|><|content_text|>You MUST call tool `{fn_name}` by responding ONLY with valid JSON: {{\"name\": \"{fn_name}\", \"arguments\": {{...}}}}.<|end_message|>")
+            format!("<|message_system|><|content_text|>You MUST invoke the `{fn_name}` tool now to complete the request.<|end_message|>")
         } else {
-            "<|message_system|><|content_text|>You MUST respond ONLY with a valid JSON tool call: {\"name\": \"<tool_name>\", \"arguments\": {...}}.<|end_message|>".to_string()
+            "<|message_system|><|content_text|>You MUST invoke one of the declared tools now to complete the request.<|end_message|>".to_string()
         };
-        if let Some(rest) = prompt.strip_prefix("<|begin_of_text|>") {
-            prompt = format!("<|begin_of_text|>{extra}{rest}");
+        if let Some(pos) = prompt.rfind("<|message_model|>") {
+            prompt.insert_str(pos, &extra);
         }
     } else if response_json {
         let json_sys = "<|message_system|><|content_text|>Respond ONLY with valid JSON.<|end_message|>";

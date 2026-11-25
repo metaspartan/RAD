@@ -105,7 +105,7 @@ impl JsonGrammarState {
                 }
             }
             Expect::InNumber => {
-                if b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-') {
+                if b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+') {
                     true
                 } else {
                     self.expect = if self.stack.is_empty() { Expect::Done } else { Expect::CommaOrEnd };
@@ -130,10 +130,6 @@ impl JsonGrammarState {
                 } else if b == b'{' {
                     self.stack.push(Container::Object);
                     self.expect = Expect::ObjKeyOrEnd;
-                    true
-                } else if b == b'[' {
-                    self.stack.push(Container::Array);
-                    self.expect = Expect::ArrayValOrEnd;
                     true
                 } else {
                     false
@@ -248,7 +244,7 @@ impl JsonGrammarState {
                     false
                 }
             }
-            Expect::Done => matches!(b, b' ' | b'\n' | b'\r' | b'\t'),
+            Expect::Done => false,
         }
     }
 
@@ -1113,5 +1109,16 @@ mod tests {
             seed: 7,
         };
         assert_eq!(sample_from_topk(&vals, &ids, &[], &mut p_tk), 100);
+    }
+
+    #[test]
+    fn json_grammar_rejects_arrays_and_stops_at_done() {
+        let g = JsonGrammarState::new_json();
+        assert!(g.accepts_bytes(b"[3]").is_none());
+        assert!(g.accepts_bytes(b"[3-5]").is_none());
+        let done = g.accepts_bytes(br#"{"ok":1}"#).expect("valid object");
+        assert!(done.is_complete());
+        assert!(done.accepts_bytes(b"\n").is_none());
+        assert!(done.accepts_bytes(b"\t").is_none());
     }
 }
