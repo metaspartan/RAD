@@ -61,20 +61,21 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **8-User Concurrent Burst TTFT (`B=8`, live SSE)** | **107.2 ms avg** | `106.5–107.7 ms` across all 8 users (`3.2×` faster via batched multi-user prefill) |
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **21.2 ms** | Prefix-cache affinity hit + GQA 3:1 Split-KV FlashAttention |
 | **Multi-User Decode (`B=4`, Batched DFlash 2 `K=8`)** | **538.1 agg tok/s** | **`134.5 tok/s/user`** (`ITL 7.4 ms`, 32-tok `exp2f` SWA + single-launch `grid.z` WMMA) |
-| **Multi-User Decode (`B=4`, Hybrid DFlash 2 + `K=128`)** | **2,840.7 agg tok/s** | **`710.2 tok/s/user`** (`ITL 1.4 ms`, 32-tok `exp2f` Q8KV FlashAttention + `hipGraph`) |
+| **Multi-User Decode (`B=4`, Hybrid DFlash 2 + `K=128`)** | **2,846.2 agg tok/s** | **`711.6 tok/s/user`** (`ITL 1.4 ms`, coalesced WMMA epilogue + 32-tok `exp2f` Q8KV FlashAttention) |
 | **Multi-User Decode (`B=8`, no-spec)** | **643.6 agg tok/s** | **`80.4 tok/s/user`** (`ITL 12.4 ms`, `hipGraph` + GQA-3:1 INT8 KV + `loop_ctrl_down_nt_k<8>`) |
 | **Multi-User Decode (`B=8`, Batched DFlash 2 `K=8`)** | **748.8 agg tok/s** | **`93.6 tok/s/user`** (`ITL 10.7 ms`; 32-tok `exp2f` SWA + `grid.z` WMMA FlashAttention) |
-| **Multi-User Decode (`B=8`, Hybrid DFlash 2 + `K=128`)** | **3,601.3 agg tok/s** | **`450.2 tok/s/user`** (`ITL 2.2 ms`, 32-tok `exp2f` Q8KV FlashAttention + `1,024`-tok verify) |
+| **Multi-User Decode (`B=8`, Hybrid DFlash 2 + `K=128`)** | **3,644.0 agg tok/s** | **`455.5 tok/s/user`** (`ITL 2.2 ms`, coalesced WMMA epilogue + L2 grid tiling + `1,024`-tok verify) |
 | **Multi-User Decode (`B=16`, no-spec)** | **926.3 agg tok/s** | **`57.9 tok/s/user`** (`ITL 17.3 ms`, unrolled `nt == 8` MoE + GQA-3:1 INT8 KV) |
 | **Multi-User Decode (`B=16`, Batched DFlash 2 `K=8`)** | **1,174.4 agg tok/s** | **`73.4 tok/s/user`** (`ITL 13.6 ms`, 32-tok `exp2f` SWA + `grid.z` WMMA FlashAttention) |
-| **Multi-User Decode (`B=16`, Hybrid DFlash 2 + `K=64`)** | **3,815.1 agg tok/s** | **`238.4 tok/s/user`** (`ITL 4.2 ms`, 32-tok `exp2f` Q8KV FlashAttention, **90.5% of `pp2048` compute**) |
+| **Multi-User Decode (`B=16`, Hybrid DFlash 2 + `K=64`)** | **3,880.7 agg tok/s** | **`242.5 tok/s/user`** (`ITL 4.1 ms`, coalesced WMMA epilogue + L2 grid tiling, **92.4% of `pp2048` compute**) |
 | **Multi-User Decode (`B=32`, no-spec)** | **1,277.8 agg tok/s** | **`39.9 tok/s/user`** (`ITL 25.0 ms`; +47% via `blockIdx.z` hot-expert splitting & `fused_rg B<=64`) |
 | **Multi-User Decode (`B=64`, no-spec)** | **1,162.2 agg tok/s** | `18.2 tok/s/user` (8-warp `128×64` LDS WMMA MoE) |
 | **Multi-User Decode (`B=128`, no-spec)** | **1,856.0 agg tok/s** | **`14.5 tok/s/user`** (fused WMMA MoE-to-`Q8_1` + `float4` slot reduction) |
 | **Live SSE API (`/v1/chat/completions`, real code edit)** | **1,074.8 tok/s** | Live HTTP SSE streaming `2,048` Python tokens in `1.91 s` (**`1,073.4 tok/s`** at `temp=0.2` via GPU top-64 sampling) |
-| **Multi-Turn Agentic E2E (`exec` + `write_file` + `read_file`)** | **98.9–99.5% prefix cache** | Verbatim `tool_call_id` replay survives client JSON reformatting (`80.8 ms` T2 E2E), stop-token speculative rewind |
+| **Multi-Turn Agentic E2E (`exec` + `write_file` + `read_file`)** | **98.9–99.5% prefix cache** | Verbatim `tool_call_id` replay survives client JSON reformatting (`77.3 ms` T2 E2E), stop-token speculative rewind |
+| **256K Long-Context Agentic Project E2E (7 turns, live SSE)** | **100.0% cache @ 249K** | Builds & tests multi-file Python project across `443 -> 43K -> 92K -> 182K -> 249K` tok (**`235.6 ms` TTFT**, **`96.2 tok/s`** decode @ 249K, exact Turn-1 recall) |
 | **Live SSE API (8-User Concurrent, Hybrid `K=128`, `temp=0.2`)** | **3,042.8 agg tok/s** | **`322.9 tok/s/user`** avg (**`2,199.7 agg tok/s`** full decode span, up to **`380.3 tok/s/user`**, edit-bridge catch-up + fused rewind + 64-tok lookup) |
-| **Live SSE API (8-User Independent File Edits, `B=8`)** | **2,130.8 agg tok/s** | `9,295` tokens across 8 distinct edits in `4.36 s` (**`263–291 tok/s/user`**, all 8 users finishing within `0.30 s`) |
+| **Live SSE API (8-User Independent File Edits, `B=8`)** | **2,156.0 agg tok/s** | `9,295` tokens across 8 distinct edits in `4.31 s` (**`266–295 tok/s/user`**, all 8 users finishing within `0.30 s`) |
 
 ---
 
@@ -104,7 +105,8 @@ RAD/
 │   └── rad_multiuser.svg      Multi-user throughput scaling chart
 └── scripts/
     ├── test_serve.py          End-to-end HTTP, SSE, batch, and WebSocket test suite
-    └── test_e2e_realworld.py  Real-world multi-user SSE, tool-call prefix cache, grammar & disconnect tests
+    ├── test_e2e_realworld.py      Real-world 8-test multi-user SSE, tool-call prefix cache, grammar & disconnect suite
+    └── test_e2e_longctx_agent.py  Real-world 7-turn 256K long-context agentic project-building E2E test
 ```
 
 ---
