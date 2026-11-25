@@ -1211,13 +1211,14 @@ fn run_scheduler(
 
         let any_grammar = active.iter().any(|a| a.grammar.is_some() || !a.sampling.is_greedy());
 
-        if active.len() == 1 && !any_grammar {
+        if active.len() == 1 {
             if let Some(ref mut d) = drafter {
                 let seq = active[0].seq;
                 if seq < d.max_seqs() && d.seq_ctx_len(seq) == engine.seq_pos[seq] {
                     let mut slot = active.pop().unwrap();
                     let pos0 = engine.seq_pos[seq];
                     let t_step = Instant::now();
+                    let needs_logits = slot.grammar.is_some() || !slot.sampling.is_greedy();
                     let res = (|| -> anyhow::Result<Vec<i32>> {
                         let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[seq], slot.next_tok, 64) {
                             ng
@@ -1229,12 +1230,33 @@ fn run_scheduler(
                         let dk = draft.len();
                         let verified = engine.verify_batch_seq(seq, &draft)?;
                         let mut n_acc = 1usize;
-                        for j in 0..(dk - 1) {
-                            if verified[j] == draft[j + 1] {
-                                n_acc += 1;
-                            } else {
-                                break;
+                        let mut last_pred = verified[0];
+                        if needs_logits {
+                            let mut hist = engine.seq_tokens[seq].clone();
+                            for j in 0..dk {
+                                hist.push(draft[j]);
+                                let logits = engine.read_batch_logits(j)?;
+                                let pred = if let Some(ref mut g) = slot.grammar {
+                                    vocab_grammar.select_best_token(&logits, g)
+                                } else {
+                                    grammar::sample_from_logits(&logits, &hist, &mut slot.sampling)
+                                };
+                                last_pred = pred;
+                                if j + 1 < dk && pred == draft[j + 1] {
+                                    n_acc += 1;
+                                } else {
+                                    break;
+                                }
                             }
+                        } else {
+                            for j in 0..(dk - 1) {
+                                if verified[j] == draft[j + 1] {
+                                    n_acc += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            last_pred = verified[n_acc - 1];
                         }
                         engine.rewind_verify_seq_to(seq, n_acc, dk)?;
                         d.inject_batch_seq_async(seq, &engine, 0, pos0, n_acc)?;
@@ -1246,7 +1268,7 @@ fn run_scheduler(
                         for j in 1..n_acc {
                             emitted_toks.push(draft[j]);
                         }
-                        emitted_toks.push(verified[n_acc - 1]);
+                        emitted_toks.push(last_pred);
                         Ok(emitted_toks)
                     })();
                     let step_s = t_step.elapsed().as_secs_f64();
@@ -3051,9 +3073,9 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
             .collect();
         if long_targets.len() >= 2 {
             println!();
-            println!("Long-Context Scaling (prefill + hybrid {spec_mode}/ngram K=48 decode):");
+            println!("Long-Context Scaling (prefill + hybrid {spec_mode}/ngram K=64 decode):");
             let block_txt = "pub struct KvBlock {\n    pub block_id: usize,\n    pub ref_count: u32,\n    pub tokens: [i32; 16],\n    pub dirty: bool,\n}\nimpl KvBlock {\n    pub fn new(block_id: usize) -> Self {\n        Self { block_id, ref_count: 1, tokens: [0; 16], dirty: false }\n    }\n    pub fn retain(&mut self) {\n        self.ref_count = self.ref_count.saturating_add(1);\n    }\n    pub fn release(&mut self) -> bool {\n        self.ref_count = self.ref_count.saturating_sub(1);\n        self.ref_count == 0\n    }\n}\n";
-            let target_txt = "pub struct KvCachePool {\n    pub blocks: Vec<KvBlock>,\n    pub free_list: Vec<usize>,\n    pub block_size: usize,\n    pub max_blocks: usize,\n}\nimpl KvCachePool {\n    pub fn with_capacity(max_blocks: usize, block_size: usize) -> Self {\n        let mut blocks = Vec::with_capacity(max_blocks);\n        let mut free_list = Vec::with_capacity(max_blocks);\n        for i in 0..max_blocks {\n            blocks.push(KvBlock::new(i));\n            free_list.push(max_blocks - 1 - i);\n        }\n        Self { blocks, free_list, block_size, max_blocks }\n    }\n    pub fn alloc_block(&mut self) -> Option<usize> {\n        let id = self.free_list.pop()?;\n        self.blocks[id].ref_count = 1;\n        self.blocks[id].dirty = true;\n        Some(id)\n    }\n    pub fn free_block(&mut self, id: usize) {\n        if id < self.blocks.len() && self.blocks[id].release() {\n            self.blocks[id].dirty = false;\n            self.free_list.push(id);\n        }\n    }\n    pub fn used_blocks(&self) -> usize {\n        self.max_blocks.saturating_sub(self.free_list.len())\n    }\n}\n";
+            let target_txt = "pub struct KvCachePool {\n    pub blocks: Vec<KvBlock>,\n    pub free_list: Vec<usize>,\n    pub block_size: usize,\n    pub max_blocks: usize,\n}\nimpl KvCachePool {\n    pub fn with_capacity(max_blocks: usize, block_size: usize) -> Self {\n        let mut blocks = Vec::with_capacity(max_blocks);\n        let mut free_list = Vec::with_capacity(max_blocks);\n        for i in 0..max_blocks {\n            blocks.push(KvBlock::new(i));\n            free_list.push(max_blocks - 1 - i);\n        }\n        Self { blocks, free_list, block_size, max_blocks }\n    }\n    pub fn alloc_block(&mut self) -> Option<usize> {\n        let id = self.free_list.pop()?;\n        self.blocks[id].ref_count = 1;\n        self.blocks[id].dirty = true;\n        Some(id)\n    }\n    pub fn free_block(&mut self, id: usize) {\n        if id < self.blocks.len() && self.blocks[id].release() {\n            self.blocks[id].dirty = false;\n            self.free_list.push(id);\n        }\n    }\n    pub fn used_blocks(&self) -> usize {\n        self.max_blocks.saturating_sub(self.free_list.len())\n    }\n    pub fn free_blocks(&self) -> usize {\n        self.free_list.len()\n    }\n    pub fn utilization(&self) -> f64 {\n        if self.max_blocks == 0 { 0.0 } else { self.used_blocks() as f64 / self.max_blocks as f64 }\n    }\n    pub fn reset_all(&mut self) {\n        self.free_list.clear();\n        for i in 0..self.max_blocks {\n            self.blocks[i].ref_count = 0;\n            self.blocks[i].dirty = false;\n            self.free_list.push(self.max_blocks - 1 - i);\n        }\n    }\n}\n";
             let block_ids: Vec<i32> = tokenizer.encode(block_txt, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
             let target_ids: Vec<i32> = tokenizer.encode(target_txt, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
             let prefix_p = format_prompt(
@@ -3079,7 +3101,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
                 let mut gen = 0usize;
                 let mut rounds = 0usize;
                 let td = Instant::now();
-                while gen < 200 {
+                while gen < 256 {
                     let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[0], ct, 64) {
                         ng
                     } else {
