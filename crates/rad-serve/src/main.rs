@@ -1554,7 +1554,7 @@ fn run_scheduler(
                 for a in &active {
                     let rem_kv = engine.max_ctx.saturating_sub(engine.seq_pos[a.seq] as usize);
                     if let Some((ng, mlen)) = ngram_lookup_draft_ex(&engine.seq_tokens[a.seq], a.next_tok, max_user_k.min(rem_kv)) {
-                        let req_mlen = if a.last_emits > 0 && a.last_emits <= 16 { 6 } else { 5 };
+                        let req_mlen = if a.last_emits > 0 && a.last_emits <= 16 { 12 } else { 5 };
                         if ng.len() >= 8 && mlen >= req_mlen {
                             hit_count += 1;
                             max_hit_len = max_hit_len.max(ng.len());

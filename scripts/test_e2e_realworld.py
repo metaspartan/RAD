@@ -257,6 +257,76 @@ def test_multiuser_sse_pure_gen(base_url, headers, n_users=8):
     print(f"[PASS] multiuser_sse_pure_gen (B={n_users}, temp=0.2): ctoks={tot_ct} agg={agg:.1f} tok/s ({agg/n_users:.1f} tok/s/user)")
 
 
+def test_8user_burst_ttft(base_url, headers, n_users=8):
+    url = f"{base_url}/v1/chat/completions"
+
+    def run_u(i):
+        r = stream_sse(
+            url,
+            {
+                "model": "inkling-2-mini",
+                "messages": [{"role": "user", "content": f"User {i}: explain GPU memory coalescing in one sentence."}],
+                "temperature": 0.0,
+                "max_tokens": 32,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+            headers,
+        )
+        assert r["saw_done"], f"burst U{i} missing [DONE]"
+        return (r["first"] - r["t0"]) * 1000.0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_users) as ex:
+        ttfts = list(ex.map(run_u, range(n_users)))
+    avg_ms = sum(ttfts) / len(ttfts)
+    max_ms = max(ttfts)
+    assert max_ms < 1000.0, f"burst TTFT too high: max={max_ms:.1f}ms"
+    print(f"[PASS] 8user_burst_ttft (B={n_users}): min={min(ttfts):.1f}ms avg={avg_ms:.1f}ms max={max_ms:.1f}ms")
+
+
+def test_responses_api_prefix_cache(base_url, headers):
+    url = f"{base_url}/v1/responses"
+    sys_inst = "You are a concise Rust performance assistant. " + ("Prefer zero-copy designs. " * 120)
+    d1 = post_json(
+        url,
+        {
+            "model": "inkling-2-mini",
+            "instructions": sys_inst,
+            "input": [{"role": "user", "content": "Reply with the word READY."}],
+            "temperature": 0.0,
+            "max_output_tokens": 16,
+        },
+        headers,
+    )
+    out1 = ""
+    for item in d1.get("output") or []:
+        for c in item.get("content") or []:
+            if c.get("type") == "output_text":
+                out1 += c.get("text") or ""
+    assert out1.strip(), f"empty /v1/responses T1 output: {d1}"
+    d2 = post_json(
+        url,
+        {
+            "model": "inkling-2-mini",
+            "instructions": sys_inst,
+            "input": [
+                {"role": "user", "content": "Reply with the word READY."},
+                {"role": "assistant", "content": out1.strip()},
+                {"role": "user", "content": "Reply with OK."},
+            ],
+            "temperature": 0.0,
+            "max_output_tokens": 16,
+        },
+        headers,
+    )
+    u2 = d2.get("usage") or {}
+    c2 = (u2.get("input_tokens_details") or {}).get("cached_tokens", 0)
+    in2 = u2.get("input_tokens", 1)
+    pct2 = 100.0 * c2 / max(1, in2)
+    assert pct2 >= 90.0, f"/v1/responses T2 prefix cache too low: {pct2:.1f}% ({c2}/{in2})"
+    print(f"[PASS] responses_api_prefix_cache: T2={pct2:.1f}% ({c2}/{in2})")
+
+
 def test_metrics_endpoint(base_url, headers):
     req = urllib.request.Request(f"{base_url}/metrics", headers=headers)
     with urllib.request.urlopen(req, timeout=15) as resp:
@@ -279,12 +349,14 @@ def main():
     args = ap.parse_args()
     headers = make_headers(args.api_key)
     test_tool_call_reformatted_prefix_cache(args.url, headers)
+    test_responses_api_prefix_cache(args.url, headers)
     test_json_grammar(args.url, headers)
     test_midstream_disconnect_resilience(args.url, headers)
+    test_8user_burst_ttft(args.url, headers, args.users)
     test_multiuser_sse_pure_gen(args.url, headers, args.users)
     test_multiuser_sse_hybrid(args.url, headers, args.users)
     test_metrics_endpoint(args.url, headers)
-    print("ALL REAL-WORLD E2E TESTS PASSED!")
+    print("ALL 8 REAL-WORLD E2E TESTS PASSED!")
 
 
 if __name__ == "__main__":

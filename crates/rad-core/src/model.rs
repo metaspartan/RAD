@@ -373,7 +373,6 @@ pub struct InklingEngine {
     decode_graph: Option<CapturedGraph>,
     verify_graph: Option<(usize, CapturedGraph)>,
     seq_verify_graphs: std::collections::HashMap<(usize, usize), CapturedGraph>,
-    rewind_graphs: std::collections::HashMap<(usize, usize), CapturedGraph>,
     multi_graphs: std::collections::HashMap<usize, CapturedGraph>,
     multi_verify_graphs: std::collections::HashMap<(usize, usize), CapturedGraph>,
     pub pos: i32,
@@ -701,7 +700,6 @@ impl InklingEngine {
             decode_graph: None,
             verify_graph: None,
             seq_verify_graphs: std::collections::HashMap::new(),
-            rewind_graphs: std::collections::HashMap::new(),
             multi_graphs: std::collections::HashMap::new(),
             multi_verify_graphs: std::collections::HashMap::new(),
             pos: 0,
@@ -1910,30 +1908,33 @@ impl InklingEngine {
 
     pub fn rewind_verify_seq_to(&mut self, seq: usize, n_acc: usize, b: usize) -> Result<()> {
         if n_acc < b {
-            let idx = n_acc - 1;
-            let key = (seq, idx);
-            if !self.rewind_graphs.contains_key(&key) {
-                let kv_n = (self.cfg.n_head_kv * self.cfg.dh * 3) as i32;
-                let e_n = (self.cfg.n_embd * 3) as i32;
-                let kv_off = idx * (kv_n as usize);
-                let e_off = idx * (e_n as usize);
-                let kv_dst_off = seq * (kv_n as usize);
-                let e_dst_off = seq * (e_n as usize);
-                let g = unsafe {
-                    CapturedGraph::capture(|s| {
-                        for sl in &self.slots {
-                            ops::ink_copy_f32(s, (sl.k_snap.ptr as *const f32).add(kv_off), (sl.k_hist.ptr as *mut f32).add(kv_dst_off), kv_n);
-                            ops::ink_copy_f32(s, (sl.v_snap.ptr as *const f32).add(kv_off), (sl.v_hist.ptr as *mut f32).add(kv_dst_off), kv_n);
-                            ops::ink_copy_f32(s, (sl.attn_post_snap.ptr as *const f32).add(e_off), (sl.attn_post_hist.ptr as *mut f32).add(e_dst_off), e_n);
-                            ops::ink_copy_f32(s, (sl.ffn_post_snap.ptr as *const f32).add(e_off), (sl.ffn_post_hist.ptr as *mut f32).add(e_dst_off), e_n);
-                        }
-                    })
-                }.map_err(he)?;
-                self.rewind_graphs.insert(key, g);
-            }
-            let g = self.rewind_graphs.get(&key).unwrap();
+            let idx = (n_acc - 1) as i32;
+            let kv_n = (self.cfg.n_head_kv * self.cfg.dh * 3) as i32;
+            let e_n = (self.cfg.n_embd * 3) as i32;
             let target_s = self.seq_verify_graphs.get(&(seq, b)).map(|vg| vg.stream).unwrap_or(self.stream);
-            g.launch_on(target_s).map_err(he)?;
+            let rw_u: [i32; 1] = [0];
+            let rw_seq: [i32; 1] = [seq as i32];
+            let rw_idx: [i32; 1] = [idx];
+            let u_b = unsafe { std::slice::from_raw_parts(rw_u.as_ptr() as *const u8, 4) };
+            let s_b = unsafe { std::slice::from_raw_parts(rw_seq.as_ptr() as *const u8, 4) };
+            let i_b = unsafe { std::slice::from_raw_parts(rw_idx.as_ptr() as *const u8, 4) };
+            self.d_rw_u.copy_from(u_b, Some(target_s)).map_err(he)?;
+            self.d_rw_seq.copy_from(s_b, Some(target_s)).map_err(he)?;
+            self.d_rw_idx.copy_from(i_b, Some(target_s)).map_err(he)?;
+            unsafe {
+                ops::ink_rewind_multi_all_slots(
+                    target_s,
+                    self.d_rewind_ptrs.ptr as *const u64,
+                    self.d_rw_u.ptr as *const i32,
+                    self.d_rw_seq.ptr as *const i32,
+                    self.d_rw_idx.ptr as *const i32,
+                    self.slots.len() as i32,
+                    1,
+                    kv_n,
+                    e_n,
+                    b as i32,
+                );
+            }
             self.seq_pos[seq] -= (b - n_acc) as i32;
             if seq == 0 {
                 self.pos = self.seq_pos[0];
