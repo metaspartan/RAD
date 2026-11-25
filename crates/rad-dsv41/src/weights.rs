@@ -309,6 +309,9 @@ pub struct LayerWeights {
     pub wq_b: Exl3Linear,
     pub wkv: Exl3Linear,
     pub wo_a_slices: Vec<Exl3Linear>,
+    pub d_wo_a_trel: CudaBuf,
+    pub d_wo_a_suh: CudaBuf,
+    pub d_wo_a_svh: CudaBuf,
     pub wo_b: Exl3Linear,
     pub gate_w: CudaBuf,
     pub gate_bias: CudaBuf,
@@ -402,6 +405,9 @@ impl LayerWeights {
             });
         }
 
+        let d_wo_a_trel = upload_ptr_table(&wo_a_slices.iter().map(|s| s.trellis.ptr as u64).collect::<Vec<_>>())?;
+        let d_wo_a_suh = upload_ptr_table(&wo_a_slices.iter().map(|s| s.suh.ptr as u64).collect::<Vec<_>>())?;
+        let d_wo_a_svh = upload_ptr_table(&wo_a_slices.iter().map(|s| s.svh.ptr as u64).collect::<Vec<_>>())?;
         let d_w1_trel = upload_ptr_table(&experts.iter().map(|e| e.w1.trellis.ptr as u64).collect::<Vec<_>>())?;
         let d_w1_suh = upload_ptr_table(&experts.iter().map(|e| e.w1.suh.ptr as u64).collect::<Vec<_>>())?;
         let d_w1_svh = upload_ptr_table(&experts.iter().map(|e| e.w1.svh.ptr as u64).collect::<Vec<_>>())?;
@@ -422,6 +428,9 @@ impl LayerWeights {
             wq_b: Exl3Linear::load_col_shard(idx.as_deref_mut(), &format!("{p}.attn.wq_b"), comm)?,
             wkv: Exl3Linear::load_replicated(idx.as_deref_mut(), &format!("{p}.attn.wkv"), comm)?,
             wo_a_slices,
+            d_wo_a_trel,
+            d_wo_a_suh,
+            d_wo_a_svh,
             wo_b: Exl3Linear::load_row_shard(idx.as_deref_mut(), &format!("{p}.attn.wo_b"), comm)?,
             gate_w: load_raw_buf_replicated(idx.as_deref_mut(), &format!("{p}.ffn.gate.weight"), comm)?,
             gate_bias: load_raw_buf_replicated(idx.as_deref_mut(), &format!("{p}.ffn.gate.bias"), comm)?,

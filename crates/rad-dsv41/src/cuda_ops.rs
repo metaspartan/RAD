@@ -50,6 +50,22 @@ extern "C" {
         stream: CudaStream,
     );
 
+    pub fn rad_cuda_exl3_batched_group_mma_f16(
+        x_in: *const c_void,
+        trellis_ptrs: *const *const c_void,
+        suh_ptrs: *const *const c_void,
+        svh_ptrs: *const *const c_void,
+        z_scratch_f32: *mut c_void,
+        y_out: *mut c_void,
+        m: i32,
+        g: i32,
+        k: i32,
+        n: i32,
+        bits: i32,
+        wht_scale: f32,
+        stream: CudaStream,
+    );
+
     pub fn rad_cuda_rms_norm_bf16w_f16(
         x: *const c_void,
         w: *const c_void,
@@ -240,6 +256,7 @@ extern "C" {
         stream: CudaStream,
     );
 
+    #[allow(dead_code)]
     pub fn rad_cuda_wo_a_gather_group_f16(
         attn_out: *const c_void,
         grp_in: *mut c_void,
@@ -251,6 +268,7 @@ extern "C" {
         stream: CudaStream,
     );
 
+    #[allow(dead_code)]
     pub fn rad_cuda_wo_a_scatter_group_f16(
         grp_out: *const c_void,
         wo_mid: *mut c_void,

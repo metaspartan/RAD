@@ -101,12 +101,14 @@ First CUDA backend (`rad-cuda` + `rad-dsv41`) running **DeepSeek-V4.1-Flash-1017
 | --- | --- | --- |
 | **EXL3 `mul1` Tensor Core GEMV (`M=1`, 4-bit)** | **269.9 GB/s** (**98.9% peak**) | `mma.sync.aligned.m16n8k16` (`rad_exl3_mma.cu`), verified `<2e-5` rel_err across 2/3/4/5/6-bit |
 | **EXL3 `mul1` Tensor Core Prefill (`M=16..64`)** | **21.02 TFLOPS** | Fused WHT-128 + `mul1` `0x83DCD12D` Tensor Core MMA |
-| **ConnectX-7 RoCE v2 RDMA AllReduce** | **7 us** (**134x** vs TCP) | Zero-copy `cudaHostAllocMapped` + `libibverbs` (`938 us` TCP -> `7 us` RDMA) with GPU-side peer add |
+| **Fused Batched `wo_a` EXL3 MMA (`8x 1024x512`, 5b)** | **14.2 us** (`184.5 GB/s`, **8.3x**) | Single-launch 8-group `exl3_batched_group_mma_m16_mul1_k` (`12.7 us` / `205.9 GB/s` at `M=1`, zero gather/scatter) |
+| **Tensor Core MQA+CSA2 FlashAttention (`M=512`)** | **5.59 ms/layer** (**8.2x** @ 4K) | `mqa_flash_mma16_f16_k` (`mma.sync.aligned.m16n8k16`, `8.06e-6` CSA2 parity vs FP32 CPU) |
+| **ConnectX-7 RoCE v2 RDMA AllReduce** | **7 us** (**134x** vs TCP) | Zero-copy `cudaHostAllocMapped` + `libibverbs` (`8 MB` RDMA ring for `M=512` prefill) with GPU-side peer add |
 | **MoE Router (`384` experts, `sqrtsoftplus`, `top_k=6`)** | **66 us** (**6.6x** speedup) | Vectorized `half2` logits + parallel 256-thread top-K (`rad_dsv41_router.cu`) |
-| **GPU-Grouped MoE Tensor Core MMA (`M=2..64`)** | **2.04x** prefill / **1.90x** verify | Expert-grouped `mma.sync.aligned.m16n8k16` (`rad_exl3_mma.cu`), **100% bit-exact** `M=1` vs `M=4` parity |
-| **Live 40-Layer TP=2 RDMA TTFT & Prefix Cache** | **73.7 ms** cached / **191.7 ms** cold | Beats `267.2 ms` vLLM baseline; multi-turn KV prefix caching (`lcp`, **47x** cached TTFT speedup) + full-context CSA2 compressed KV (`layers.2, 8, 14, 20`) |
-| **Live 40-Layer TP=2 RDMA Pure Gen (`DSpark MTP` + CUDA Graphs)** | **61.8 tok/s** code (**86.6 tok/s** peak) | `Math=46.3 tok/s`, `Prose=23.7 tok/s`; `M=1/6/64/128` QKV/WO/FFN + 3-layer MTP CUDA Graphs (`68.2 ms` avg `M=6` verify), register-resident `half2` MQA |
-| **Live 40-Layer TP=2 RDMA Hybrid (`K=128` Verbatim Edit)** | **159.0–217+ tok/s** | `M=128` prefill (**21.5%** faster), `acc=64/64` in `275–290 ms`; exact pipelined mHC, transposed Sinkhorn, per-layer 10K/160K YaRN RoPE, `<think>` / `reasoning_effort`, shared `rad-http` Prometheus `/metrics`, & DSML tool calls |
+| **GPU-Grouped MoE Tensor Core MMA (`M=2..512`)** | **2.04x** prefill / **1.90x** verify | Expert-grouped `mma.sync.aligned.m16n8k16` (`rad_exl3_mma.cu`) tuned for 48-SM GB10, **100% bit-exact** parity |
+| **Live 40-Layer TP=2 RDMA Prefill & Prefix Cache** | **494.2 tok/s** (`5.5K` `M=512`) / **73.7 ms** cached | **2.35x** faster `M=512` prefill via Tensor Core FlashMQA (`162–172 ms` cold TTFT vs `267.2 ms` vLLM), multi-turn KV prefix cache + full-context CSA2 |
+| **Live 40-Layer TP=2 RDMA Pure Gen (`DSpark MTP` + CUDA Graphs)** | **61.8 tok/s** code (**86.6 tok/s** peak) | `Math=53.4 tok/s`, `Prose=29.2 tok/s`; `M=1/6/64/128/512` QKV/WO/FFN + 3-layer MTP CUDA Graphs, 4-head vectorized `half2` MQA |
+| **Live 40-Layer TP=2 RDMA Hybrid (`K=128` Verbatim Edit)** | **197.3–230+ tok/s** | `700` chunks in `3.55 s` (`350.5 tok/s` cold prefill); exact pipelined mHC, transposed Sinkhorn, per-layer 10K/160K YaRN RoPE, `<think>` / `reasoning_effort`, shared `rad-http` Prometheus `/metrics`, & DSML tool calls |
 
 ### Supported Models & Weights
 

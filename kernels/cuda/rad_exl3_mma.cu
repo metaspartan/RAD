@@ -679,13 +679,164 @@ void exl3_moe_mma_grouped_m16_mul1_k(
     }
 }
 
+template <int BITS>
+__global__ __launch_bounds__(256)
+void exl3_batched_group_mma_m16_mul1_k(
+    const half* __restrict__ x_in,
+    const uint16_t* const* __restrict__ trellis_ptrs,
+    const half* const* __restrict__ suh_ptrs,
+    float* __restrict__ z_f32,
+    int M,
+    int G,
+    int K,
+    int N,
+    int split_k,
+    float wht_scale
+) {
+    constexpr int PACKED_U16 = 16 * BITS;
+    constexpr int PACKED_U32 = 8 * BITS;
+    int g = blockIdx.y % G;
+    int mb = blockIdx.y / G;
+    int m0 = mb * 16;
+    int m_len = M - m0;
+    if (m_len <= 0) return;
+    if (m_len > 16) m_len = 16;
+
+    int t = threadIdx.x;
+    int lane = t & 31;
+    int warp = t >> 5;
+    int n_tile = blockIdx.x * 8 + warp;
+    int sk = blockIdx.z;
+    int N_tiles = N >> 4;
+    if (n_tile >= N_tiles) return;
+
+    const uint16_t* trellis = trellis_ptrs[g];
+    const half* suh = suh_ptrs[g];
+
+    int K_blocks128 = K >> 7;
+    int kb_start = (K_blocks128 * sk) / split_k;
+    int kb_end = (K_blocks128 * (sk + 1)) / split_k;
+
+    __shared__ uint32_t s_packed[8][PACKED_U32];
+    __shared__ half s_x128[16][128];
+
+    float c00 = 0.0f, c01 = 0.0f, c02 = 0.0f, c03 = 0.0f;
+    float c10 = 0.0f, c11 = 0.0f, c12 = 0.0f, c13 = 0.0f;
+
+    int group_id = lane >> 2;
+    int tid_in_grp = lane & 3;
+    int k_off0 = tid_in_grp * 2;
+    int k_off1 = k_off0 + 8;
+
+    for (int kb_idx = kb_start; kb_idx < kb_end; ++kb_idx) {
+        int kb = kb_idx * 128;
+        for (int r = warp; r < m_len; r += 8) {
+            const half* x_src = x_in + (size_t)((m0 + r) * G + g) * K;
+            int base = kb + lane * 4;
+            float v0 = __half2float(x_src[base + 0]) * __half2float(suh[base + 0]);
+            float v1 = __half2float(x_src[base + 1]) * __half2float(suh[base + 1]);
+            float v2 = __half2float(x_src[base + 2]) * __half2float(suh[base + 2]);
+            float v3 = __half2float(x_src[base + 3]) * __half2float(suh[base + 3]);
+            mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
+            s_x128[r][lane * 4 + 0] = __float2half(v0);
+            s_x128[r][lane * 4 + 1] = __float2half(v1);
+            s_x128[r][lane * 4 + 2] = __float2half(v2);
+            s_x128[r][lane * 4 + 3] = __float2half(v3);
+        }
+        __syncthreads();
+
+        int kt0 = kb >> 4;
+        #pragma unroll
+        for (int sub = 0; sub < 8; ++sub) {
+            int kt = kt0 + sub;
+            const uint32_t* g_tile = (const uint32_t*)(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
+            #pragma unroll
+            for (int w = lane; w < PACKED_U32; w += 32) {
+                s_packed[warp][w] = __ldg(g_tile + w);
+            }
+            __syncwarp();
+
+            uint32_t b00, b01, b10, b11;
+            mma_dq8_mul1<BITS>(s_packed[warp], lane * 8, b00, b01, b10, b11);
+
+            uint32_t a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u;
+            if (group_id < m_len) {
+                const half* r0 = &s_x128[group_id][sub * 16];
+                a0 = *reinterpret_cast<const uint32_t*>(r0 + k_off0);
+                a2 = *reinterpret_cast<const uint32_t*>(r0 + k_off1);
+            }
+            if (group_id + 8 < m_len) {
+                const half* r1 = &s_x128[group_id + 8][sub * 16];
+                a1 = *reinterpret_cast<const uint32_t*>(r1 + k_off0);
+                a3 = *reinterpret_cast<const uint32_t*>(r1 + k_off1);
+            }
+            mma_m16n8k16_f32(c00, c01, c02, c03, a0, a1, a2, a3, b00, b01);
+            mma_m16n8k16_f32(c10, c11, c12, c13, a0, a1, a2, a3, b10, b11);
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+
+    int col_base = n_tile * 16 + tid_in_grp * 2;
+    if (group_id < m_len) {
+        float* z0 = z_f32 + (size_t)((m0 + group_id) * G + g) * N + col_base;
+        if (split_k == 1) {
+            z0[0] = c00; z0[1] = c01; z0[8] = c10; z0[9] = c11;
+        } else {
+            atomicAdd(z0 + 0, c00); atomicAdd(z0 + 1, c01);
+            atomicAdd(z0 + 8, c10); atomicAdd(z0 + 9, c11);
+        }
+    }
+    if (group_id + 8 < m_len) {
+        float* z1 = z_f32 + (size_t)((m0 + group_id + 8) * G + g) * N + col_base;
+        if (split_k == 1) {
+            z1[0] = c02; z1[1] = c03; z1[8] = c12; z1[9] = c13;
+        } else {
+            atomicAdd(z1 + 0, c02); atomicAdd(z1 + 1, c03);
+            atomicAdd(z1 + 8, c12); atomicAdd(z1 + 9, c13);
+        }
+    }
+}
+
+__global__ void batched_group_wht128_post_f32_to_f16_k(
+    const float* __restrict__ z_f32,
+    const half* const* __restrict__ svh_ptrs,
+    half* __restrict__ y_out,
+    int G,
+    int N,
+    float wht_scale
+) {
+    int lane = threadIdx.x;
+    int block_idx = blockIdx.x;
+    int row_g = blockIdx.y;
+    int g = row_g % G;
+    int base = block_idx * 128 + lane * 4;
+    const float* zr = z_f32 + (size_t)row_g * N;
+    const half* svh = svh_ptrs[g];
+    half* yr = y_out + (size_t)row_g * N;
+
+    float v0 = zr[base + 0];
+    float v1 = zr[base + 1];
+    float v2 = zr[base + 2];
+    float v3 = zr[base + 3];
+    mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
+    v0 *= __half2float(svh[base + 0]);
+    v1 *= __half2float(svh[base + 1]);
+    v2 *= __half2float(svh[base + 2]);
+    v3 *= __half2float(svh[base + 3]);
+    yr[base + 0] = __float2half(fminf(fmaxf(v0, -65504.0f), 65504.0f));
+    yr[base + 1] = __float2half(fminf(fmaxf(v1, -65504.0f), 65504.0f));
+    yr[base + 2] = __float2half(fminf(fmaxf(v2, -65504.0f), 65504.0f));
+    yr[base + 3] = __float2half(fminf(fmaxf(v3, -65504.0f), 65504.0f));
+}
+
 static int* g_moe_meta = nullptr;
 
 extern "C" {
 
 void rad_cuda_moe_init_meta(void) {
     if (!g_moe_meta) {
-        cudaMalloc(&g_moe_meta, 4096 * sizeof(int));
+        cudaMalloc(&g_moe_meta, 16384 * sizeof(int));
     }
 }
 
@@ -711,15 +862,15 @@ void rad_cuda_exl3_moe_mma_f16(
 ) {
     int n_blocks = N / 128;
     int pairs = M * top_k;
-    if (M >= 2 && pairs <= 1024 && n_local_experts <= 256) {
+    if (M >= 2 && pairs <= 4096 && n_local_experts <= 256) {
         if (!g_moe_meta) {
-            cudaMalloc(&g_moe_meta, 4096 * sizeof(int));
+            cudaMalloc(&g_moe_meta, 16384 * sizeof(int));
         }
         int* d_sorted = g_moe_meta;
-        int* d_eids = g_moe_meta + 1024;
-        int* d_offs = g_moe_meta + 2048;
-        int* d_lens = g_moe_meta + 3072;
-        int* d_ng = g_moe_meta + 4095;
+        int* d_eids = g_moe_meta + 4096;
+        int* d_offs = g_moe_meta + 8192;
+        int* d_lens = g_moe_meta + 12288;
+        int* d_ng = g_moe_meta + 16383;
         if (!reuse_groups) {
             moe_build_groups_k<<<1, 1, 0, stream>>>(
                 expert_ids, pairs, expert_start, n_local_experts,
@@ -727,7 +878,9 @@ void rad_cuda_exl3_moe_mma_f16(
             );
         }
         int max_groups = (pairs < n_local_experts + (pairs / 16) + 1) ? pairs : (n_local_experts + (pairs / 16) + 1);
-        int split_k = (n_blocks * max_groups < 128) ? 4 : ((n_blocks * max_groups < 256) ? 2 : 1);
+        int est_active = (pairs / 2 < n_local_experts) ? (pairs / 2) : n_local_experts;
+        if (est_active < 1) est_active = 1;
+        int split_k = (n_blocks * est_active < 64) ? 4 : ((n_blocks * est_active < 128) ? 2 : 1);
         if (K / 128 < split_k) split_k = K / 128;
         if (split_k < 1) split_k = 1;
         if (split_k > 1) {
@@ -765,6 +918,44 @@ void rad_cuda_exl3_moe_mma_f16(
     moe_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh_ptrs, expert_ids, y_out, N, wht_scale, expert_start, n_local_experts);
 }
 
+void rad_cuda_exl3_batched_group_mma_f16(
+    const half* x_in,
+    const uint16_t* const* trellis_ptrs,
+    const half* const* suh_ptrs,
+    const half* const* svh_ptrs,
+    float* z_scratch_f32,
+    half* y_out,
+    int M,
+    int G,
+    int K,
+    int N,
+    int bits,
+    float wht_scale,
+    cudaStream_t stream
+) {
+    int n_blocks = N / 128;
+    int m_blocks = (M + 15) / 16;
+    int total_blocks = n_blocks * m_blocks * G;
+    int split_k = (total_blocks < 64) ? 4 : ((total_blocks < 128) ? 2 : 1);
+    int max_sk = K / 128;
+    if (split_k > max_sk) split_k = max_sk;
+    if (split_k < 1) split_k = 1;
+    if (split_k > 1) {
+        cudaMemsetAsync(z_scratch_f32, 0, (size_t)M * G * N * sizeof(float), stream);
+    }
+    dim3 grid(n_blocks, m_blocks * G, split_k);
+    switch (bits) {
+        case 2: exl3_batched_group_mma_m16_mul1_k<2><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
+        case 3: exl3_batched_group_mma_m16_mul1_k<3><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
+        case 4: exl3_batched_group_mma_m16_mul1_k<4><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
+        case 5: exl3_batched_group_mma_m16_mul1_k<5><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
+        case 6: exl3_batched_group_mma_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
+        case 8: exl3_batched_group_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
+    }
+    dim3 post_grid(n_blocks, M * G);
+    batched_group_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh_ptrs, y_out, G, N, wht_scale);
+}
+
 void rad_cuda_exl3_mma_f16(
     const half* x_rot,
     const uint16_t* trellis,
@@ -783,7 +974,7 @@ void rad_cuda_exl3_mma_f16(
     int use_m64 = (M >= 32);
     int m_blocks = use_m64 ? ((M + 63) / 64) : ((M + 15) / 16);
     int total_mn = n_blocks * m_blocks;
-    int target_ctas = 192;
+    int target_ctas = (M >= 64) ? 96 : 192;
     int split_k = (target_ctas + total_mn - 1) / total_mn;
     int max_sk = K / 128;
     if (split_k > max_sk) split_k = max_sk;

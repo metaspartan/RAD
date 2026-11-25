@@ -14,7 +14,8 @@ use crate::mtp::{ngram_draft, DsparkMtp};
 use crate::safetensors::SafetensorsIndex;
 use crate::weights::{load_raw_buf_replicated, CompressorWeights, Exl3Linear, LayerWeights};
 
-pub const MAX_BATCH: usize = 128;
+pub const MAX_BATCH: usize = 512;
+pub const MAX_DECODE_BATCH: usize = 128;
 
 pub struct KvCacheLayer {
     pub k_cache: CudaBuf,
@@ -56,8 +57,6 @@ pub struct Dsv41Engine {
     pub d_kv: CudaBuf,
     pub d_kv_normed: CudaBuf,
     pub d_attn_out: CudaBuf,
-    pub d_wo_grp_in: CudaBuf,
-    pub d_wo_grp_out: CudaBuf,
     pub d_wo_mid: CudaBuf,
     pub d_branch_out: CudaBuf,
     pub d_h_coeff: CudaBuf,
@@ -195,9 +194,8 @@ impl Dsv41Engine {
         comm.set_nodelay(true);
         let n_heads_local = tc.num_attention_heads / world;
         let groups_local = tc.o_groups / world;
-        let heads_per_grp = tc.num_attention_heads / tc.o_groups;
         let vocab_local = tc.vocab_size / world;
-        let max_head_m = MAX_BATCH;
+        let max_head_m = MAX_DECODE_BATCH;
         let z_elems = (MAX_BATCH * n_heads_local * tc.head_dim)
             .max(MAX_BATCH * tc.num_experts_per_tok * d)
             .max(max_head_m * vocab_local);
@@ -230,8 +228,6 @@ impl Dsv41Engine {
             d_kv: CudaBuf::new(MAX_BATCH * tc.head_dim * 2).map_err(CudaFail)?,
             d_kv_normed: CudaBuf::new(MAX_BATCH * tc.head_dim * 2).map_err(CudaFail)?,
             d_attn_out: CudaBuf::new(MAX_BATCH * n_heads_local * tc.head_dim * 2).map_err(CudaFail)?,
-            d_wo_grp_in: CudaBuf::new(MAX_BATCH * heads_per_grp * tc.head_dim * 2).map_err(CudaFail)?,
-            d_wo_grp_out: CudaBuf::new(MAX_BATCH * tc.o_lora_rank * 2).map_err(CudaFail)?,
             d_wo_mid: CudaBuf::new(MAX_BATCH * groups_local * tc.o_lora_rank * 2).map_err(CudaFail)?,
             d_branch_out: CudaBuf::new(MAX_BATCH * d * 2).map_err(CudaFail)?,
             d_h_coeff: CudaBuf::new(MAX_BATCH * 24 * 4).map_err(CudaFail)?,
@@ -337,40 +333,24 @@ impl Dsv41Engine {
     unsafe fn enqueue_wo_proj(&self, l: usize, m: usize, branch_dst: *mut c_void, stream: CudaStream) {
         let tc = &self.cfg.text_config;
         let mi = m as i32;
-        let n_heads_local = tc.num_attention_heads / self.world;
-        let groups_local = tc.o_groups / self.world;
-        let heads_per_grp = tc.num_attention_heads / tc.o_groups;
+        let groups_local = (tc.o_groups / self.world) as i32;
         let lw = &self.layers[l];
-        if m == 1 {
-            for (gi, wo_slice) in lw.wo_a_slices.iter().enumerate() {
-                let x_ptr = (self.d_attn_out.ptr as *const u8).add(gi * heads_per_grp * tc.head_dim * 2) as *const c_void;
-                let y_ptr = (self.d_wo_mid.ptr as *mut u8).add(gi * tc.o_lora_rank * 2) as *mut c_void;
-                self.exl3_proj(x_ptr, wo_slice, y_ptr, 1, 0, stream);
-            }
-        } else {
-            for (gi, wo_slice) in lw.wo_a_slices.iter().enumerate() {
-                cuda_ops::rad_cuda_wo_a_gather_group_f16(
-                    self.d_attn_out.ptr,
-                    self.d_wo_grp_in.ptr,
-                    mi,
-                    n_heads_local as i32,
-                    heads_per_grp as i32,
-                    tc.head_dim as i32,
-                    gi as i32,
-                    stream,
-                );
-                self.exl3_proj(self.d_wo_grp_in.ptr, wo_slice, self.d_wo_grp_out.ptr, mi, 0, stream);
-                cuda_ops::rad_cuda_wo_a_scatter_group_f16(
-                    self.d_wo_grp_out.ptr,
-                    self.d_wo_mid.ptr,
-                    mi,
-                    groups_local as i32,
-                    tc.o_lora_rank as i32,
-                    gi as i32,
-                    stream,
-                );
-            }
-        }
+        let s0 = &lw.wo_a_slices[0];
+        cuda_ops::rad_cuda_exl3_batched_group_mma_f16(
+            self.d_attn_out.ptr,
+            lw.d_wo_a_trel.ptr as *const *const c_void,
+            lw.d_wo_a_suh.ptr as *const *const c_void,
+            lw.d_wo_a_svh.ptr as *const *const c_void,
+            self.d_z_scratch.ptr,
+            self.d_wo_mid.ptr,
+            mi,
+            groups_local,
+            s0.k as i32,
+            s0.n as i32,
+            s0.bits as i32,
+            self.wht_scale,
+            stream,
+        );
         self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, branch_dst, mi, 0, stream);
     }
 
@@ -608,7 +588,7 @@ impl Dsv41Engine {
                     );
                 }
             }
-            let use_graph = (m == 1 || m == 6 || m == 64 || m == 128) && comm.rdma_ptrs().is_some();
+            let use_graph = (m == 1 || m == 6 || m == 64 || m == 128 || m == 512) && comm.rdma_ptrs().is_some();
             if use_graph {
                 let gkey = (l, m);
                 if !self.qkv_graphs.contains_key(&gkey) {
@@ -856,7 +836,6 @@ impl Dsv41Engine {
         let tc = self.cfg.text_config.clone();
         let d = tc.hidden_size;
         let n_heads_local = tc.num_attention_heads / self.world;
-        let heads_per_grp = tc.num_attention_heads / tc.o_groups;
         let stream: CudaStream = std::ptr::null_mut();
         let start_pos = self.pos as i32;
         let attn_scale = 1.0f32 / (tc.head_dim as f32).sqrt();
@@ -903,12 +882,7 @@ impl Dsv41Engine {
 
         let t3 = std::time::Instant::now();
         unsafe {
-            for (gi, wo_slice) in lw.wo_a_slices.iter().enumerate() {
-                let x_ptr = (self.d_attn_out.ptr as *const u8).add(gi * heads_per_grp * tc.head_dim * 2) as *const c_void;
-                let y_ptr = (self.d_wo_mid.ptr as *mut u8).add(gi * tc.o_lora_rank * 2) as *mut c_void;
-                self.exl3_proj(x_ptr, wo_slice, y_ptr, 1, 0, stream);
-            }
-            self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, branch_dst, 1, 0, stream);
+            self.enqueue_wo_proj(0, 1, branch_dst, stream);
         }
         let _ = sync_t();
         let t_wo = t3.elapsed().as_secs_f64() * 1e6;
@@ -1003,7 +977,6 @@ impl Dsv41Engine {
         let mi = blk as i32;
         let n_heads_local = tc.num_attention_heads / self.world;
         let groups_local = tc.o_groups / self.world;
-        let heads_per_grp = tc.num_attention_heads / tc.o_groups;
         let stream: CudaStream = std::ptr::null_mut();
         let attn_scale = 1.0f32 / (tc.head_dim as f32).sqrt();
         let branch_dst = comm.rdma_ptrs().map(|(s, _)| s).unwrap_or(self.d_branch_out.ptr);
@@ -1064,11 +1037,22 @@ impl Dsv41Engine {
                     let g = unsafe {
                         CudaCapturedGraph::capture(|gs| {
                             let lw = &mtp.layers[l];
-                            for (gi, wo_slice) in lw.wo_a_slices.iter().enumerate() {
-                                cuda_ops::rad_cuda_wo_a_gather_group_f16(self.d_attn_out.ptr, self.d_wo_grp_in.ptr, mi, n_heads_local as i32, heads_per_grp as i32, tc.head_dim as i32, gi as i32, gs);
-                                self.exl3_proj(self.d_wo_grp_in.ptr, wo_slice, self.d_wo_grp_out.ptr, mi, 0, gs);
-                                cuda_ops::rad_cuda_wo_a_scatter_group_f16(self.d_wo_grp_out.ptr, self.d_wo_mid.ptr, mi, groups_local as i32, tc.o_lora_rank as i32, gi as i32, gs);
-                            }
+                            let s0 = &lw.wo_a_slices[0];
+                            cuda_ops::rad_cuda_exl3_batched_group_mma_f16(
+                                self.d_attn_out.ptr,
+                                lw.d_wo_a_trel.ptr as *const *const c_void,
+                                lw.d_wo_a_suh.ptr as *const *const c_void,
+                                lw.d_wo_a_svh.ptr as *const *const c_void,
+                                self.d_z_scratch.ptr,
+                                self.d_wo_mid.ptr,
+                                mi,
+                                groups_local as i32,
+                                s0.k as i32,
+                                s0.n as i32,
+                                s0.bits as i32,
+                                self.wht_scale,
+                                gs,
+                            );
                             self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, branch_dst, mi, 0, gs);
                         })
                     }
@@ -1079,11 +1063,22 @@ impl Dsv41Engine {
             } else {
                 unsafe {
                     let lw = &mtp.layers[l];
-                    for (gi, wo_slice) in lw.wo_a_slices.iter().enumerate() {
-                        cuda_ops::rad_cuda_wo_a_gather_group_f16(self.d_attn_out.ptr, self.d_wo_grp_in.ptr, mi, n_heads_local as i32, heads_per_grp as i32, tc.head_dim as i32, gi as i32, stream);
-                        self.exl3_proj(self.d_wo_grp_in.ptr, wo_slice, self.d_wo_grp_out.ptr, mi, 0, stream);
-                        cuda_ops::rad_cuda_wo_a_scatter_group_f16(self.d_wo_grp_out.ptr, self.d_wo_mid.ptr, mi, groups_local as i32, tc.o_lora_rank as i32, gi as i32, stream);
-                    }
+                    let s0 = &lw.wo_a_slices[0];
+                    cuda_ops::rad_cuda_exl3_batched_group_mma_f16(
+                        self.d_attn_out.ptr,
+                        lw.d_wo_a_trel.ptr as *const *const c_void,
+                        lw.d_wo_a_suh.ptr as *const *const c_void,
+                        lw.d_wo_a_svh.ptr as *const *const c_void,
+                        self.d_z_scratch.ptr,
+                        self.d_wo_mid.ptr,
+                        mi,
+                        groups_local as i32,
+                        s0.k as i32,
+                        s0.n as i32,
+                        s0.bits as i32,
+                        self.wht_scale,
+                        stream,
+                    );
                     self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, branch_dst, mi, 0, stream);
                 }
             }
@@ -1196,7 +1191,7 @@ impl Dsv41Engine {
     pub fn step_speculative(&mut self, history: &[i32], anchor: i32, comm: &mut Tp2Comm) -> Result<Vec<i32>> {
         static TRACE_SPEC: OnceLock<bool> = OnceLock::new();
         let trace = *TRACE_SPEC.get_or_init(|| std::env::var("RAD_TRACE_SPEC").map(|v| v == "1").unwrap_or(false));
-        let max_k = MAX_BATCH.min(self.max_ctx.saturating_sub(self.pos + 1));
+        let max_k = MAX_DECODE_BATCH.min(self.max_ctx.saturating_sub(self.pos + 1));
         let t_draft = Instant::now();
         let (mut draft, mode) = if max_k >= 4 {
             if let Some(ng) = ngram_draft(history, anchor, max_k) {

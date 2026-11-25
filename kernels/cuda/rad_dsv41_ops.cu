@@ -323,12 +323,58 @@ __global__ void mqa_attn_sink_causal_f16_k(
     __shared__ float wsum[8];
 
     if (head_dim == 512) {
+        __shared__ float wsum4[4][8];
         const half2* qh2 = reinterpret_cast<const half2*>(q + ((size_t)mr * n_heads + h) * 512);
         float2 qv = __half22float2(__ldg(qh2 + t));
         float a0 = 0.0f;
         float a1 = 0.0f;
         bool same_kv = (k_cache == v_cache);
-        for (int p = p_start; p < seq_len; ++p) {
+        int p = p_start;
+        for (; p + 3 < seq_len; p += 4) {
+            float2 kv0 = __half22float2(__ldg(reinterpret_cast<const half2*>(k_cache + (size_t)(p + 0) * 512) + t));
+            float2 kv1 = __half22float2(__ldg(reinterpret_cast<const half2*>(k_cache + (size_t)(p + 1) * 512) + t));
+            float2 kv2 = __half22float2(__ldg(reinterpret_cast<const half2*>(k_cache + (size_t)(p + 2) * 512) + t));
+            float2 kv3 = __half22float2(__ldg(reinterpret_cast<const half2*>(k_cache + (size_t)(p + 3) * 512) + t));
+            float d0 = fmaf(qv.x, kv0.x, qv.y * kv0.y);
+            float d1 = fmaf(qv.x, kv1.x, qv.y * kv1.y);
+            float d2 = fmaf(qv.x, kv2.x, qv.y * kv2.y);
+            float d3 = fmaf(qv.x, kv3.x, qv.y * kv3.y);
+            for (int m = 16; m > 0; m >>= 1) {
+                d0 += __shfl_xor_sync(0xFFFFFFFFu, d0, m);
+                d1 += __shfl_xor_sync(0xFFFFFFFFu, d1, m);
+                d2 += __shfl_xor_sync(0xFFFFFFFFu, d2, m);
+                d3 += __shfl_xor_sync(0xFFFFFFFFu, d3, m);
+            }
+            if (lane == 0) {
+                wsum4[0][warp] = d0;
+                wsum4[1][warp] = d1;
+                wsum4[2][warp] = d2;
+                wsum4[3][warp] = d3;
+            }
+            __syncthreads();
+            if (warp < 4) {
+                float v = (lane < 8) ? wsum4[warp][lane] : 0.0f;
+                for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+                if (lane == 0) wsum4[warp][0] = v * scale;
+            }
+            __syncthreads();
+            float s0 = wsum4[0][0], s1 = wsum4[1][0], s2 = wsum4[2][0], s3 = wsum4[3][0];
+            float new_max = fmaxf(m_max, fmaxf(fmaxf(s0, s1), fmaxf(s2, s3)));
+            float alpha = expf(m_max - new_max);
+            float b0 = expf(s0 - new_max);
+            float b1 = expf(s1 - new_max);
+            float b2 = expf(s2 - new_max);
+            float b3 = expf(s3 - new_max);
+            l_sum = l_sum * alpha + b0 + b1 + b2 + b3;
+            m_max = new_max;
+            float2 v0 = same_kv ? kv0 : __half22float2(__ldg(reinterpret_cast<const half2*>(v_cache + (size_t)(p + 0) * 512) + t));
+            float2 v1 = same_kv ? kv1 : __half22float2(__ldg(reinterpret_cast<const half2*>(v_cache + (size_t)(p + 1) * 512) + t));
+            float2 v2 = same_kv ? kv2 : __half22float2(__ldg(reinterpret_cast<const half2*>(v_cache + (size_t)(p + 2) * 512) + t));
+            float2 v3 = same_kv ? kv3 : __half22float2(__ldg(reinterpret_cast<const half2*>(v_cache + (size_t)(p + 3) * 512) + t));
+            a0 = a0 * alpha + b0 * v0.x + b1 * v1.x + b2 * v2.x + b3 * v3.x;
+            a1 = a1 * alpha + b0 * v0.y + b1 * v1.y + b2 * v2.y + b3 * v3.y;
+        }
+        for (; p < seq_len; ++p) {
             const half2* kp2 = reinterpret_cast<const half2*>(k_cache + (size_t)p * 512);
             float2 kv = __half22float2(__ldg(kp2 + t));
             float dot = fmaf(qv.x, kv.x, qv.y * kv.y);
@@ -353,7 +399,48 @@ __global__ void mqa_attn_sink_causal_f16_k(
         }
         if (comp_kv && comp_ratio > 0) {
             int n_comp = seq_len / comp_ratio;
-            for (int c = 0; c < n_comp; ++c) {
+            int c = 0;
+            for (; c + 3 < n_comp; c += 4) {
+                float2 kv0 = __half22float2(__ldg(reinterpret_cast<const half2*>(comp_kv + (size_t)(c + 0) * 512) + t));
+                float2 kv1 = __half22float2(__ldg(reinterpret_cast<const half2*>(comp_kv + (size_t)(c + 1) * 512) + t));
+                float2 kv2 = __half22float2(__ldg(reinterpret_cast<const half2*>(comp_kv + (size_t)(c + 2) * 512) + t));
+                float2 kv3 = __half22float2(__ldg(reinterpret_cast<const half2*>(comp_kv + (size_t)(c + 3) * 512) + t));
+                float d0 = fmaf(qv.x, kv0.x, qv.y * kv0.y);
+                float d1 = fmaf(qv.x, kv1.x, qv.y * kv1.y);
+                float d2 = fmaf(qv.x, kv2.x, qv.y * kv2.y);
+                float d3 = fmaf(qv.x, kv3.x, qv.y * kv3.y);
+                for (int m = 16; m > 0; m >>= 1) {
+                    d0 += __shfl_xor_sync(0xFFFFFFFFu, d0, m);
+                    d1 += __shfl_xor_sync(0xFFFFFFFFu, d1, m);
+                    d2 += __shfl_xor_sync(0xFFFFFFFFu, d2, m);
+                    d3 += __shfl_xor_sync(0xFFFFFFFFu, d3, m);
+                }
+                if (lane == 0) {
+                    wsum4[0][warp] = d0;
+                    wsum4[1][warp] = d1;
+                    wsum4[2][warp] = d2;
+                    wsum4[3][warp] = d3;
+                }
+                __syncthreads();
+                if (warp < 4) {
+                    float v = (lane < 8) ? wsum4[warp][lane] : 0.0f;
+                    for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+                    if (lane == 0) wsum4[warp][0] = v * scale;
+                }
+                __syncthreads();
+                float s0 = wsum4[0][0], s1 = wsum4[1][0], s2 = wsum4[2][0], s3 = wsum4[3][0];
+                float new_max = fmaxf(m_max, fmaxf(fmaxf(s0, s1), fmaxf(s2, s3)));
+                float alpha = expf(m_max - new_max);
+                float b0 = expf(s0 - new_max);
+                float b1 = expf(s1 - new_max);
+                float b2 = expf(s2 - new_max);
+                float b3 = expf(s3 - new_max);
+                l_sum = l_sum * alpha + b0 + b1 + b2 + b3;
+                m_max = new_max;
+                a0 = a0 * alpha + b0 * kv0.x + b1 * kv1.x + b2 * kv2.x + b3 * kv3.x;
+                a1 = a1 * alpha + b0 * kv0.y + b1 * kv1.y + b2 * kv2.y + b3 * kv3.y;
+            }
+            for (; c < n_comp; ++c) {
                 const half2* ck2 = reinterpret_cast<const half2*>(comp_kv + (size_t)c * 512);
                 float2 kv = __half22float2(__ldg(ck2 + t));
                 float dot = fmaf(qv.x, kv.x, qv.y * kv.y);
@@ -535,6 +622,303 @@ __global__ void wo_a_scatter_group_f16_k(
     }
 }
 
+template <int HB>
+__global__ void mqa_attn_sink_causal_mh_f16_k(
+    const half* __restrict__ q,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    const half* __restrict__ comp_kv,
+    const float* __restrict__ attn_sink,
+    half* __restrict__ out,
+    int n_heads,
+    int start_pos,
+    int max_ctx,
+    int sliding_window,
+    int comp_ratio,
+    float scale
+) {
+    int h0 = blockIdx.x * HB;
+    int mr = blockIdx.y;
+    int t = threadIdx.x;
+    int lane = t & 31;
+    int warp = t >> 5;
+    int seq_len = start_pos + mr + 1;
+    if (seq_len > max_ctx) seq_len = max_ctx;
+    int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
+
+    float qx[HB], qy[HB], ax[HB], ay[HB], m_max[HB], l_sum[HB];
+    #pragma unroll
+    for (int j = 0; j < HB; ++j) {
+        const half2* qh2 = reinterpret_cast<const half2*>(q + ((size_t)mr * n_heads + h0 + j) * 512);
+        float2 qv = __half22float2(__ldg(qh2 + t));
+        qx[j] = qv.x;
+        qy[j] = qv.y;
+        ax[j] = 0.0f;
+        ay[j] = 0.0f;
+        m_max[j] = attn_sink ? attn_sink[h0 + j] : -1e30f;
+        l_sum[j] = attn_sink ? 1.0f : 0.0f;
+    }
+
+    __shared__ float wsum[HB][8];
+    __shared__ float s_score[HB];
+    bool same_kv = (k_cache == v_cache);
+
+    for (int p = p_start; p < seq_len; ++p) {
+        float2 kv = __half22float2(__ldg(reinterpret_cast<const half2*>(k_cache + (size_t)p * 512) + t));
+        #pragma unroll
+        for (int j = 0; j < HB; ++j) {
+            float d = fmaf(qx[j], kv.x, qy[j] * kv.y);
+            for (int m = 16; m > 0; m >>= 1) d += __shfl_xor_sync(0xFFFFFFFFu, d, m);
+            if (lane == 0) wsum[j][warp] = d;
+        }
+        __syncthreads();
+        if (warp < HB) {
+            float v = (lane < 8) ? wsum[warp][lane] : 0.0f;
+            for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+            if (lane == 0) s_score[warp] = v * scale;
+        }
+        __syncthreads();
+        float2 vv = same_kv ? kv : __half22float2(__ldg(reinterpret_cast<const half2*>(v_cache + (size_t)p * 512) + t));
+        #pragma unroll
+        for (int j = 0; j < HB; ++j) {
+            float score = s_score[j];
+            float nm = fmaxf(m_max[j], score);
+            float alpha = expf(m_max[j] - nm);
+            float beta = expf(score - nm);
+            l_sum[j] = l_sum[j] * alpha + beta;
+            m_max[j] = nm;
+            ax[j] = fmaf(ax[j], alpha, beta * vv.x);
+            ay[j] = fmaf(ay[j], alpha, beta * vv.y);
+        }
+    }
+
+    if (comp_kv && comp_ratio > 0) {
+        int n_comp = seq_len / comp_ratio;
+        for (int c = 0; c < n_comp; ++c) {
+            float2 kv = __half22float2(__ldg(reinterpret_cast<const half2*>(comp_kv + (size_t)c * 512) + t));
+            #pragma unroll
+            for (int j = 0; j < HB; ++j) {
+                float d = fmaf(qx[j], kv.x, qy[j] * kv.y);
+                for (int m = 16; m > 0; m >>= 1) d += __shfl_xor_sync(0xFFFFFFFFu, d, m);
+                if (lane == 0) wsum[j][warp] = d;
+            }
+            __syncthreads();
+            if (warp < HB) {
+                float v = (lane < 8) ? wsum[warp][lane] : 0.0f;
+                for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+                if (lane == 0) s_score[warp] = v * scale;
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int j = 0; j < HB; ++j) {
+                float score = s_score[j];
+                float nm = fmaxf(m_max[j], score);
+                float alpha = expf(m_max[j] - nm);
+                float beta = expf(score - nm);
+                l_sum[j] = l_sum[j] * alpha + beta;
+                m_max[j] = nm;
+                ax[j] = fmaf(ax[j], alpha, beta * kv.x);
+                ay[j] = fmaf(ay[j], alpha, beta * kv.y);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < HB; ++j) {
+        float inv = 1.0f / fmaxf(l_sum[j], 1e-20f);
+        half2* oh2 = reinterpret_cast<half2*>(out + ((size_t)mr * n_heads + h0 + j) * 512);
+        oh2[t] = __float22half2_rn(make_float2(ax[j] * inv, ay[j] * inv));
+    }
+}
+
+__device__ __forceinline__ void mqa_mma_m16n8k16_f32(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)
+    );
+}
+
+__global__ __launch_bounds__(256)
+void mqa_flash_mma16_f16_k(
+    const half* __restrict__ q,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ comp_kv,
+    const float* __restrict__ attn_sink,
+    half* __restrict__ out,
+    int n_heads,
+    int start_pos,
+    int max_ctx,
+    int sliding_window,
+    int comp_ratio,
+    float scale
+) {
+    int h0 = blockIdx.x * 16;
+    int mr = blockIdx.y;
+    int t = threadIdx.x;
+    int warp = t >> 5;
+    int lane = t & 31;
+    int group_id = lane >> 2;
+    int tid = lane & 3;
+
+    int seq_len = start_pos + mr + 1;
+    if (seq_len > max_ctx) seq_len = max_ctx;
+    int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
+
+    __shared__ half s_q[16][512];
+    __shared__ half s_kv[16][512];
+    __shared__ float s_sp[8][16][16];
+    __shared__ half s_p[16][16];
+    __shared__ float s_m[16];
+    __shared__ float s_l[16];
+    __shared__ float s_alpha[16];
+
+    const uint4* q_u4 = reinterpret_cast<const uint4*>(q + ((size_t)mr * n_heads + h0) * 512);
+    uint4* sq_u4 = reinterpret_cast<uint4*>(&s_q[0][0]);
+    for (int i = t; i < 1024; i += 256) {
+        sq_u4[i] = __ldg(q_u4 + i);
+    }
+    if (t < 16) {
+        s_m[t] = attn_sink ? attn_sink[h0 + t] : -1e30f;
+        s_l[t] = attn_sink ? 1.0f : 0.0f;
+    }
+    __syncthreads();
+
+    float o0[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float o1[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float o2[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float o3[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    auto process_tile = [&](int tile_len) {
+        float s00 = 0.0f, s01 = 0.0f, s02 = 0.0f, s03 = 0.0f;
+        float s10 = 0.0f, s11 = 0.0f, s12 = 0.0f, s13 = 0.0f;
+        int k_base = warp * 64;
+        #pragma unroll
+        for (int ks = 0; ks < 64; ks += 16) {
+            int ko0 = k_base + ks + tid * 2;
+            int ko1 = ko0 + 8;
+            uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][ko0]);
+            uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][ko0]);
+            uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][ko1]);
+            uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][ko1]);
+            uint32_t b00 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id][ko0]);
+            uint32_t b01 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id][ko1]);
+            uint32_t b10 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id + 8][ko0]);
+            uint32_t b11 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id + 8][ko1]);
+            mqa_mma_m16n8k16_f32(s00, s01, s02, s03, a0, a1, a2, a3, b00, b01);
+            mqa_mma_m16n8k16_f32(s10, s11, s12, s13, a0, a1, a2, a3, b10, b11);
+        }
+        s_sp[warp][group_id][tid * 2] = s00;
+        s_sp[warp][group_id][tid * 2 + 1] = s01;
+        s_sp[warp][group_id + 8][tid * 2] = s02;
+        s_sp[warp][group_id + 8][tid * 2 + 1] = s03;
+        s_sp[warp][group_id][8 + tid * 2] = s10;
+        s_sp[warp][group_id][8 + tid * 2 + 1] = s11;
+        s_sp[warp][group_id + 8][8 + tid * 2] = s12;
+        s_sp[warp][group_id + 8][8 + tid * 2 + 1] = s13;
+        __syncthreads();
+
+        int r = t >> 4;
+        int c = t & 15;
+        float sc = -1e30f;
+        if (c < tile_len) {
+            float sum = s_sp[0][r][c] + s_sp[1][r][c] + s_sp[2][r][c] + s_sp[3][r][c]
+                      + s_sp[4][r][c] + s_sp[5][r][c] + s_sp[6][r][c] + s_sp[7][r][c];
+            sc = sum * scale;
+        }
+        float rmax = sc;
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 8));
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 4));
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 2));
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 1));
+        float old_m = s_m[r];
+        float new_m = fmaxf(old_m, rmax);
+        float alpha = expf(old_m - new_m);
+        float p = (c < tile_len) ? expf(sc - new_m) : 0.0f;
+        s_p[r][c] = __float2half(p);
+        float rsum = p;
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 8);
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 4);
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 2);
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 1);
+        if (c == 0) {
+            s_l[r] = s_l[r] * alpha + rsum;
+            s_m[r] = new_m;
+            s_alpha[r] = alpha;
+        }
+        __syncthreads();
+
+        float a0_sc = s_alpha[group_id];
+        float a1_sc = s_alpha[group_id + 8];
+        uint32_t pa0 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2]);
+        uint32_t pa1 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2]);
+        uint32_t pa2 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2 + 8]);
+        uint32_t pa3 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2 + 8]);
+        int col_w = warp * 64;
+        #pragma unroll
+        for (int nb = 0; nb < 8; ++nb) {
+            o0[nb] *= a0_sc;
+            o1[nb] *= a0_sc;
+            o2[nb] *= a1_sc;
+            o3[nb] *= a1_sc;
+            int col = col_w + nb * 8 + group_id;
+            half2 vb0 = __halves2half2(s_kv[tid * 2][col], s_kv[tid * 2 + 1][col]);
+            half2 vb1 = __halves2half2(s_kv[tid * 2 + 8][col], s_kv[tid * 2 + 9][col]);
+            uint32_t b0 = *reinterpret_cast<uint32_t*>(&vb0);
+            uint32_t b1 = *reinterpret_cast<uint32_t*>(&vb1);
+            mqa_mma_m16n8k16_f32(o0[nb], o1[nb], o2[nb], o3[nb], pa0, pa1, pa2, pa3, b0, b1);
+        }
+        __syncthreads();
+    };
+
+    uint4* skv_u4 = reinterpret_cast<uint4*>(&s_kv[0][0]);
+    for (int p0 = p_start; p0 < seq_len; p0 += 16) {
+        int tile_len = seq_len - p0;
+        if (tile_len > 16) tile_len = 16;
+        int n_u4 = tile_len * 64;
+        const uint4* src_u4 = reinterpret_cast<const uint4*>(k_cache + (size_t)p0 * 512);
+        for (int i = t; i < 1024; i += 256) {
+            skv_u4[i] = (i < n_u4) ? __ldg(src_u4 + i) : make_uint4(0u, 0u, 0u, 0u);
+        }
+        __syncthreads();
+        process_tile(tile_len);
+    }
+
+    if (comp_kv && comp_ratio > 0 && p_start > 0) {
+        int c_end = p_start / comp_ratio;
+        for (int c0 = 0; c0 < c_end; c0 += 16) {
+            int tile_len = c_end - c0;
+            if (tile_len > 16) tile_len = 16;
+            int n_u4 = tile_len * 64;
+            const uint4* src_u4 = reinterpret_cast<const uint4*>(comp_kv + (size_t)c0 * 512);
+            for (int i = t; i < 1024; i += 256) {
+                skv_u4[i] = (i < n_u4) ? __ldg(src_u4 + i) : make_uint4(0u, 0u, 0u, 0u);
+            }
+            __syncthreads();
+            process_tile(tile_len);
+        }
+    }
+
+    int col_w = warp * 64;
+    float inv0 = 1.0f / fmaxf(s_l[group_id], 1e-20f);
+    float inv1 = 1.0f / fmaxf(s_l[group_id + 8], 1e-20f);
+    half* oh0 = out + ((size_t)mr * n_heads + h0 + group_id) * 512 + col_w;
+    half* oh1 = out + ((size_t)mr * n_heads + h0 + group_id + 8) * 512 + col_w;
+    #pragma unroll
+    for (int nb = 0; nb < 8; ++nb) {
+        int c0 = nb * 8 + tid * 2;
+        oh0[c0] = __float2half(o0[nb] * inv0);
+        oh0[c0 + 1] = __float2half(o1[nb] * inv0);
+        oh1[c0] = __float2half(o2[nb] * inv1);
+        oh1[c0 + 1] = __float2half(o3[nb] * inv1);
+    }
+}
+
 extern "C" {
 
 void rad_cuda_rms_norm_bf16w_f16(
@@ -698,6 +1082,27 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     float scale,
     cudaStream_t stream
 ) {
+    if (head_dim == 512 && k_cache == v_cache && (n_heads % 16) == 0 && M >= 16) {
+        dim3 grid(n_heads / 16, M);
+        mqa_flash_mma16_f16_k<<<grid, 256, 0, stream>>>(
+            q, k_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
+        );
+        return;
+    }
+    if (head_dim == 512 && M >= 16 && (n_heads % 8) == 0) {
+        dim3 grid(n_heads / 8, M);
+        mqa_attn_sink_causal_mh_f16_k<8><<<grid, 256, 0, stream>>>(
+            q, k_cache, v_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
+        );
+        return;
+    }
+    if (head_dim == 512 && M >= 2 && (n_heads % 4) == 0) {
+        dim3 grid(n_heads / 4, M);
+        mqa_attn_sink_causal_mh_f16_k<4><<<grid, 256, 0, stream>>>(
+            q, k_cache, v_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
+        );
+        return;
+    }
     size_t smem = (head_dim == 512) ? 0 : (size_t)head_dim * 2 * sizeof(float);
     dim3 grid(n_heads, M);
     mqa_attn_sink_causal_f16_k<<<grid, 256, smem, stream>>>(
