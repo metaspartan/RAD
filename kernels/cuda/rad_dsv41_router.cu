@@ -124,19 +124,16 @@ __global__ void mhc_coeff_proj_k(
     int mr = blockIdx.y;
     if (c >= 24) return;
     int t = threadIdx.x;
-    const float* sr = streams + (size_t)mr * D4;
-    int D = D4 >> 2;
+    const float4* sr4 = reinterpret_cast<const float4*>(streams + (size_t)mr * D4);
     const float4* row4 = reinterpret_cast<const float4*>(hc_fn + (size_t)c * D4);
+    int d4_vec = D4 >> 2;
     float dot = 0.0f;
     float ss = 0.0f;
-    for (int i = t; i < D; i += blockDim.x) {
-        float x0 = sr[0 * D + i];
-        float x1 = sr[1 * D + i];
-        float x2 = sr[2 * D + i];
-        float x3 = sr[3 * D + i];
+    for (int i = t; i < d4_vec; i += blockDim.x) {
+        float4 x = sr4[i];
         float4 w = row4[i];
-        ss = fmaf(x0, x0, fmaf(x1, x1, fmaf(x2, x2, fmaf(x3, x3, ss))));
-        dot = fmaf(x0, w.x, fmaf(x1, w.y, fmaf(x2, w.z, fmaf(x3, w.w, dot))));
+        ss = fmaf(x.x, x.x, fmaf(x.y, x.y, fmaf(x.z, x.z, fmaf(x.w, x.w, ss))));
+        dot = fmaf(x.x, w.x, fmaf(x.y, w.y, fmaf(x.z, w.z, fmaf(x.w, w.w, dot))));
     }
     int lane = t & 31;
     int warp = t >> 5;
