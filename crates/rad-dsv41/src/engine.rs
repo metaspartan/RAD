@@ -305,14 +305,16 @@ impl Dsv41Engine {
                     let tk = tc.num_experts_per_tok as i32;
                     let inter = tc.moe_intermediate_size as i32;
                     let bits = lw.experts[0].w1.bits as i32;
-                    cuda_ops::rad_cuda_exl3_moe_gemv_f16(
+                    cuda_ops::rad_cuda_exl3_moe_mma_f16(
                         self.d_normed.ptr,
                         lw.d_w1_trel.ptr as *const *const c_void,
                         lw.d_w1_suh.ptr as *const *const c_void,
                         lw.d_w1_svh.ptr as *const *const c_void,
                         self.d_topk_ids.ptr as *const i32,
+                        self.d_z_scratch.ptr,
                         self.d_moe_gate.ptr,
                         tk,
+                        1,
                         d as i32,
                         inter,
                         bits,
@@ -320,14 +322,16 @@ impl Dsv41Engine {
                         0,
                         stream,
                     );
-                    cuda_ops::rad_cuda_exl3_moe_gemv_f16(
+                    cuda_ops::rad_cuda_exl3_moe_mma_f16(
                         self.d_normed.ptr,
                         lw.d_w3_trel.ptr as *const *const c_void,
                         lw.d_w3_suh.ptr as *const *const c_void,
                         lw.d_w3_svh.ptr as *const *const c_void,
                         self.d_topk_ids.ptr as *const i32,
+                        self.d_z_scratch.ptr,
                         self.d_moe_up.ptr,
                         tk,
+                        1,
                         d as i32,
                         inter,
                         bits,
@@ -343,14 +347,16 @@ impl Dsv41Engine {
                         tc.swiglu_limit,
                         stream,
                     );
-                    cuda_ops::rad_cuda_exl3_moe_gemv_f16(
+                    cuda_ops::rad_cuda_exl3_moe_mma_f16(
                         self.d_moe_act.ptr,
                         lw.d_w2_trel.ptr as *const *const c_void,
                         lw.d_w2_suh.ptr as *const *const c_void,
                         lw.d_w2_svh.ptr as *const *const c_void,
                         self.d_topk_ids.ptr as *const i32,
+                        self.d_z_scratch.ptr,
                         self.d_moe_outs.ptr,
                         tk,
+                        1,
                         inter,
                         d as i32,
                         bits,

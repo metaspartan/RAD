@@ -51,6 +51,24 @@ extern "C" {
         stream: CudaStream,
     );
 
+    pub fn rad_cuda_exl3_moe_mma_f16(
+        x_in: *const c_void,
+        trellis_ptrs: *const *const c_void,
+        suh_ptrs: *const *const c_void,
+        svh_ptrs: *const *const c_void,
+        expert_ids: *const i32,
+        z_scratch_f32: *mut c_void,
+        y_out: *mut c_void,
+        top_k: i32,
+        m: i32,
+        k: i32,
+        n: i32,
+        bits: i32,
+        wht_scale: f32,
+        x_per_expert: i32,
+        stream: CudaStream,
+    );
+
     pub fn rad_cuda_exl3_moe_gemv_f16(
         x_in: *const c_void,
         trellis_ptrs: *const *const c_void,
