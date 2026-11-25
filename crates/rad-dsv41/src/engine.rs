@@ -118,9 +118,9 @@ impl Dsv41Engine {
             d_gate_sel: CudaBuf::new(tc.n_routed_experts * 4).map_err(CudaFail)?,
             d_topk_ids: CudaBuf::new(tc.num_experts_per_tok * 4).map_err(CudaFail)?,
             d_topk_weights: CudaBuf::new(tc.num_experts_per_tok * 4).map_err(CudaFail)?,
-            d_moe_gate: CudaBuf::new(tc.moe_intermediate_size * 2).map_err(CudaFail)?,
-            d_moe_up: CudaBuf::new(tc.moe_intermediate_size * 2).map_err(CudaFail)?,
-            d_moe_act: CudaBuf::new(tc.moe_intermediate_size * 2).map_err(CudaFail)?,
+            d_moe_gate: CudaBuf::new(tc.num_experts_per_tok * tc.moe_intermediate_size * 2).map_err(CudaFail)?,
+            d_moe_up: CudaBuf::new(tc.num_experts_per_tok * tc.moe_intermediate_size * 2).map_err(CudaFail)?,
+            d_moe_act: CudaBuf::new(tc.num_experts_per_tok * tc.moe_intermediate_size * 2).map_err(CudaFail)?,
             d_moe_outs: CudaBuf::new(tc.num_experts_per_tok * d * 2).map_err(CudaFail)?,
             d_shared_g: CudaBuf::new((tc.moe_intermediate_size / world) * 2).map_err(CudaFail)?,
             d_shared_u: CudaBuf::new((tc.moe_intermediate_size / world) * 2).map_err(CudaFail)?,
@@ -300,54 +300,124 @@ impl Dsv41Engine {
                 self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, 1, 0, stream);
             }
 
-            rad_cuda::sync_device().map_err(CudaFail)?;
-            let id_bytes = unsafe { std::slice::from_raw_parts_mut(host_ids.as_mut_ptr() as *mut u8, host_ids.len() * 4) };
-            let w_bytes = unsafe { std::slice::from_raw_parts_mut(host_weights.as_mut_ptr() as *mut u8, host_weights.len() * 4) };
-            self.d_topk_ids.copy_to_host(id_bytes).map_err(CudaFail)?;
-            self.d_topk_weights.copy_to_host(w_bytes).map_err(CudaFail)?;
-
-            let exp_end = lw.expert_start + lw.experts.len();
-            let mut local_k = 0usize;
-            let mut local_weights = Vec::with_capacity(tc.num_experts_per_tok);
-            for slot in 0..tc.num_experts_per_tok {
-                let eid = host_ids[slot] as usize;
-                if eid >= lw.expert_start && eid < exp_end {
-                    let ew = &lw.experts[eid - lw.expert_start];
-                    unsafe {
-                        self.exl3_proj(self.d_normed.ptr, &ew.w1, self.d_moe_gate.ptr, 1, 0, stream);
-                        self.exl3_proj(self.d_normed.ptr, &ew.w3, self.d_moe_up.ptr, 1, 0, stream);
-                        cuda_ops::rad_cuda_clamped_swiglu_f16(
-                            self.d_moe_gate.ptr,
-                            self.d_moe_up.ptr,
-                            self.d_moe_act.ptr,
-                            tc.moe_intermediate_size as i32,
-                            tc.swiglu_limit,
-                            stream,
-                        );
-                        let out_ptr = (self.d_moe_outs.ptr as *mut u8).add(local_k * d * 2) as *mut c_void;
-                        self.exl3_proj(self.d_moe_act.ptr, &ew.w2, out_ptr, 1, 0, stream);
-                    }
-                    local_weights.push(host_weights[slot]);
-                    local_k += 1;
-                }
-            }
-            if local_k > 0 {
-                let lw_bytes = unsafe { std::slice::from_raw_parts(local_weights.as_ptr() as *const u8, local_k * 4) };
-                self.d_topk_weights.copy_from(lw_bytes, None).map_err(CudaFail)?;
+            if self.world == 1 {
                 unsafe {
+                    let tk = tc.num_experts_per_tok as i32;
+                    let inter = tc.moe_intermediate_size as i32;
+                    let bits = lw.experts[0].w1.bits as i32;
+                    cuda_ops::rad_cuda_exl3_moe_gemv_f16(
+                        self.d_normed.ptr,
+                        lw.d_w1_trel.ptr as *const *const c_void,
+                        lw.d_w1_suh.ptr as *const *const c_void,
+                        lw.d_w1_svh.ptr as *const *const c_void,
+                        self.d_topk_ids.ptr as *const i32,
+                        self.d_moe_gate.ptr,
+                        tk,
+                        d as i32,
+                        inter,
+                        bits,
+                        self.wht_scale,
+                        0,
+                        stream,
+                    );
+                    cuda_ops::rad_cuda_exl3_moe_gemv_f16(
+                        self.d_normed.ptr,
+                        lw.d_w3_trel.ptr as *const *const c_void,
+                        lw.d_w3_suh.ptr as *const *const c_void,
+                        lw.d_w3_svh.ptr as *const *const c_void,
+                        self.d_topk_ids.ptr as *const i32,
+                        self.d_moe_up.ptr,
+                        tk,
+                        d as i32,
+                        inter,
+                        bits,
+                        self.wht_scale,
+                        0,
+                        stream,
+                    );
+                    cuda_ops::rad_cuda_clamped_swiglu_f16(
+                        self.d_moe_gate.ptr,
+                        self.d_moe_up.ptr,
+                        self.d_moe_act.ptr,
+                        tk * inter,
+                        tc.swiglu_limit,
+                        stream,
+                    );
+                    cuda_ops::rad_cuda_exl3_moe_gemv_f16(
+                        self.d_moe_act.ptr,
+                        lw.d_w2_trel.ptr as *const *const c_void,
+                        lw.d_w2_suh.ptr as *const *const c_void,
+                        lw.d_w2_svh.ptr as *const *const c_void,
+                        self.d_topk_ids.ptr as *const i32,
+                        self.d_moe_outs.ptr,
+                        tk,
+                        inter,
+                        d as i32,
+                        bits,
+                        self.wht_scale,
+                        1,
+                        stream,
+                    );
                     cuda_ops::rad_cuda_moe_weighted_sum_f16(
                         self.d_moe_outs.ptr,
                         self.d_topk_weights.ptr as *const f32,
                         self.d_shared_out.ptr,
                         self.d_branch_out.ptr,
-                        local_k as i32,
+                        tk,
                         d as i32,
                         stream,
                     );
                 }
             } else {
-                unsafe {
-                    rad_cuda::cudaMemcpyAsync(self.d_branch_out.ptr, self.d_shared_out.ptr, d * 2, rad_cuda::CUDA_MEMCPY_DEVICE_TO_DEVICE, stream);
+                rad_cuda::sync_device().map_err(CudaFail)?;
+                let id_bytes = unsafe { std::slice::from_raw_parts_mut(host_ids.as_mut_ptr() as *mut u8, host_ids.len() * 4) };
+                let w_bytes = unsafe { std::slice::from_raw_parts_mut(host_weights.as_mut_ptr() as *mut u8, host_weights.len() * 4) };
+                self.d_topk_ids.copy_to_host(id_bytes).map_err(CudaFail)?;
+                self.d_topk_weights.copy_to_host(w_bytes).map_err(CudaFail)?;
+
+                let exp_end = lw.expert_start + lw.experts.len();
+                let mut local_k = 0usize;
+                let mut local_weights = Vec::with_capacity(tc.num_experts_per_tok);
+                for slot in 0..tc.num_experts_per_tok {
+                    let eid = host_ids[slot] as usize;
+                    if eid >= lw.expert_start && eid < exp_end {
+                        let ew = &lw.experts[eid - lw.expert_start];
+                        unsafe {
+                            self.exl3_proj(self.d_normed.ptr, &ew.w1, self.d_moe_gate.ptr, 1, 0, stream);
+                            self.exl3_proj(self.d_normed.ptr, &ew.w3, self.d_moe_up.ptr, 1, 0, stream);
+                            cuda_ops::rad_cuda_clamped_swiglu_f16(
+                                self.d_moe_gate.ptr,
+                                self.d_moe_up.ptr,
+                                self.d_moe_act.ptr,
+                                tc.moe_intermediate_size as i32,
+                                tc.swiglu_limit,
+                                stream,
+                            );
+                            let out_ptr = (self.d_moe_outs.ptr as *mut u8).add(local_k * d * 2) as *mut c_void;
+                            self.exl3_proj(self.d_moe_act.ptr, &ew.w2, out_ptr, 1, 0, stream);
+                        }
+                        local_weights.push(host_weights[slot]);
+                        local_k += 1;
+                    }
+                }
+                if local_k > 0 {
+                    let lw_bytes = unsafe { std::slice::from_raw_parts(local_weights.as_ptr() as *const u8, local_k * 4) };
+                    self.d_topk_weights.copy_from(lw_bytes, None).map_err(CudaFail)?;
+                    unsafe {
+                        cuda_ops::rad_cuda_moe_weighted_sum_f16(
+                            self.d_moe_outs.ptr,
+                            self.d_topk_weights.ptr as *const f32,
+                            self.d_shared_out.ptr,
+                            self.d_branch_out.ptr,
+                            local_k as i32,
+                            d as i32,
+                            stream,
+                        );
+                    }
+                } else {
+                    unsafe {
+                        rad_cuda::cudaMemcpyAsync(self.d_branch_out.ptr, self.d_shared_out.ptr, d * 2, rad_cuda::CUDA_MEMCPY_DEVICE_TO_DEVICE, stream);
+                    }
                 }
             }
 

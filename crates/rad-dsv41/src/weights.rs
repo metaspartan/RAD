@@ -145,6 +145,22 @@ pub struct LayerWeights {
     pub hc_ffn_scale: CudaBuf,
     pub experts: Vec<ExpertWeights>,
     pub expert_start: usize,
+    pub d_w1_trel: CudaBuf,
+    pub d_w1_suh: CudaBuf,
+    pub d_w1_svh: CudaBuf,
+    pub d_w2_trel: CudaBuf,
+    pub d_w2_suh: CudaBuf,
+    pub d_w2_svh: CudaBuf,
+    pub d_w3_trel: CudaBuf,
+    pub d_w3_suh: CudaBuf,
+    pub d_w3_svh: CudaBuf,
+}
+
+fn upload_ptr_table(ptrs: &[u64]) -> Result<CudaBuf> {
+    let bytes = unsafe { std::slice::from_raw_parts(ptrs.as_ptr() as *const u8, ptrs.len() * 8) };
+    let mut buf = CudaBuf::new(bytes.len()).map_err(CudaFail)?;
+    buf.copy_from(bytes, None).map_err(CudaFail)?;
+    Ok(buf)
 }
 
 impl LayerWeights {
@@ -173,6 +189,15 @@ impl LayerWeights {
                 w3: Exl3Linear::load(idx, &format!("{p}.ffn.experts.{e}.w3"))?,
             });
         }
+        let d_w1_trel = upload_ptr_table(&experts.iter().map(|e| e.w1.trellis.ptr as u64).collect::<Vec<_>>())?;
+        let d_w1_suh = upload_ptr_table(&experts.iter().map(|e| e.w1.suh.ptr as u64).collect::<Vec<_>>())?;
+        let d_w1_svh = upload_ptr_table(&experts.iter().map(|e| e.w1.svh.ptr as u64).collect::<Vec<_>>())?;
+        let d_w2_trel = upload_ptr_table(&experts.iter().map(|e| e.w2.trellis.ptr as u64).collect::<Vec<_>>())?;
+        let d_w2_suh = upload_ptr_table(&experts.iter().map(|e| e.w2.suh.ptr as u64).collect::<Vec<_>>())?;
+        let d_w2_svh = upload_ptr_table(&experts.iter().map(|e| e.w2.svh.ptr as u64).collect::<Vec<_>>())?;
+        let d_w3_trel = upload_ptr_table(&experts.iter().map(|e| e.w3.trellis.ptr as u64).collect::<Vec<_>>())?;
+        let d_w3_suh = upload_ptr_table(&experts.iter().map(|e| e.w3.suh.ptr as u64).collect::<Vec<_>>())?;
+        let d_w3_svh = upload_ptr_table(&experts.iter().map(|e| e.w3.svh.ptr as u64).collect::<Vec<_>>())?;
         Ok(Self {
             attn_norm: load_raw_buf(idx, &format!("{p}.attn_norm.weight"))?,
             ffn_norm: load_raw_buf(idx, &format!("{p}.ffn_norm.weight"))?,
@@ -197,6 +222,15 @@ impl LayerWeights {
             hc_ffn_scale: load_raw_buf(idx, &format!("{p}.hc_ffn_scale"))?,
             experts,
             expert_start,
+            d_w1_trel,
+            d_w1_suh,
+            d_w1_svh,
+            d_w2_trel,
+            d_w2_suh,
+            d_w2_svh,
+            d_w3_trel,
+            d_w3_suh,
+            d_w3_svh,
         })
     }
 }
