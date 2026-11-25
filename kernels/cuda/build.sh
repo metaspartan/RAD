@@ -9,6 +9,7 @@ OUT="${SCRIPT_DIR}/librad_cuda_ops.so"
 "${NVCC}" -O3 -arch="${ARCH}" --use_fast_math --shared -Xcompiler -fPIC \
     -I"${SCRIPT_DIR}" \
     "${SCRIPT_DIR}/rad_exl3.cu" \
+    "${SCRIPT_DIR}/rad_exl3_mma.cu" \
     "${SCRIPT_DIR}/rad_dsv41_ops.cu" \
     -o "${OUT}"
 echo "Built ${OUT} for ${ARCH}"
