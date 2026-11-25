@@ -80,7 +80,8 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **Multi-User Decode (`B=32`, no-spec)** | **1,277.8 agg tok/s** | **`39.9 tok/s/user`** (`ITL 25.0 ms`; +47% via `blockIdx.z` hot-expert splitting & `fused_rg B<=64`) |
 | **Multi-User Decode (`B=64`, no-spec)** | **1,162.2 agg tok/s** | `18.2 tok/s/user` (8-warp `128×64` LDS WMMA MoE) |
 | **Multi-User Decode (`B=128`, no-spec)** | **1,856.0 agg tok/s** | **`14.5 tok/s/user`** (fused WMMA MoE-to-`Q8_1` + `float4` slot reduction) |
-| **Live SSE API (`/v1/chat/completions`, real code edit)** | **892.9 tok/s** | Live HTTP SSE streaming `1,800` Python tokens in `2.01 s` (`12.67×` stock `llama.cpp`) |
+| **Live SSE API (`/v1/chat/completions`, real code edit)** | **1,010.5 tok/s** | Live HTTP SSE streaming `1,600` Python tokens in `1.58 s` (`14.3×` stock `llama.cpp`; `1,001.1 tok/s` over `1,900` tok) |
+| **30-Turn Agentic E2E (`exec` + `write_file` + `read_file`)** | **92.0% avg prefix cache** | `30` turns up to `15.5K` ctx, `21` tool calls, `0` JSON errors, `38–65 ms` cached TTFT, GPU top-64 sampling (`ink_logits_topk64_batch`) |
 | **Live SSE API (8-User Concurrent, DFlash 2 `K=4`)** | **604.1 agg tok/s** | **`75.5 tok/s/user`** decode window (`591.2 agg tok/s` end-to-end wall-clock incl. prefill) |
 
 ---

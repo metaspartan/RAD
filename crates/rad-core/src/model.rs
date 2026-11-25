@@ -312,6 +312,8 @@ struct BatchScratch {
     d_seq_ids: DevBuf,
     d_positions: DevBuf,
     d_out_toks: DevBuf,
+    topk_vals: DevBuf,
+    topk_ids: DevBuf,
     cur: DevBuf,
     ffn_inp: DevBuf,
     prelude: DevBuf,
@@ -582,6 +584,8 @@ impl InklingEngine {
             d_seq_ids: DevBuf::new(mb * 4).map_err(he)?,
             d_positions: DevBuf::new(mb * 4).map_err(he)?,
             d_out_toks: DevBuf::new(mb * 4).map_err(he)?,
+            topk_vals: DevBuf::new(128 * 64 * 4).map_err(he)?,
+            topk_ids: DevBuf::new(128 * 64 * 4).map_err(he)?,
             cur: DevBuf::new(mb * e * 4).map_err(he)?,
             ffn_inp: DevBuf::new(mb * e * 4).map_err(he)?,
             prelude: DevBuf::new(mb * e * 4).map_err(he)?,
@@ -3464,6 +3468,41 @@ impl InklingEngine {
             return Err(he(rc));
         }
         Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+
+    pub fn read_batch_topk64(&self, b: usize) -> Result<(Vec<f32>, Vec<i32>)> {
+        let count = b * 64;
+        let mut vals = vec![0.0f32; count];
+        let mut ids = vec![0i32; count];
+        unsafe {
+            ops::ink_logits_topk64_batch(
+                self.stream,
+                self.bsc.logits.ptr as *const f32,
+                self.cfg.vocab_padded as i32,
+                self.cfg.vocab_unpadded as i32,
+                self.bsc.topk_vals.ptr as *mut f32,
+                self.bsc.topk_ids.ptr as *mut i32,
+                b as i32,
+            );
+            let rc1 = rad_hip::hipMemcpyAsync(
+                vals.as_mut_ptr() as *mut core::ffi::c_void,
+                self.bsc.topk_vals.ptr,
+                count * 4,
+                rad_hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                self.stream,
+            );
+            if rc1 != rad_hip::HIP_SUCCESS { return Err(he(rc1)); }
+            let rc2 = rad_hip::hipMemcpyAsync(
+                ids.as_mut_ptr() as *mut core::ffi::c_void,
+                self.bsc.topk_ids.ptr,
+                count * 4,
+                rad_hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                self.stream,
+            );
+            if rc2 != rad_hip::HIP_SUCCESS { return Err(he(rc2)); }
+            rad_hip::hipStreamSynchronize(self.stream);
+        }
+        Ok((vals, ids))
     }
 
     pub fn read_logits(&self) -> Result<Vec<f32>> {

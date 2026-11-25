@@ -1379,8 +1379,8 @@ extern "C" __global__ void moe_dn_q8_0_batch_k(const uint8_t* __restrict__ W,
     if (lane == 0) y_out[(size_t)bt * n_embd + row] = total;
 }
 
-__device__ float g_b_softcap_max_v[64 * 32];
-__device__ int g_b_softcap_max_i[64 * 32];
+__device__ float g_b_softcap_max_v[128 * 32];
+__device__ int g_b_softcap_max_i[128 * 32];
 
 extern "C" __global__ void softcap_argmax_batch_p1_k(float* __restrict__ logits,
                                                      float cap, int vocab_padded, int n_unpadded) {
@@ -2284,12 +2284,77 @@ extern "C" int ink_moe_dn_q8_0_batch(hipStream_t s, const uint8_t* W, const floa
     moe_dn_q8_0_batch_k<<<dim3((n_embd + 7) / 8, B), dim3(256), 0, s>>>(W, scales, act_in, itop, wtop, y_out, n_embd, n_ff, n_used);
     return 0;
 }
+extern "C" __global__ void logits_topk64_batch_k(const float* __restrict__ logits,
+                                                 int vocab_padded, int n_unpadded,
+                                                 float* __restrict__ out_vals,
+                                                 int* __restrict__ out_ids) {
+    int bt = blockIdx.x;
+    int tid = threadIdx.x;
+    const float* lg = logits + (size_t)bt * vocab_padded;
+    float tv[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+    int ti[4] = {0, 0, 0, 0};
+    for (int i = tid; i < n_unpadded; i += 256) {
+        float v = lg[i];
+        if (v > tv[3]) {
+            tv[3] = v;
+            ti[3] = i;
+            if (tv[3] > tv[2]) { float fv = tv[2]; tv[2] = tv[3]; tv[3] = fv; int fi = ti[2]; ti[2] = ti[3]; ti[3] = fi; }
+            if (tv[2] > tv[1]) { float fv = tv[1]; tv[1] = tv[2]; tv[2] = fv; int fi = ti[1]; ti[1] = ti[2]; ti[2] = fi; }
+            if (tv[1] > tv[0]) { float fv = tv[0]; tv[0] = tv[1]; tv[1] = fv; int fi = ti[0]; ti[0] = ti[1]; ti[1] = fi; }
+        }
+    }
+    __shared__ float sv[1024];
+    __shared__ int si[1024];
+    sv[tid * 4 + 0] = tv[0]; si[tid * 4 + 0] = ti[0];
+    sv[tid * 4 + 1] = tv[1]; si[tid * 4 + 1] = ti[1];
+    sv[tid * 4 + 2] = tv[2]; si[tid * 4 + 2] = ti[2];
+    sv[tid * 4 + 3] = tv[3]; si[tid * 4 + 3] = ti[3];
+    __syncthreads();
+    if (tid < 32) {
+        float* ov = out_vals + (size_t)bt * 64;
+        int* oi = out_ids + (size_t)bt * 64;
+        for (int r = 0; r < 64; ++r) {
+            float bv = -1e30f;
+            int bp = -1;
+            for (int j = tid; j < 1024; j += 32) {
+                float v = sv[j];
+                if (v > bv) { bv = v; bp = j; }
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                float other_v = __shfl_down(bv, off, 32);
+                int other_p = __shfl_down(bp, off, 32);
+                if (other_v > bv || (other_v == bv && other_p >= 0 && (bp < 0 || other_p < bp))) {
+                    bv = other_v;
+                    bp = other_p;
+                }
+            }
+            if (tid == 0) {
+                if (bp >= 0) {
+                    ov[r] = bv;
+                    oi[r] = si[bp];
+                    sv[bp] = -1e30f;
+                } else {
+                    ov[r] = -1e30f;
+                    oi[r] = 0;
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
 extern "C" int ink_softcap_argmax_batch(hipStream_t s, float* logits, float cap, int vocab_padded, int n_unpadded, int* out_toks, int B) {
-    if (B <= 64) {
+    if (B <= 128) {
         softcap_argmax_batch_p1_k<<<dim3(32, B), dim3(256), 0, s>>>(logits, cap, vocab_padded, n_unpadded);
         softcap_argmax_batch_p2_k<<<dim3(B), dim3(32), 0, s>>>(out_toks);
         return 0;
     }
     softcap_argmax_batch_k<<<dim3(B), dim3(256), 0, s>>>(logits, cap, vocab_padded, n_unpadded, out_toks);
+    return 0;
+}
+
+extern "C" int ink_logits_topk64_batch(hipStream_t s, const float* logits, int vocab_padded, int n_unpadded, float* out_vals, int* out_ids, int B) {
+    logits_topk64_batch_k<<<dim3(B), dim3(256), 0, s>>>(logits, vocab_padded, n_unpadded, out_vals, out_ids);
     return 0;
 }

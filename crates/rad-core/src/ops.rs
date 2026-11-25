@@ -51,6 +51,7 @@ extern "C" {
     pub fn ink_moe_gu_q8_0_batch(s: HipStream, w: *const u8, scales: *const f32, x: *const f32, itop: *const i32, act_out: *mut f32, n_ff: i32, k: i32, n_used: i32, beta: f32, lb: f32, b: i32) -> i32;
     pub fn ink_moe_dn_q8_0_batch(s: HipStream, w: *const u8, scales: *const f32, act_in: *const f32, itop: *const i32, wtop: *const f32, y_out: *mut f32, n_embd: i32, n_ff: i32, n_used: i32, b: i32) -> i32;
     pub fn ink_softcap_argmax_batch(s: HipStream, logits: *mut f32, cap: f32, vocab_padded: i32, n_unpadded: i32, out_toks: *mut i32, b: i32) -> i32;
+    pub fn ink_logits_topk64_batch(s: HipStream, logits: *const f32, vocab_padded: i32, n_unpadded: i32, out_vals: *mut f32, out_ids: *mut i32, b: i32) -> i32;
     pub fn ink_dspark_fuse(s: HipStream, feats: *const f32, fuse_w: *const f32, out: *mut f32, n_embd: i32, use_softmax: i32) -> i32;
     pub fn ink_dspark_rope_norm_ctx(s: HipStream, k_in: *const f32, v_in: *const f32, k_norm_w: *const f32, kc: *mut u16, vc: *mut u16, d_pos: *const i32, max_ctx: i32, n_head_kv: i32, dh: i32, freq_base: f32, is_swa: i32) -> i32;
     pub fn ink_dspark_rope_norm_qk(s: HipStream, q: *mut f32, k: *mut f32, q_norm_w: *const f32, k_norm_w: *const f32, d_pos0: *const i32, k_len: i32, n_head: i32, n_head_kv: i32, dh: i32, freq_base: f32) -> i32;

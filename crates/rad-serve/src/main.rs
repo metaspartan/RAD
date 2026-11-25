@@ -1238,20 +1238,36 @@ fn run_scheduler(
                         let mut n_acc = 1usize;
                         let mut last_pred = verified[0];
                         if needs_logits {
-                            let mut hist = engine.seq_tokens[seq].clone();
-                            for j in 0..dk {
-                                hist.push(draft[j]);
-                                let logits = engine.read_batch_logits(j)?;
-                                let pred = if let Some(ref mut g) = slot.grammar {
-                                    vocab_grammar.select_best_token(&logits, g)
-                                } else {
-                                    grammar::sample_from_logits(&logits, &hist, &mut slot.sampling)
-                                };
-                                last_pred = pred;
-                                if j + 1 < dk && pred == draft[j + 1] {
-                                    n_acc += 1;
-                                } else {
-                                    break;
+                            if let Some(ref mut g) = slot.grammar {
+                                for j in 0..dk {
+                                    let logits = engine.read_batch_logits(j)?;
+                                    let pred = vocab_grammar.select_best_token(&logits, g);
+                                    last_pred = pred;
+                                    if j + 1 < dk && pred == draft[j + 1] {
+                                        n_acc += 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                let (tk_vals, tk_ids) = engine.read_batch_topk64(dk)?;
+                                let seq_len = engine.seq_tokens[seq].len();
+                                let mut recent: Vec<i32> = engine.seq_tokens[seq][seq_len.saturating_sub(128)..].to_vec();
+                                for j in 0..dk {
+                                    recent.push(draft[j]);
+                                    let off = j * 64;
+                                    let pred = grammar::sample_from_topk(
+                                        &tk_vals[off..off + 64],
+                                        &tk_ids[off..off + 64],
+                                        &recent,
+                                        &mut slot.sampling,
+                                    );
+                                    last_pred = pred;
+                                    if j + 1 < dk && pred == draft[j + 1] {
+                                        n_acc += 1;
+                                    } else {
+                                        break;
+                                    }
                                 }
                             }
                         } else {

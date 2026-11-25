@@ -568,6 +568,67 @@ pub fn sample_from_logits(logits: &[f32], recent_tokens: &[i32], params: &mut Sa
     probs[0].1 as i32
 }
 
+pub fn sample_from_topk(vals: &[f32], ids: &[i32], recent_tokens: &[i32], params: &mut SamplingParams) -> i32 {
+    let n = vals.len().min(ids.len());
+    if n == 0 {
+        return 0;
+    }
+    let rep = params.repetition_penalty;
+    let temp = params.temperature.max(1e-4);
+    let mut top: Vec<(f32, i32)> = Vec::with_capacity(n);
+    let has_rep = (rep - 1.0).abs() > 1e-4;
+    let recent = if has_rep {
+        &recent_tokens[recent_tokens.len().saturating_sub(128)..]
+    } else {
+        &[]
+    };
+    for i in 0..n {
+        let id = ids[i];
+        let mut v = vals[i];
+        if has_rep && recent.contains(&id) {
+            v = if v > 0.0 { v / rep } else { v * rep };
+        }
+        top.push((v, id));
+    }
+    top.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    if params.temperature <= 1e-5 {
+        return top[0].1;
+    }
+    let max_l = top[0].0;
+    let mut probs: Vec<(f32, i32)> = Vec::with_capacity(n);
+    let mut sum = 0.0f32;
+    for &(v, id) in &top {
+        let p = ((v - max_l) / temp).exp();
+        probs.push((p, id));
+        sum += p;
+    }
+    if sum <= 0.0 || !sum.is_finite() {
+        return top[0].1;
+    }
+    let top_p = params.top_p.clamp(0.05, 1.0);
+    let mut cum = 0.0f32;
+    let mut keep = probs.len();
+    for (k, &(p, _)) in probs.iter().enumerate() {
+        cum += p / sum;
+        if cum >= top_p {
+            keep = (k + 1).max(1);
+            break;
+        }
+    }
+    probs.truncate(keep);
+    let kept_sum: f32 = probs.iter().map(|x| x.0).sum();
+    params.seed = params.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let r = (((params.seed >> 33) as u32) as f32 / (u32::MAX as f32)) * kept_sum;
+    let mut acc = 0.0f32;
+    for &(p, id) in &probs {
+        acc += p;
+        if acc >= r {
+            return id;
+        }
+    }
+    probs[0].1
+}
+
 pub fn parse_tool_calls(text: &str, allowed_tools: &[String]) -> Option<Vec<Value>> {
     let trimmed = text.trim();
     let candidate = if let Some(s) = trimmed.strip_prefix("```json") {
