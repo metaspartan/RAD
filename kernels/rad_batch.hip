@@ -2339,7 +2339,7 @@ extern "C" __global__ void logits_topk64_batch_k(const float* __restrict__ logit
                     oi[r] = 0;
                 }
             }
-            __syncwarp();
+            __threadfence_block();
         }
     }
 }
