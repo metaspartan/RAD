@@ -166,9 +166,14 @@ pub fn build_compressed_token_map(tok: &Tokenizer, vocab_size: usize) -> Result<
     let mut next_id = 0i64;
     for tid in 0..vocab_size {
         let decoded = tok.decode(&[tid as u32], false).unwrap_or_default();
-        let mut ns = NormalizedString::from(decoded.as_str());
-        let _ = norm.normalize(&mut ns);
-        let key = ns.get().trim().replace(sentinel, " ");
+        let key = if decoded.contains('\u{FFFD}') {
+            tok.id_to_token(tid as u32).unwrap_or(decoded)
+        } else {
+            let mut ns = NormalizedString::from(decoded.as_str());
+            let _ = norm.normalize(&mut ns);
+            let nt = ns.get().trim().replace(sentinel, " ");
+            if nt.is_empty() { decoded } else { nt }
+        };
         let cid = if let Some(&existing) = key_to_id.get(&key) {
             existing
         } else {

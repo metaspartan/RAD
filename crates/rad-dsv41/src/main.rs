@@ -353,6 +353,7 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
 
     let (job_tx, mut job_rx) = mpsc::unbounded_channel::<ServeJob>();
     std::thread::spawn(move || {
+        let mut cached_seq: Vec<i32> = Vec::new();
         while let Some(job) = job_rx.blocking_recv() {
             if job.tx.is_closed() {
                 continue;
@@ -373,12 +374,22 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                 )));
                 continue;
             }
-            eng.pos = 0;
-            let mut reset_cmd = 0u32;
-            let _ = comm.broadcast_u32(&mut reset_cmd);
-            let mut next_tok = match eng.prefill_tokens(&p_ids, &mut comm) {
+            let mut lcp = 0usize;
+            let max_lcp = cached_seq.len().min(prompt_n.saturating_sub(1));
+            while lcp < max_lcp && cached_seq[lcp] == p_ids[lcp] {
+                lcp += 1;
+            }
+            eng.pos = lcp;
+            let mut pcmd = 3u32;
+            let _ = comm.broadcast_u32(&mut pcmd);
+            let mut pval = lcp as u32;
+            let _ = comm.broadcast_u32(&mut pval);
+            let mut crow = 0u32;
+            let _ = comm.broadcast_u32(&mut crow);
+            let mut next_tok = match eng.prefill_tokens(&p_ids[lcp..], &mut comm) {
                 Ok(t) => t,
                 Err(e) => {
+                    cached_seq.clear();
                     let _ = job.tx.send(ServeEvent::Error(format!("{e}")));
                     continue;
                 }
@@ -440,6 +451,7 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                     }
                 }
             }
+            cached_seq = history;
             let _ = job.tx.send(ServeEvent::Done {
                 prompt_n,
                 pred_n: gen_ids.len(),

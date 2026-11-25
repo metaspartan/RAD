@@ -117,8 +117,10 @@ __global__ void mhc_coeff_proj_k(
     const float* __restrict__ hc_base,
     const float* __restrict__ hc_scale,
     float* __restrict__ h_coeff,
+    float* __restrict__ next_pre,
     int D4,
-    float eps
+    float rms_eps,
+    float hc_eps
 ) {
     int c = blockIdx.x;
     int mr = blockIdx.y;
@@ -156,24 +158,31 @@ __global__ void mhc_coeff_proj_k(
             vs += __shfl_xor_sync(0xFFFFFFFFu, vs, m);
         }
         if (lane == 0) {
-            float rsqrt_v = rsqrtf(vs / (float)D4 + eps);
+            float rsqrt_v = rsqrtf(vs / (float)D4 + rms_eps);
             int sc_idx = (c < 4) ? 0 : ((c < 8) ? 1 : 2);
-            h_coeff[(size_t)mr * 24 + c] = (vd * rsqrt_v) * hc_scale[sc_idx] + hc_base[c];
+            float val = (vd * rsqrt_v) * hc_scale[sc_idx] + hc_base[c];
+            h_coeff[(size_t)mr * 24 + c] = val;
+            if (c < 4 && next_pre) {
+                next_pre[(size_t)mr * 4 + c] = 1.0f / (1.0f + expf(-val)) + hc_eps;
+            }
         }
     }
 }
 
 __global__ void mhc_pre_mix_f16_k(
     const float* __restrict__ streams,
-    const float* __restrict__ h_coeff,
+    const float* __restrict__ prev_pre,
     float* __restrict__ branch_in,
-    int D,
-    float eps
+    int D
 ) {
     int mr = blockIdx.y;
     __shared__ float s_pre[4];
     if (threadIdx.x < 4) {
-        s_pre[threadIdx.x] = 1.0f / (1.0f + expf(-h_coeff[(size_t)mr * 24 + threadIdx.x])) + eps;
+        if (prev_pre) {
+            s_pre[threadIdx.x] = prev_pre[(size_t)mr * 4 + threadIdx.x];
+        } else {
+            s_pre[threadIdx.x] = (threadIdx.x == 0) ? 1.0f : 0.0f;
+        }
     }
     __syncthreads();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -284,17 +293,32 @@ void rad_cuda_mhc_pre_and_coeff(
     const float* hc_fn,
     const float* hc_base,
     const float* hc_scale,
+    const float* prev_pre,
     float* h_coeff,
+    float* next_pre,
     float* branch_in,
     int M,
     int D,
-    float eps,
+    float rms_eps,
+    float hc_eps,
     cudaStream_t stream
 ) {
     dim3 g1(24, M);
-    mhc_coeff_proj_k<<<g1, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, D * 4, eps);
+    mhc_coeff_proj_k<<<g1, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, D * 4, rms_eps, hc_eps);
     dim3 g2((D + 255) / 256, M);
-    mhc_pre_mix_f16_k<<<g2, 256, 0, stream>>>(streams, h_coeff, branch_in, D, eps);
+    mhc_pre_mix_f16_k<<<g2, 256, 0, stream>>>(streams, prev_pre, branch_in, D);
+}
+
+void rad_cuda_mhc_pre_mix_only(
+    const float* streams,
+    const float* prev_pre,
+    float* branch_in,
+    int M,
+    int D,
+    cudaStream_t stream
+) {
+    dim3 g2((D + 255) / 256, M);
+    mhc_pre_mix_f16_k<<<g2, 256, 0, stream>>>(streams, prev_pre, branch_in, D);
 }
 
 void rad_cuda_argmax_f16(

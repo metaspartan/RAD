@@ -172,6 +172,7 @@ __global__ void rope_yarn_f16_k(
     int rope_dim,
     int start_pos,
     float theta,
+    int orig_len,
     float sign
 ) {
     int h = blockIdx.x;
@@ -179,19 +180,21 @@ __global__ void rope_yarn_f16_k(
     int i = threadIdx.x;
     int half_r = rope_dim >> 1;
     if (i >= half_r) return;
-    float base_freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
-    float factor = 16.0f;
-    float orig_ctx = 65536.0f;
-    float beta_fast = 32.0f;
-    float beta_slow = 1.0f;
-    float low = floorf((float)rope_dim * logf(orig_ctx / (beta_fast * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
-    float high = ceilf((float)rope_dim * logf(orig_ctx / (beta_slow * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
-    if (low < 0.0f) low = 0.0f;
-    if (high > (float)(rope_dim - 1)) high = (float)(rope_dim - 1);
-    float ramp = ((float)i - low) / fmaxf(high - low, 0.001f);
-    if (ramp < 0.0f) ramp = 0.0f;
-    if (ramp > 1.0f) ramp = 1.0f;
-    float freq = (base_freq / factor) * ramp + base_freq * (1.0f - ramp);
+    float freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
+    if (orig_len > 0) {
+        float factor = 16.0f;
+        float orig_ctx = (float)orig_len;
+        float beta_fast = 32.0f;
+        float beta_slow = 1.0f;
+        float low = floorf((float)rope_dim * logf(orig_ctx / (beta_fast * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
+        float high = ceilf((float)rope_dim * logf(orig_ctx / (beta_slow * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
+        if (low < 0.0f) low = 0.0f;
+        if (high > (float)(rope_dim - 1)) high = (float)(rope_dim - 1);
+        float ramp = ((float)i - low) / fmaxf(high - low, 0.001f);
+        if (ramp < 0.0f) ramp = 0.0f;
+        if (ramp > 1.0f) ramp = 1.0f;
+        freq = (freq / factor) * ramp + freq * (1.0f - ramp);
+    }
     float pos_f = (float)(start_pos + mr);
     float ang = pos_f * freq;
     float cs = cosf(ang);
@@ -240,11 +243,20 @@ __global__ void mhc_sinkhorn_mix_f16_k(
                 float v = hc[8 + r * 4 + c];
                 if (v > rmax) rmax = v;
             }
+            float rs = 0.0f;
             for (int c = 0; c < 4; ++c) {
                 m[r][c] = expf(hc[8 + r * 4 + c] - rmax);
+                rs += m[r][c];
             }
+            float inv = 1.0f / rs;
+            for (int c = 0; c < 4; ++c) m[r][c] = m[r][c] * inv + eps;
         }
-        for (int it = 0; it < sinkhorn_iters; ++it) {
+        for (int c = 0; c < 4; ++c) {
+            float cs = m[0][c] + m[1][c] + m[2][c] + m[3][c] + eps;
+            float inv = 1.0f / cs;
+            for (int r = 0; r < 4; ++r) m[r][c] *= inv;
+        }
+        for (int it = 1; it < sinkhorn_iters; ++it) {
             for (int r = 0; r < 4; ++r) {
                 float rs = m[r][0] + m[r][1] + m[r][2] + m[r][3] + eps;
                 float inv = 1.0f / rs;
@@ -274,8 +286,8 @@ __global__ void mhc_sinkhorn_mix_f16_k(
         }
         #pragma unroll
         for (int r = 0; r < 4; ++r) {
-            sr[r * D + i] = s_res[r * 4 + 0] * x0 + s_res[r * 4 + 1] * x1 +
-                            s_res[r * 4 + 2] * x2 + s_res[r * 4 + 3] * x3 +
+            sr[r * D + i] = s_res[0 * 4 + r] * x0 + s_res[1 * 4 + r] * x1 +
+                            s_res[2 * 4 + r] * x2 + s_res[3 * 4 + r] * x3 +
                             s_post[r] * b;
         }
     }
@@ -478,12 +490,13 @@ void rad_cuda_rope_yarn_f16(
     int rope_dim,
     int start_pos,
     float theta,
+    int orig_len,
     float sign,
     cudaStream_t stream
 ) {
     dim3 grid(n_q_heads + n_kv_heads, M);
     rope_yarn_f16_k<<<grid, rope_dim / 2, 0, stream>>>(
-        q, k, n_q_heads, n_kv_heads, head_dim, rope_dim, start_pos, theta, sign
+        q, k, n_q_heads, n_kv_heads, head_dim, rope_dim, start_pos, theta, orig_len, sign
     );
 }
 
@@ -614,7 +627,8 @@ __global__ void engram_gate_f32_k(
         for (int m = 16; m > 0; m >>= 1) vd += __shfl_xor_sync(0xFFFFFFFFu, vd, m);
         if (lane == 0) {
             float sc = vd * rsqrtf((float)D);
-            sm_q[0] = 1.0f / (1.0f + expf(-sc));
+            float sc_s = copysignf(sqrtf(fmaxf(fabsf(sc), 1e-6f)), sc);
+            sm_q[0] = 1.0f / (1.0f + expf(-sc_s));
         }
     }
     __syncthreads();

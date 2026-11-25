@@ -79,7 +79,7 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **256K Long-Context Agentic Project E2E (7 turns, live SSE)** | **100.0% cache @ 249K** | Builds & tests multi-file Python project across `443 -> 43K -> 92K -> 182K -> 249K` tok (**`235.6 ms` TTFT**, **`96.2 tok/s`** decode @ 249K, exact Turn-1 recall) |
 | **Multi-User 17.5K Long-Context E2E (`B=8`, 2 turns, live SSE)** | **99.8% cache / 222.6 ms TTFT** | Split-KV multi-user `K<=16` FlashAttention + exact `max_tokens` rewind (**`283.2 tok/s`** T1 pure DFlash 2, **`399.1 tok/s`** T2 cached Hybrid) |
 | **Live SSE API (8-User Concurrent, Hybrid `K=128`, `temp=0.2`)** | **3,306.5 agg tok/s** | **`413.5 tok/s/user`** avg (**`413.3–413.7 tok/s/user`** across all 8 users, `3,307.0` overlap; pure-gen `B=8` SSE **`315.3 tok/s`**) |
-| **Cybara Multi-Turn Agentic E2E (Live Desktop -> RAD R9700)** | **31,667 tok cached** | 2-turn tool-calling codebase edit + `unittest` (`9.19 s` T1 / `11.66 s` T2 across `7.3K–7.9K` ctx, `5` prefix-cache hits, `3/3` tests passing) |
+| **Cybara Multi-Turn Agentic E2E (Live Desktop -> RAD R9700)** | **6-turn + 4-turn concurrent** | 10KB Rust analysis (`5,572` chars) + 3-file Python engine (`16/16` tests) + concurrent 80-entry needle haystack (`5,011`-char parser + exact recall), `0` looping |
 | **Live SSE API (8-User Independent File Edits, `B=8`)** | **2,342.3 agg tok/s** | `9,295` tokens across 8 distinct edits in `3.97 s` (**`289–324 tok/s/user`**, avg `296 tok/s/user`, all 8 users finishing within `0.32 s`) |
 
 ### Live Recorded Demo Videos (Single AMD Radeon AI PRO R9700)
@@ -102,10 +102,10 @@ First CUDA backend (`rad-cuda` + `rad-dsv41`) running **DeepSeek-V4.1-Flash-1017
 | **EXL3 `mul1` Tensor Core GEMV (`M=1`, 4-bit)** | **269.9 GB/s** (**98.9% peak**) | `mma.sync.aligned.m16n8k16` (`rad_exl3_mma.cu`), verified `<2e-5` rel_err across 2/3/4/5/6-bit |
 | **EXL3 `mul1` Tensor Core Prefill (`M=16..64`)** | **21.02 TFLOPS** | Fused WHT-128 + `mul1` `0x83DCD12D` Tensor Core MMA |
 | **ConnectX-7 RoCE v2 RDMA AllReduce** | **7 us** (**134x** vs TCP) | Zero-copy `cudaHostAllocMapped` + `libibverbs` (`938 us` TCP -> `7 us` RDMA) with GPU-side peer add |
-| **MoE Router (`384` experts, `sqrtsoftplus`, `top_k=12`)** | **93 us** (**4.7x** speedup) | Vectorized `half2` logits + parallel 256-thread top-K (`rad_dsv41_router.cu`) |
-| **Live 40-Layer TP=2 RDMA TTFT** | **170.8 ms** (**1.56x** vs vLLM) | Beats `267.2 ms` vLLM baseline on identical 2x DGX Spark hardware |
-| **Live 40-Layer TP=2 RDMA Decode (No-Spec)** | **24.5 tok/s** | Full 40-layer TP=2/EP=2 RDMA OpenAI `/v1/chat/completions` + `<think>` + DSML tool calls |
-| **1-Layer TP=2 Parity (`M=1` vs `M=4`)** | **100% bit-exact** | Exact token match across batched prefill & decode (`PARITY M=1 vs M=4: match=true`) |
+| **MoE Router (`384` experts, `sqrtsoftplus`, `top_k=6`)** | **66 us** (**6.6x** speedup) | Vectorized `half2` logits + parallel 256-thread top-K (`rad_dsv41_router.cu`) |
+| **GPU-Grouped MoE Tensor Core MMA (`M=2..64`)** | **2.04x** prefill / **1.90x** verify | Expert-grouped `mma.sync.aligned.m16n8k16` (`rad_exl3_mma.cu`), **100% bit-exact** `M=1` vs `M=4` parity |
+| **Live 40-Layer TP=2 RDMA TTFT & Prefix Cache** | **170.8 ms** (**2x** cached turn) | Beats `267.2 ms` vLLM baseline; multi-turn KV prefix caching (`lcp`) + `M=1` FFN CUDA Graphs (`25.0 tok/s`) |
+| **Live 40-Layer TP=2 RDMA Decode (`M=1` CUDA Graph + `K=64` Hybrid)** | **25.0 tok/s** (`M=1` graph) | Full 40-layer TP=2/EP=2 RDMA with exact pipelined mHC, transposed Sinkhorn, per-layer 10K/160K YaRN RoPE, `<think>` & DSML tool calls |
 
 ---
 

@@ -66,22 +66,22 @@ impl DsparkMtp {
 
 pub fn ngram_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<i32>> {
     let n = history.len();
-    if n < 12 || max_k < 5 {
+    if n < 8 || max_k < 4 {
         return None;
     }
     let c = history[n - 1];
     let b = history[n - 2];
     let mut best_pos: Option<usize> = None;
     let mut best_len = 0usize;
-    let mut i = n.saturating_sub(6);
-    while i >= 2 {
+    let mut i = n.saturating_sub(4);
+    while i >= 3 {
         if history[i] == anchor && history[i - 1] == c && history[i - 2] == b {
             let mut mlen = 3usize;
-            let lim = 32usize.min(i).min(n);
+            let lim = 64usize.min(i).min(n);
             while mlen < lim && history[i - mlen] == history[n - mlen] {
                 mlen += 1;
             }
-            if mlen > best_len {
+            if mlen >= 4 && mlen > best_len {
                 best_len = mlen;
                 best_pos = Some(i);
                 if mlen >= 16 {
@@ -93,7 +93,7 @@ pub fn ngram_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<i32
     }
     let pos = best_pos?;
     let avail = (n - pos).min(max_k);
-    if avail < 5 {
+    if avail < 6 {
         return None;
     }
     let mut out = Vec::with_capacity(avail);

@@ -126,6 +126,7 @@ extern "C" {
         rope_dim: i32,
         start_pos: i32,
         theta: f32,
+        orig_len: i32,
         sign: f32,
         stream: CudaStream,
     );
@@ -221,11 +222,23 @@ extern "C" {
         hc_fn: *const c_void,
         hc_base: *const c_void,
         hc_scale: *const c_void,
+        prev_pre: *const c_void,
         h_coeff: *mut c_void,
+        next_pre: *mut c_void,
         branch_in: *mut c_void,
         m: i32,
         d: i32,
-        eps: f32,
+        rms_eps: f32,
+        hc_eps: f32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_mhc_pre_mix_only(
+        streams: *const c_void,
+        prev_pre: *const c_void,
+        branch_in: *mut c_void,
+        m: i32,
+        d: i32,
         stream: CudaStream,
     );
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use core::ffi::c_void;
 use rad_cuda::comm::Tp2Comm;
-use rad_cuda::{CudaBuf, CudaFail, CudaStream};
+use rad_cuda::{CudaBuf, CudaCapturedGraph, CudaFail, CudaStream};
 use std::io::Write;
 use std::path::Path;
 use crate::config::DeepseekV41Config;
@@ -50,6 +50,8 @@ pub struct Dsv41Engine {
     pub d_wo_mid: CudaBuf,
     pub d_branch_out: CudaBuf,
     pub d_h_coeff: CudaBuf,
+    pub d_pre_a: CudaBuf,
+    pub d_pre_b: CudaBuf,
     pub d_gate_raw: CudaBuf,
     pub d_gate_sel: CudaBuf,
     pub d_topk_ids: CudaBuf,
@@ -68,6 +70,7 @@ pub struct Dsv41Engine {
     pub d_best_val: CudaBuf,
     pub d_best_id: CudaBuf,
     pub h_ar_buf: Vec<u16>,
+    pub ffn_graphs_m1: Vec<Option<CudaCapturedGraph>>,
     pub pos: usize,
     pub wht_scale: f32,
 }
@@ -153,7 +156,7 @@ impl Dsv41Engine {
         let groups_local = tc.o_groups / world;
         let heads_per_grp = tc.num_attention_heads / tc.o_groups;
         let vocab_local = tc.vocab_size / world;
-        let max_head_m = 16usize;
+        let max_head_m = MAX_BATCH;
         let z_elems = (MAX_BATCH * n_heads_local * tc.head_dim)
             .max(MAX_BATCH * tc.num_experts_per_tok * d)
             .max(max_head_m * vocab_local);
@@ -190,6 +193,8 @@ impl Dsv41Engine {
             d_wo_mid: CudaBuf::new(MAX_BATCH * groups_local * tc.o_lora_rank * 2).map_err(CudaFail)?,
             d_branch_out: CudaBuf::new(MAX_BATCH * d * 2).map_err(CudaFail)?,
             d_h_coeff: CudaBuf::new(MAX_BATCH * 24 * 4).map_err(CudaFail)?,
+            d_pre_a: CudaBuf::new(MAX_BATCH * 4 * 4).map_err(CudaFail)?,
+            d_pre_b: CudaBuf::new(MAX_BATCH * 4 * 4).map_err(CudaFail)?,
             d_gate_raw: CudaBuf::new(MAX_BATCH * tc.n_routed_experts * 4).map_err(CudaFail)?,
             d_gate_sel: CudaBuf::new(MAX_BATCH * tc.n_routed_experts * 4).map_err(CudaFail)?,
             d_topk_ids: CudaBuf::new(MAX_BATCH * tc.num_experts_per_tok * 4).map_err(CudaFail)?,
@@ -208,6 +213,7 @@ impl Dsv41Engine {
             d_best_val: CudaBuf::new(max_head_m * 4).map_err(CudaFail)?,
             d_best_id: CudaBuf::new(max_head_m * 4).map_err(CudaFail)?,
             h_ar_buf: vec![0u16; MAX_BATCH * d],
+            ffn_graphs_m1: (0..n_layers).map(|_| None).collect(),
             pos: 0,
             wht_scale: 1.0f32 / 128.0f32.sqrt(),
         })
@@ -316,16 +322,30 @@ impl Dsv41Engine {
                 }
             }
             unsafe {
+                if let Some(ref mtp) = self.mtp {
+                    if let Some(slot) = tc.dspark_target_layer_ids.iter().position(|&id| id == l) {
+                        let rows_save = m.min(16);
+                        for mr in 0..rows_save {
+                            let s_ptr = (self.d_streams.ptr as *const u8).add(mr * 4 * d * 4) as *const c_void;
+                            let dst_ctx = (mtp.d_ctx_raw.ptr as *mut u8).add((mr * 3 + slot) * d * 4) as *mut c_void;
+                            cuda_ops::rad_cuda_mhc_collapse_mean_f16(s_ptr, dst_ctx, 1, d as i32, stream);
+                        }
+                    }
+                }
                 let lw = &self.layers[l];
+                let prev_pre = if l == 0 { std::ptr::null() } else { self.d_pre_b.ptr as *const c_void };
                 cuda_ops::rad_cuda_mhc_pre_and_coeff(
                     self.d_streams.ptr,
                     lw.hc_attn_fn.ptr,
                     lw.hc_attn_base.ptr,
                     lw.hc_attn_scale.ptr,
+                    prev_pre,
                     self.d_h_coeff.ptr,
+                    self.d_pre_a.ptr,
                     self.d_branch_in.ptr,
                     mi,
                     d as i32,
+                    tc.rms_norm_eps,
                     tc.hc_eps,
                     stream,
                 );
@@ -336,6 +356,12 @@ impl Dsv41Engine {
 
                 self.exl3_proj(self.d_normed.ptr, &lw.wkv, self.d_kv.ptr, mi, 0, stream);
                 cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, lw.kv_norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, stream);
+                let is_comp = tc.compress_ratios.get(l).copied().unwrap_or(0) > 0;
+                let (r_theta, r_orig) = if is_comp {
+                    (tc.compress_rope_theta, tc.rope_scaling.original_max_position_embeddings as i32)
+                } else {
+                    (tc.rope_theta, 0)
+                };
                 cuda_ops::rad_cuda_rope_yarn_f16(
                     self.d_q.ptr,
                     self.d_kv_normed.ptr,
@@ -345,7 +371,8 @@ impl Dsv41Engine {
                     tc.head_dim as i32,
                     tc.qk_rope_head_dim as i32,
                     start_pos,
-                    tc.rope_theta,
+                    r_theta,
+                    r_orig,
                     1.0f32,
                     stream,
                 );
@@ -362,7 +389,7 @@ impl Dsv41Engine {
                 );
 
                 let sink_ptr = (lw.attn_sink.ptr as *const f32).add(self.rank * n_heads_local);
-                let sw = if tc.compress_ratios.get(l).copied().unwrap_or(0) > 0 { tc.sliding_window as i32 } else { 0 };
+                let sw = if is_comp { tc.sliding_window as i32 } else { 0 };
                 cuda_ops::rad_cuda_mqa_attn_sink_causal_f16(
                     self.d_q.ptr,
                     self.kv_caches[l].k_cache.ptr,
@@ -387,7 +414,8 @@ impl Dsv41Engine {
                     tc.head_dim as i32,
                     tc.qk_rope_head_dim as i32,
                     start_pos,
-                    tc.rope_theta,
+                    r_theta,
+                    r_orig,
                     -1.0f32,
                     stream,
                 );
@@ -427,6 +455,153 @@ impl Dsv41Engine {
 
             let (b_self, b_peer) = self.exchange_branch(m, comm)?;
 
+            if m == 1 && comm.rdma_ptrs().is_some() {
+                if self.ffn_graphs_m1[l].is_none() {
+                    let g = unsafe {
+                        CudaCapturedGraph::capture(|gs| {
+                            let lw = &self.layers[l];
+                            cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(
+                                self.d_streams.ptr,
+                                b_self,
+                                b_peer,
+                                self.d_h_coeff.ptr as *const f32,
+                                1,
+                                d as i32,
+                                tc.hc_sinkhorn_iters as i32,
+                                tc.hc_eps,
+                                gs,
+                            );
+                            cuda_ops::rad_cuda_mhc_pre_and_coeff(
+                                self.d_streams.ptr,
+                                lw.hc_ffn_fn.ptr,
+                                lw.hc_ffn_base.ptr,
+                                lw.hc_ffn_scale.ptr,
+                                self.d_pre_a.ptr,
+                                self.d_h_coeff.ptr,
+                                self.d_pre_b.ptr,
+                                self.d_branch_in.ptr,
+                                1,
+                                d as i32,
+                                tc.rms_norm_eps,
+                                tc.hc_eps,
+                                gs,
+                            );
+                            cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.ffn_norm.ptr, self.d_normed.ptr, 1, d as i32, tc.rms_norm_eps, gs);
+                            cuda_ops::rad_cuda_moe_route_sqrtsoftplus(
+                                self.d_normed.ptr,
+                                lw.gate_w.ptr,
+                                lw.gate_bias.ptr,
+                                self.d_gate_raw.ptr,
+                                self.d_gate_sel.ptr,
+                                self.d_topk_ids.ptr,
+                                self.d_topk_weights.ptr,
+                                1,
+                                tc.n_routed_experts as i32,
+                                d as i32,
+                                tc.num_experts_per_tok as i32,
+                                tc.routed_scaling_factor,
+                                gs,
+                            );
+                            self.exl3_proj(self.d_normed.ptr, &lw.shared_w1, self.d_shared_g.ptr, 1, 0, gs);
+                            self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, 1, 0, gs);
+                            cuda_ops::rad_cuda_clamped_swiglu_f16(
+                                self.d_shared_g.ptr,
+                                self.d_shared_u.ptr,
+                                self.d_shared_g.ptr,
+                                (tc.moe_intermediate_size / self.world) as i32,
+                                tc.swiglu_limit,
+                                gs,
+                            );
+                            self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, 1, 0, gs);
+
+                            let tk = tc.num_experts_per_tok as i32;
+                            let inter = tc.moe_intermediate_size as i32;
+                            let bits = lw.experts[0].w1.bits as i32;
+                            let exp_start = lw.expert_start as i32;
+                            let n_local = lw.experts.len() as i32;
+
+                            cuda_ops::rad_cuda_exl3_moe_mma_f16(
+                                self.d_normed.ptr,
+                                lw.d_w1_trel.ptr as *const *const c_void,
+                                lw.d_w1_suh.ptr as *const *const c_void,
+                                lw.d_w1_svh.ptr as *const *const c_void,
+                                self.d_topk_ids.ptr as *const i32,
+                                self.d_z_scratch.ptr,
+                                self.d_moe_gate.ptr,
+                                tk,
+                                1,
+                                d as i32,
+                                inter,
+                                bits,
+                                self.wht_scale,
+                                0,
+                                exp_start,
+                                n_local,
+                                gs,
+                            );
+                            cuda_ops::rad_cuda_exl3_moe_mma_f16(
+                                self.d_normed.ptr,
+                                lw.d_w3_trel.ptr as *const *const c_void,
+                                lw.d_w3_suh.ptr as *const *const c_void,
+                                lw.d_w3_svh.ptr as *const *const c_void,
+                                self.d_topk_ids.ptr as *const i32,
+                                self.d_z_scratch.ptr,
+                                self.d_moe_up.ptr,
+                                tk,
+                                1,
+                                d as i32,
+                                inter,
+                                bits,
+                                self.wht_scale,
+                                0,
+                                exp_start,
+                                n_local,
+                                gs,
+                            );
+                            cuda_ops::rad_cuda_clamped_swiglu_f16(
+                                self.d_moe_gate.ptr,
+                                self.d_moe_up.ptr,
+                                self.d_moe_act.ptr,
+                                tk * inter,
+                                tc.swiglu_limit,
+                                gs,
+                            );
+                            cuda_ops::rad_cuda_exl3_moe_mma_f16(
+                                self.d_moe_act.ptr,
+                                lw.d_w2_trel.ptr as *const *const c_void,
+                                lw.d_w2_suh.ptr as *const *const c_void,
+                                lw.d_w2_svh.ptr as *const *const c_void,
+                                self.d_topk_ids.ptr as *const i32,
+                                self.d_z_scratch.ptr,
+                                self.d_moe_outs.ptr,
+                                tk,
+                                1,
+                                inter,
+                                d as i32,
+                                bits,
+                                self.wht_scale,
+                                1,
+                                exp_start,
+                                n_local,
+                                gs,
+                            );
+                            cuda_ops::rad_cuda_moe_weighted_sum_f16(
+                                self.d_moe_outs.ptr,
+                                self.d_topk_weights.ptr as *const f32,
+                                self.d_shared_out.ptr,
+                                branch_dst,
+                                1,
+                                tk,
+                                d as i32,
+                                gs,
+                            );
+                        })
+                    }
+                    .map_err(CudaFail)?;
+                    self.ffn_graphs_m1[l] = Some(g);
+                }
+                self.ffn_graphs_m1[l].as_ref().unwrap().launch().map_err(CudaFail)?;
+            } else {
             unsafe {
                 let lw = &self.layers[l];
                 cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(
@@ -445,10 +620,13 @@ impl Dsv41Engine {
                     lw.hc_ffn_fn.ptr,
                     lw.hc_ffn_base.ptr,
                     lw.hc_ffn_scale.ptr,
+                    self.d_pre_a.ptr,
                     self.d_h_coeff.ptr,
+                    self.d_pre_b.ptr,
                     self.d_branch_in.ptr,
                     mi,
                     d as i32,
+                    tc.rms_norm_eps,
                     tc.hc_eps,
                     stream,
                 );
@@ -562,6 +740,7 @@ impl Dsv41Engine {
                     stream,
                 );
             }
+            }
 
             let (b_self2, b_peer2) = self.exchange_branch(m, comm)?;
 
@@ -577,16 +756,6 @@ impl Dsv41Engine {
                     tc.hc_eps,
                     stream,
                 );
-                if let Some(ref mtp) = self.mtp {
-                    if let Some(slot) = tc.dspark_target_layer_ids.iter().position(|&id| id == l) {
-                        let rows_save = m.min(16);
-                        for mr in 0..rows_save {
-                            let s_ptr = (self.d_streams.ptr as *const u8).add(mr * 4 * d * 4) as *const c_void;
-                            let dst_ctx = (mtp.d_ctx_raw.ptr as *mut u8).add((mr * 3 + slot) * d * 4) as *mut c_void;
-                            cuda_ops::rad_cuda_mhc_collapse_mean_f16(s_ptr, dst_ctx, 1, d as i32, stream);
-                        }
-                    }
-                }
             }
         }
         self.pos += m;
@@ -604,7 +773,7 @@ impl Dsv41Engine {
         let d = tc.hidden_size;
         let stream: CudaStream = std::ptr::null_mut();
         unsafe {
-            cuda_ops::rad_cuda_mhc_collapse_mean_f16(self.d_streams.ptr, self.d_branch_in.ptr, m as i32, d as i32, stream);
+            cuda_ops::rad_cuda_mhc_pre_mix_only(self.d_streams.ptr, self.d_pre_b.ptr, self.d_branch_in.ptr, m as i32, d as i32, stream);
             cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, self.final_norm.ptr, self.d_normed.ptr, m as i32, d as i32, tc.rms_norm_eps, stream);
             self.exl3_proj(self.d_normed.ptr, &self.head, self.d_logits.ptr, m as i32, 0, stream);
             cuda_ops::rad_cuda_argmax_f16(
@@ -657,7 +826,7 @@ impl Dsv41Engine {
         let lw = &self.layers[0];
         let t0 = std::time::Instant::now();
         unsafe {
-            cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_attn_fn.ptr, lw.hc_attn_base.ptr, lw.hc_attn_scale.ptr, self.d_h_coeff.ptr, self.d_branch_in.ptr, 1, d as i32, tc.hc_eps, stream);
+            cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_attn_fn.ptr, lw.hc_attn_base.ptr, lw.hc_attn_scale.ptr, std::ptr::null(), self.d_h_coeff.ptr, self.d_pre_a.ptr, self.d_branch_in.ptr, 1, d as i32, tc.rms_norm_eps, tc.hc_eps, stream);
             cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.attn_norm.ptr, self.d_normed.ptr, 1, d as i32, tc.rms_norm_eps, stream);
         }
         let _ = sync_t();
@@ -670,7 +839,7 @@ impl Dsv41Engine {
             self.exl3_proj(self.d_q_normed.ptr, &lw.wq_b, self.d_q.ptr, 1, 0, stream);
             self.exl3_proj(self.d_normed.ptr, &lw.wkv, self.d_kv.ptr, 1, 0, stream);
             cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, lw.kv_norm.ptr, self.d_kv_normed.ptr, 1, tc.head_dim as i32, tc.rms_norm_eps, stream);
-            cuda_ops::rad_cuda_rope_yarn_f16(self.d_q.ptr, self.d_kv_normed.ptr, 1, n_heads_local as i32, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 1.0f32, stream);
+            cuda_ops::rad_cuda_rope_yarn_f16(self.d_q.ptr, self.d_kv_normed.ptr, 1, n_heads_local as i32, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, 1.0f32, stream);
             cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv_normed.ptr, self.d_kv_normed.ptr, self.kv_caches[0].k_cache.ptr, self.kv_caches[0].v_cache.ptr, 1, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
         }
         let _ = sync_t();
@@ -680,7 +849,7 @@ impl Dsv41Engine {
         unsafe {
             let sink_ptr = (lw.attn_sink.ptr as *const f32).add(self.rank * n_heads_local);
             cuda_ops::rad_cuda_mqa_attn_sink_causal_f16(self.d_q.ptr, self.kv_caches[0].k_cache.ptr, self.kv_caches[0].v_cache.ptr, sink_ptr, self.d_attn_out.ptr, 1, n_heads_local as i32, start_pos, self.max_ctx as i32, 0, tc.head_dim as i32, attn_scale, stream);
-            cuda_ops::rad_cuda_rope_yarn_f16(self.d_attn_out.ptr, std::ptr::null_mut(), 1, n_heads_local as i32, 0, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, -1.0f32, stream);
+            cuda_ops::rad_cuda_rope_yarn_f16(self.d_attn_out.ptr, std::ptr::null_mut(), 1, n_heads_local as i32, 0, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, -1.0f32, stream);
         }
         let _ = sync_t();
         let t_attn = t2.elapsed().as_secs_f64() * 1e6;
@@ -706,7 +875,7 @@ impl Dsv41Engine {
         let t5 = std::time::Instant::now();
         unsafe {
             cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(self.d_streams.ptr, b_self, b_peer, self.d_h_coeff.ptr as *const f32, 1, d as i32, tc.hc_sinkhorn_iters as i32, tc.hc_eps, stream);
-            cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_ffn_fn.ptr, lw.hc_ffn_base.ptr, lw.hc_ffn_scale.ptr, self.d_h_coeff.ptr, self.d_branch_in.ptr, 1, d as i32, tc.hc_eps, stream);
+            cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_ffn_fn.ptr, lw.hc_ffn_base.ptr, lw.hc_ffn_scale.ptr, self.d_pre_a.ptr, self.d_h_coeff.ptr, self.d_pre_b.ptr, self.d_branch_in.ptr, 1, d as i32, tc.rms_norm_eps, tc.hc_eps, stream);
             cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.ffn_norm.ptr, self.d_normed.ptr, 1, d as i32, tc.rms_norm_eps, stream);
             cuda_ops::rad_cuda_moe_route_sqrtsoftplus(self.d_normed.ptr, lw.gate_w.ptr, lw.gate_bias.ptr, self.d_gate_raw.ptr, self.d_gate_sel.ptr, self.d_topk_ids.ptr, self.d_topk_weights.ptr, 1, tc.n_routed_experts as i32, d as i32, tc.num_experts_per_tok as i32, tc.routed_scaling_factor, stream);
         }
@@ -808,18 +977,19 @@ impl Dsv41Engine {
         for l in 0..mtp.layers.len() {
             unsafe {
                 let lw = &mtp.layers[l];
-                cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_attn_fn.ptr, lw.hc_attn_base.ptr, lw.hc_attn_scale.ptr, self.d_h_coeff.ptr, self.d_branch_in.ptr, mi, d as i32, tc.hc_eps, stream);
+                let prev_pre = if l == 0 { std::ptr::null() } else { self.d_pre_b.ptr as *const c_void };
+                cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_attn_fn.ptr, lw.hc_attn_base.ptr, lw.hc_attn_scale.ptr, prev_pre, self.d_h_coeff.ptr, self.d_pre_a.ptr, self.d_branch_in.ptr, mi, d as i32, tc.rms_norm_eps, tc.hc_eps, stream);
                 cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.attn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
                 self.exl3_proj(self.d_normed.ptr, &lw.wq_a, self.d_q_lora.ptr, mi, 0, stream);
                 cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_q_lora.ptr, lw.q_norm.ptr, self.d_q_normed.ptr, mi, tc.q_lora_rank as i32, tc.rms_norm_eps, stream);
                 self.exl3_proj(self.d_q_normed.ptr, &lw.wq_b, self.d_q.ptr, mi, 0, stream);
                 self.exl3_proj(self.d_normed.ptr, &lw.wkv, self.d_kv.ptr, mi, 0, stream);
                 cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, lw.kv_norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, stream);
-                cuda_ops::rad_cuda_rope_yarn_f16(self.d_q.ptr, self.d_kv_normed.ptr, mi, n_heads_local as i32, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 1.0f32, stream);
+                cuda_ops::rad_cuda_rope_yarn_f16(self.d_q.ptr, self.d_kv_normed.ptr, mi, n_heads_local as i32, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, 1.0f32, stream);
                 cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv_normed.ptr, self.d_kv_normed.ptr, mtp.kv_caches[l].k_cache.ptr, mtp.kv_caches[l].v_cache.ptr, mi, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
                 let sink_ptr = (lw.attn_sink.ptr as *const f32).add(self.rank * n_heads_local);
                 cuda_ops::rad_cuda_mqa_attn_sink_causal_f16(self.d_q.ptr, mtp.kv_caches[l].k_cache.ptr, mtp.kv_caches[l].v_cache.ptr, sink_ptr, self.d_attn_out.ptr, mi, n_heads_local as i32, start_pos, self.max_ctx as i32, tc.sliding_window as i32, tc.head_dim as i32, attn_scale, stream);
-                cuda_ops::rad_cuda_rope_yarn_f16(self.d_attn_out.ptr, std::ptr::null_mut(), mi, n_heads_local as i32, 0, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, -1.0f32, stream);
+                cuda_ops::rad_cuda_rope_yarn_f16(self.d_attn_out.ptr, std::ptr::null_mut(), mi, n_heads_local as i32, 0, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, -1.0f32, stream);
                 for (gi, wo_slice) in lw.wo_a_slices.iter().enumerate() {
                     cuda_ops::rad_cuda_wo_a_gather_group_f16(self.d_attn_out.ptr, self.d_wo_grp_in.ptr, mi, n_heads_local as i32, heads_per_grp as i32, tc.head_dim as i32, gi as i32, stream);
                     self.exl3_proj(self.d_wo_grp_in.ptr, wo_slice, self.d_wo_grp_out.ptr, mi, 0, stream);
@@ -831,7 +1001,7 @@ impl Dsv41Engine {
             unsafe {
                 let lw = &mtp.layers[l];
                 cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(self.d_streams.ptr, b_self, b_peer, self.d_h_coeff.ptr as *const f32, mi, d as i32, tc.hc_sinkhorn_iters as i32, tc.hc_eps, stream);
-                cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_ffn_fn.ptr, lw.hc_ffn_base.ptr, lw.hc_ffn_scale.ptr, self.d_h_coeff.ptr, self.d_branch_in.ptr, mi, d as i32, tc.hc_eps, stream);
+                cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_ffn_fn.ptr, lw.hc_ffn_base.ptr, lw.hc_ffn_scale.ptr, self.d_pre_a.ptr, self.d_h_coeff.ptr, self.d_pre_b.ptr, self.d_branch_in.ptr, mi, d as i32, tc.rms_norm_eps, tc.hc_eps, stream);
                 cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.ffn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
                 let tk = tc.dspark_num_experts_per_tok as i32;
                 let inter = tc.moe_intermediate_size as i32;
@@ -855,7 +1025,7 @@ impl Dsv41Engine {
             }
         }
         unsafe {
-            cuda_ops::rad_cuda_mhc_collapse_mean_f16(self.d_streams.ptr, self.d_branch_in.ptr, mi, d as i32, stream);
+            cuda_ops::rad_cuda_mhc_pre_mix_only(self.d_streams.ptr, self.d_pre_b.ptr, self.d_branch_in.ptr, mi, d as i32, stream);
             cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, mtp.final_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
             self.exl3_proj(self.d_normed.ptr, &self.head, self.d_logits.ptr, mi, 0, stream);
             cuda_ops::rad_cuda_argmax_f16(self.d_logits.ptr, self.d_arg_vals.ptr, self.d_arg_ids.ptr, self.d_best_val.ptr, self.d_best_id.ptr, mi, self.head.n as i32, stream);
@@ -878,14 +1048,19 @@ impl Dsv41Engine {
     }
 
     pub fn step_speculative(&mut self, history: &[i32], anchor: i32, comm: &mut Tp2Comm) -> Result<Vec<i32>> {
-        let mut draft = if let Some(ng) = ngram_draft(history, anchor, 8) {
-            ng
-        } else if self.mtp.is_some() {
-            let mut dcmd = 5u32;
-            comm.broadcast_u32(&mut dcmd)?;
-            let mut a_val = anchor as u32;
-            comm.broadcast_u32(&mut a_val)?;
-            self.draft_dspark(anchor, comm)?
+        let max_k = MAX_BATCH.min(self.max_ctx.saturating_sub(self.pos + 1));
+        let mut draft = if max_k >= 4 {
+            if let Some(ng) = ngram_draft(history, anchor, max_k) {
+                ng
+            } else if self.mtp.is_some() {
+                let mut dcmd = 5u32;
+                comm.broadcast_u32(&mut dcmd)?;
+                let mut a_val = anchor as u32;
+                comm.broadcast_u32(&mut a_val)?;
+                self.draft_dspark(anchor, comm)?
+            } else {
+                vec![anchor]
+            }
         } else {
             vec![anchor]
         };
