@@ -64,7 +64,7 @@
 
   <text x="56" y="366" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Live HTTP SSE (322.9 tok/s/user)</text>
   <rect x="365" y="351" width="322" height="22" rx="5" fill="url(#cyanGrad)"/>
-  <text x="697" y="367" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">3,042.8 tok/s (2,303 full)</text>
+  <text x="697" y="367" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">3,042.8 tok/s (2,342 full)</text>
 
   <text x="56" y="400" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Hybrid DFlash 2 + K=128 (468.1/user)</text>
   <rect x="365" y="385" width="397" height="22" rx="5" fill="url(#greenGrad)"/>

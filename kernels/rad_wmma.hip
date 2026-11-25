@@ -231,7 +231,7 @@ extern "C" __global__ __launch_bounds__(128, 4) void gemm_q4_0_wmma_k(const uint
 
     __shared__ uint4 sm_wq[4][64];
     __shared__ float sm_dw[4][64];
-    __shared__ int2 sm_xq[4][4][32];
+    __shared__ int2 sm_xq[4][4][34];
     __shared__ float sm_xd[4][32];
     __shared__ int32_t sm_xs[4][32];
 
@@ -576,7 +576,7 @@ extern "C" __global__ __launch_bounds__(128, 4) void qkvrg_gemm_q4_wmma_k(const 
 
     __shared__ uint4 sm_wq[4][64];
     __shared__ float sm_dw[4][64];
-    __shared__ int2 sm_xq[4][4][32];
+    __shared__ int2 sm_xq[4][4][34];
     __shared__ float sm_xd[4][32];
     __shared__ int32_t sm_xs[4][32];
 
