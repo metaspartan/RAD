@@ -467,6 +467,57 @@ def test_tool_loop_breaker_and_post_loop_prose(base_url, headers):
     assert "\r\n\n  \r\n\n  \r\n\n" not in c2, f"degenerate whitespace loop detected: {c2!r}"
     print(f"[PASS] tool_loop_breaker_and_post_loop_prose: dup_blocked=True prose_len={len(c2)}")
 
+    cmd_a = "python -c \"print('ok')\""
+    cmd_b = "python -c \"import pathlib; print('check')\""
+    msgs_alt = [{"role": "user", "content": "Write the story file now."}]
+    for i, c in enumerate([cmd_a, cmd_b, cmd_a, cmd_b]):
+        msgs_alt.append({
+            "role": "assistant",
+            "content": "Checking environment.",
+            "tool_calls": [{
+                "id": f"call_alt_{i}",
+                "type": "function",
+                "function": {"name": "exec", "arguments": json.dumps({"command": c})},
+            }],
+        })
+        msgs_alt.append({"role": "tool", "tool_call_id": f"call_alt_{i}", "name": "exec", "content": "ok"})
+    st3, d3 = post_json(
+        f"{base_url}/v1/chat/completions",
+        {
+            "model": "inkling-2-mini",
+            "messages": msgs_alt,
+            "tools": tools,
+            "max_tokens": 128,
+            "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        headers,
+    )
+    assert st3 == 200
+    tcs3 = d3["choices"][0]["message"].get("tool_calls") or []
+    alt_dup = any(
+        tc["function"]["name"] == "exec" and json.loads(tc["function"]["arguments"]).get("command") in (cmd_a, cmd_b)
+        for tc in tcs3
+    )
+    assert not alt_dup, f"alternating loop A/B was not blocked: {tcs3}"
+
+    st4, d4 = post_json(
+        f"{base_url}/v1/chat/completions",
+        {
+            "model": "inkling-2-mini",
+            "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+            "tools": tools,
+            "tool_choice": "none",
+            "max_tokens": 64,
+            "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        headers,
+    )
+    assert st4 == 200
+    assert not (d4["choices"][0]["message"].get("tool_calls") or []), f"tool_choice=none emitted tool call: {d4}"
+    print("[PASS] alternating_tool_loop_and_tool_choice_none")
+
 
 def main():
     ap = argparse.ArgumentParser()

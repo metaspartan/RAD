@@ -55,7 +55,7 @@ pub(crate) fn canonical_tool_sig(name: &str, raw_args: &str) -> String {
     format!("{}:{}", name.trim(), norm_args)
 }
 
-pub(crate) fn detect_repeated_tool_loop(messages: &[ChatMessage]) -> (usize, Option<String>) {
+pub(crate) fn detect_repeated_tool_loop(messages: &[ChatMessage]) -> (usize, Vec<String>) {
     let mut recent_sigs: Vec<String> = Vec::new();
     for m in messages.iter().rev() {
         match m.role.as_str() {
@@ -78,7 +78,7 @@ pub(crate) fn detect_repeated_tool_loop(messages: &[ChatMessage]) -> (usize, Opt
                             parts.push(canonical_tool_sig(name, &args));
                         }
                         recent_sigs.push(parts.join("|"));
-                        if recent_sigs.len() >= 6 {
+                        if recent_sigs.len() >= 10 {
                             break;
                         }
                         continue;
@@ -91,15 +91,24 @@ pub(crate) fn detect_repeated_tool_loop(messages: &[ChatMessage]) -> (usize, Opt
         }
     }
     if recent_sigs.len() < 2 {
-        return (0, None);
+        return (0, Vec::new());
     }
-    let last = &recent_sigs[0];
-    let repeats = recent_sigs[1..].iter().filter(|prev| *prev == last).count();
-    if repeats > 0 {
-        (repeats, Some(last.clone()))
-    } else {
-        (0, None)
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for sig in &recent_sigs {
+        *counts.entry(sig.as_str()).or_insert(0) += 1;
     }
+    let mut max_repeats = 0usize;
+    let mut blocked = Vec::new();
+    for (sig, cnt) in counts {
+        if cnt >= 2 {
+            let reps = cnt - 1;
+            if reps > max_repeats {
+                max_repeats = reps;
+            }
+            blocked.push(sig.to_string());
+        }
+    }
+    (max_repeats, blocked)
 }
 
 pub(crate) fn apply_tool_loop_guard(
@@ -612,18 +621,29 @@ mod tests {
             make_turn(r#"{"command": "ls -la", "cwd": "/tmp"}"#),
             make_turn(r#"{"cwd":"/tmp","command":"ls -la"}"#),
         ];
-        let (cnt2, sig2) = detect_repeated_tool_loop(&msgs2);
+        let (cnt2, sigs2) = detect_repeated_tool_loop(&msgs2);
         assert_eq!(cnt2, 1);
-        assert!(sig2.is_some());
+        assert_eq!(sigs2.len(), 1);
 
         let msgs3 = vec![
             make_turn(r#"{"command": "ls -la"}"#),
             make_turn(r#"{"command":"ls -la"}"#),
             make_turn(r#"{"command": "ls -la"}"#),
         ];
-        let (cnt3, sig3) = detect_repeated_tool_loop(&msgs3);
+        let (cnt3, sigs3) = detect_repeated_tool_loop(&msgs3);
         assert_eq!(cnt3, 2);
-        assert_eq!(sig3.as_deref(), Some(canonical_tool_sig("exec", r#"{"command":"ls -la"}"#).as_str()));
+        assert!(sigs3.contains(&canonical_tool_sig("exec", r#"{"command":"ls -la"}"#)));
+
+        let msgs_alt = vec![
+            make_turn(r#"{"command": "print_ok"}"#),
+            make_turn(r#"{"command": "read_file"}"#),
+            make_turn(r#"{"command": "print_ok"}"#),
+            make_turn(r#"{"command": "read_file"}"#),
+        ];
+        let (cnt_alt, sigs_alt) = detect_repeated_tool_loop(&msgs_alt);
+        assert_eq!(cnt_alt, 1);
+        assert!(sigs_alt.contains(&canonical_tool_sig("exec", r#"{"command":"print_ok"}"#)));
+        assert!(sigs_alt.contains(&canonical_tool_sig("exec", r#"{"command":"read_file"}"#)));
 
         let mut prompt = String::from("<|begin_of_text|><|message_model|><|content_text|>");
         let mut samp = grammar::SamplingParams::greedy();
@@ -645,7 +665,7 @@ mod tests {
                 reasoning_content: None,
             },
         ];
-        assert_eq!(detect_repeated_tool_loop(&after_plain), (0, None));
+        assert_eq!(detect_repeated_tool_loop(&after_plain), (0, Vec::new()));
         after_plain.push(ChatMessage {
             role: "user".into(),
             content: json!("Continue with chapter 2."),
@@ -654,6 +674,6 @@ mod tests {
             name: None,
             reasoning_content: None,
         });
-        assert_eq!(detect_repeated_tool_loop(&after_plain), (0, None));
+        assert_eq!(detect_repeated_tool_loop(&after_plain), (0, Vec::new()));
     }
 }
