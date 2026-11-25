@@ -246,6 +246,112 @@ void exl3_mma_m16_mul1_k(
     }
 }
 
+template <int BITS>
+__global__ __launch_bounds__(256)
+void exl3_mma_m64_mul1_k(
+    const half* __restrict__ x_rot,
+    const uint16_t* __restrict__ trellis,
+    float* __restrict__ z_f32,
+    int M,
+    int K,
+    int N,
+    int split_k
+) {
+    constexpr int PACKED_U16 = 16 * BITS;
+    constexpr int PACKED_U32 = 8 * BITS;
+    int t = threadIdx.x;
+    int lane = t & 31;
+    int warp = t >> 5;
+    int n_tile = blockIdx.x * 8 + warp;
+    int m_block = blockIdx.y;
+    int sk = blockIdx.z;
+    int m_base = m_block * 64;
+    int K_tiles = K >> 4;
+    int N_tiles = N >> 4;
+    if (n_tile >= N_tiles || m_base >= M) return;
+
+    int kt_start = (K_tiles * sk) / split_k;
+    int kt_end = (K_tiles * (sk + 1)) / split_k;
+
+    __shared__ uint32_t s_packed[8][PACKED_U32];
+
+    float c0[4][4];
+    float c1[4][4];
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            c0[r][j] = 0.0f;
+            c1[r][j] = 0.0f;
+        }
+    }
+
+    int group_id = lane >> 2;
+    int tid_in_grp = lane & 3;
+    int k_off0 = tid_in_grp * 2;
+    int k_off1 = k_off0 + 8;
+
+    for (int kt = kt_start; kt < kt_end; ++kt) {
+        const uint32_t* g_tile = (const uint32_t*)(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
+        #pragma unroll
+        for (int w = lane; w < PACKED_U32; w += 32) {
+            s_packed[warp][w] = __ldg(g_tile + w);
+        }
+        __syncwarp();
+
+        uint32_t b00, b01, b10, b11;
+        mma_dq8_mul1<BITS>(s_packed[warp], lane * 8, b00, b01, b10, b11);
+
+        int kb = kt * 16;
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            int m0 = m_base + r * 16 + group_id;
+            int m1 = m0 + 8;
+            uint32_t a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u;
+            if (m0 < M) {
+                const half* p0 = x_rot + (size_t)m0 * K + kb;
+                a0 = *reinterpret_cast<const uint32_t*>(p0 + k_off0);
+                a2 = *reinterpret_cast<const uint32_t*>(p0 + k_off1);
+            }
+            if (m1 < M) {
+                const half* p1 = x_rot + (size_t)m1 * K + kb;
+                a1 = *reinterpret_cast<const uint32_t*>(p1 + k_off0);
+                a3 = *reinterpret_cast<const uint32_t*>(p1 + k_off1);
+            }
+            mma_m16n8k16_f32(c0[r][0], c0[r][1], c0[r][2], c0[r][3], a0, a1, a2, a3, b00, b01);
+            mma_m16n8k16_f32(c1[r][0], c1[r][1], c1[r][2], c1[r][3], a0, a1, a2, a3, b10, b11);
+        }
+        __syncwarp();
+    }
+
+    int col_base = n_tile * 16 + tid_in_grp * 2;
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int m0 = m_base + r * 16 + group_id;
+        int m1 = m0 + 8;
+        if (m0 < M) {
+            float* z0 = z_f32 + (size_t)m0 * N + col_base;
+            if (split_k == 1) {
+                z0[0] = c0[r][0]; z0[1] = c0[r][1];
+                z0[8] = c1[r][0]; z0[9] = c1[r][1];
+            } else {
+                atomicAdd(z0 + 0, c0[r][0]); atomicAdd(z0 + 1, c0[r][1]);
+                atomicAdd(z0 + 8, c1[r][0]); atomicAdd(z0 + 9, c1[r][1]);
+            }
+        }
+        if (m1 < M) {
+            float* z1 = z_f32 + (size_t)m1 * N + col_base;
+            if (split_k == 1) {
+                z1[0] = c0[r][2]; z1[1] = c0[r][3];
+                z1[8] = c1[r][2]; z1[9] = c1[r][3];
+            } else {
+                atomicAdd(z1 + 0, c0[r][2]); atomicAdd(z1 + 1, c0[r][3]);
+                atomicAdd(z1 + 8, c1[r][2]); atomicAdd(z1 + 9, c1[r][3]);
+            }
+        }
+    }
+}
+
 extern "C" {
 
 void rad_cuda_exl3_mma_f16(
@@ -263,7 +369,8 @@ void rad_cuda_exl3_mma_f16(
     cudaStream_t stream
 ) {
     int n_blocks = N / 128;
-    int m_blocks = (M + 15) / 16;
+    int use_m64 = (M >= 32);
+    int m_blocks = use_m64 ? ((M + 63) / 64) : ((M + 15) / 16);
     int total_mn = n_blocks * m_blocks;
     int target_ctas = 192;
     int split_k = (target_ctas + total_mn - 1) / total_mn;
@@ -275,12 +382,22 @@ void rad_cuda_exl3_mma_f16(
         cudaMemsetAsync(z_scratch_f32, 0, (size_t)M * N * sizeof(float), stream);
     }
     dim3 grid(n_blocks, m_blocks, split_k);
-    switch (bits) {
-        case 3: exl3_mma_m16_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-        case 4: exl3_mma_m16_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-        case 5: exl3_mma_m16_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-        case 6: exl3_mma_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-        case 8: exl3_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+    if (use_m64) {
+        switch (bits) {
+            case 3: exl3_mma_m64_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 4: exl3_mma_m64_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 5: exl3_mma_m64_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 6: exl3_mma_m64_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 8: exl3_mma_m64_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+        }
+    } else {
+        switch (bits) {
+            case 3: exl3_mma_m16_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 4: exl3_mma_m16_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 5: exl3_mma_m16_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 6: exl3_mma_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 8: exl3_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+        }
     }
     dim3 post_grid(n_blocks, M);
     mma_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh, y, N, wht_scale, add_to_y);
