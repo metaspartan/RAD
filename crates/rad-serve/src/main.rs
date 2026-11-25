@@ -922,7 +922,9 @@ fn prefill_with_drafter(
 }
 
 fn ngram_bucket_len(avail: usize) -> usize {
-    if avail >= 64 { 64 }
+    if avail >= 128 { 128 }
+    else if avail >= 96 { 96 }
+    else if avail >= 64 { 64 }
     else if avail >= 48 { 48 }
     else if avail >= 32 { 32 }
     else if avail >= 24 { 24 }
@@ -938,35 +940,37 @@ fn ngram_lookup_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<
         return None;
     }
     let min_follow = 8usize;
-    let mut best4: Option<usize> = None;
-    let mut best3: Option<usize> = None;
     let c = history[n - 1];
     let b = history[n - 2];
-    let a = history[n - 3];
-    let d = if n >= 4 { history[n - 4] } else { -1 };
-    let e = if n >= 5 { history[n - 5] } else { -1 };
+    let mut best_pos: Option<usize> = None;
+    let mut best_len: usize = 0;
     let mut i = n.saturating_sub(min_follow + 1);
     while i >= 2 {
         if history[i] == anchor && history[i - 1] == c && history[i - 2] == b {
-            if i >= 5 && n >= 5 && history[i - 3] == a && history[i - 4] == d && history[i - 5] == e {
-                let take = ngram_bucket_len((n - i).min(max_k));
-                if take >= min_follow {
-                    let mut out = Vec::with_capacity(take);
-                    out.push(anchor);
-                    out.extend_from_slice(&history[(i + 1)..(i + take)]);
-                    return Some(out);
-                }
+            let mut mlen = 3usize;
+            let max_m = 16usize.min(i).min(n);
+            while mlen < max_m && history[i - mlen] == history[n - mlen] {
+                mlen += 1;
             }
-            if best4.is_none() && i >= 3 && history[i - 3] == a {
-                best4 = Some(i);
-            } else if best3.is_none() {
-                best3 = Some(i);
+            if mlen > best_len {
+                best_len = mlen;
+                best_pos = Some(i);
+                if mlen >= 16 {
+                    break;
+                }
             }
         }
         i -= 1;
     }
-    if let Some(pos) = best4.or(best3) {
-        let take = ngram_bucket_len((n - pos).min(max_k));
+    if let Some(pos) = best_pos {
+        let cap_k = if best_len >= 6 {
+            max_k
+        } else if best_len >= 4 {
+            max_k.min(32)
+        } else {
+            max_k.min(16)
+        };
+        let take = ngram_bucket_len((n - pos).min(cap_k));
         if take >= min_follow {
             let mut out = Vec::with_capacity(take);
             out.push(anchor);
@@ -1220,7 +1224,9 @@ fn run_scheduler(
                     let t_step = Instant::now();
                     let needs_logits = slot.grammar.is_some() || !slot.sampling.is_greedy();
                     let res = (|| -> anyhow::Result<Vec<i32>> {
-                        let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[seq], slot.next_tok, 64) {
+                        let rem_kv = engine.max_ctx.saturating_sub(pos0 as usize);
+                        let max_ng_k = 128usize.min(rem_kv);
+                        let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[seq], slot.next_tok, max_ng_k) {
                             ng
                         } else if seq == 0 {
                             d.draft(slot.next_tok, &engine, spec_k)?
@@ -2775,9 +2781,9 @@ fn load_drafter(opts: &CliOpts, engine: &mut InklingEngine, max_seqs: usize) -> 
     }
     if let Some(ref p) = opts.dflash2 {
         if Path::new(p).exists() {
-            engine.capture_verify_graph(8)?;
-            engine.capture_verify_graph(48)?;
-            engine.capture_verify_graph(64)?;
+            for &bk in &[8usize, 12, 16, 24, 32, 48, 64, 96, 128] {
+                engine.capture_verify_graph(bk)?;
+            }
             let mut d = DFlash2Drafter::load_multi(Path::new(p), opts.ctx, max_seqs)?;
             d.capture_draft_graph(engine, 8)?;
             return Ok(Some(Drafter::DFlash2(d)));
@@ -3069,13 +3075,13 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
             .iter()
             .copied()
             .filter(|&t| t <= opts.ctx)
-            .map(|t| t.min(opts.ctx.saturating_sub(256)))
+            .map(|t| t.min(opts.ctx.saturating_sub(768)))
             .collect();
         if long_targets.len() >= 2 {
             println!();
-            println!("Long-Context Scaling (prefill + hybrid {spec_mode}/ngram K=64 decode):");
+            println!("Long-Context Scaling (prefill + hybrid {spec_mode}/ngram K=128 decode):");
             let block_txt = "pub struct KvBlock {\n    pub block_id: usize,\n    pub ref_count: u32,\n    pub tokens: [i32; 16],\n    pub dirty: bool,\n}\nimpl KvBlock {\n    pub fn new(block_id: usize) -> Self {\n        Self { block_id, ref_count: 1, tokens: [0; 16], dirty: false }\n    }\n    pub fn retain(&mut self) {\n        self.ref_count = self.ref_count.saturating_add(1);\n    }\n    pub fn release(&mut self) -> bool {\n        self.ref_count = self.ref_count.saturating_sub(1);\n        self.ref_count == 0\n    }\n}\n";
-            let target_txt = "pub struct KvCachePool {\n    pub blocks: Vec<KvBlock>,\n    pub free_list: Vec<usize>,\n    pub block_size: usize,\n    pub max_blocks: usize,\n}\nimpl KvCachePool {\n    pub fn with_capacity(max_blocks: usize, block_size: usize) -> Self {\n        let mut blocks = Vec::with_capacity(max_blocks);\n        let mut free_list = Vec::with_capacity(max_blocks);\n        for i in 0..max_blocks {\n            blocks.push(KvBlock::new(i));\n            free_list.push(max_blocks - 1 - i);\n        }\n        Self { blocks, free_list, block_size, max_blocks }\n    }\n    pub fn alloc_block(&mut self) -> Option<usize> {\n        let id = self.free_list.pop()?;\n        self.blocks[id].ref_count = 1;\n        self.blocks[id].dirty = true;\n        Some(id)\n    }\n    pub fn free_block(&mut self, id: usize) {\n        if id < self.blocks.len() && self.blocks[id].release() {\n            self.blocks[id].dirty = false;\n            self.free_list.push(id);\n        }\n    }\n    pub fn used_blocks(&self) -> usize {\n        self.max_blocks.saturating_sub(self.free_list.len())\n    }\n    pub fn free_blocks(&self) -> usize {\n        self.free_list.len()\n    }\n    pub fn utilization(&self) -> f64 {\n        if self.max_blocks == 0 { 0.0 } else { self.used_blocks() as f64 / self.max_blocks as f64 }\n    }\n    pub fn reset_all(&mut self) {\n        self.free_list.clear();\n        for i in 0..self.max_blocks {\n            self.blocks[i].ref_count = 0;\n            self.blocks[i].dirty = false;\n            self.free_list.push(self.max_blocks - 1 - i);\n        }\n    }\n}\n";
+            let target_txt = "pub struct KvCachePool {\n    pub blocks: Vec<KvBlock>,\n    pub free_list: Vec<usize>,\n    pub block_size: usize,\n    pub max_blocks: usize,\n    pub hits: u64,\n    pub misses: u64,\n}\nimpl KvCachePool {\n    pub fn with_capacity(max_blocks: usize, block_size: usize) -> Self {\n        let mut blocks = Vec::with_capacity(max_blocks);\n        let mut free_list = Vec::with_capacity(max_blocks);\n        for i in 0..max_blocks {\n            blocks.push(KvBlock::new(i));\n            free_list.push(max_blocks - 1 - i);\n        }\n        Self { blocks, free_list, block_size, max_blocks, hits: 0, misses: 0 }\n    }\n    pub fn alloc_block(&mut self) -> Option<usize> {\n        let id = self.free_list.pop()?;\n        self.blocks[id].ref_count = 1;\n        self.blocks[id].dirty = true;\n        Some(id)\n    }\n    pub fn free_block(&mut self, id: usize) {\n        if id < self.blocks.len() && self.blocks[id].release() {\n            self.blocks[id].dirty = false;\n            self.free_list.push(id);\n        }\n    }\n    pub fn retain_block(&mut self, id: usize) -> bool {\n        if id < self.blocks.len() && self.blocks[id].ref_count > 0 {\n            self.blocks[id].retain();\n            self.hits += 1;\n            true\n        } else {\n            self.misses += 1;\n            false\n        }\n    }\n    pub fn write_token(&mut self, id: usize, slot: usize, tok: i32) -> bool {\n        if id < self.blocks.len() && slot < 16 {\n            self.blocks[id].tokens[slot] = tok;\n            self.blocks[id].dirty = true;\n            true\n        } else {\n            false\n        }\n    }\n    pub fn read_token(&self, id: usize, slot: usize) -> Option<i32> {\n        if id < self.blocks.len() && slot < 16 {\n            Some(self.blocks[id].tokens[slot])\n        } else {\n            None\n        }\n    }\n    pub fn used_blocks(&self) -> usize {\n        self.max_blocks.saturating_sub(self.free_list.len())\n    }\n    pub fn free_blocks(&self) -> usize {\n        self.free_list.len()\n    }\n    pub fn utilization(&self) -> f64 {\n        if self.max_blocks == 0 { 0.0 } else { self.used_blocks() as f64 / self.max_blocks as f64 }\n    }\n    pub fn hit_rate(&self) -> f64 {\n        let total = self.hits + self.misses;\n        if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }\n    }\n    pub fn reset_all(&mut self) {\n        self.free_list.clear();\n        for i in 0..self.max_blocks {\n            self.blocks[i].ref_count = 0;\n            self.blocks[i].dirty = false;\n            self.free_list.push(self.max_blocks - 1 - i);\n        }\n        self.hits = 0;\n        self.misses = 0;\n    }\n}\n";
             let block_ids: Vec<i32> = tokenizer.encode(block_txt, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
             let target_ids: Vec<i32> = tokenizer.encode(target_txt, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
             let prefix_p = format_prompt(
@@ -3101,8 +3107,9 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
                 let mut gen = 0usize;
                 let mut rounds = 0usize;
                 let td = Instant::now();
-                while gen < 256 {
-                    let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[0], ct, 64) {
+                while gen < 512 {
+                    let rem_kv = engine.max_ctx.saturating_sub(engine.pos as usize);
+                    let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[0], ct, 128usize.min(rem_kv)) {
                         ng
                     } else {
                         d.draft(ct, &engine, k_len)?

@@ -676,15 +676,18 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restri
     int pos_q = pos0 + q_idx;
     int n_q_tile = min(16, B - q_off);
     int t_max = pos0 + q_off + n_q_tile;
+    int b_stride = (B > 64) ? 128 : 64;
+    int eff_splits = min(n_splits, max(16, (pos0 + B + 255) >> 8));
+    if (sp >= eff_splits) return;
 
     int total_tiles = (t_max + 15) / 16;
-    int tiles_per_sp = (total_tiles + n_splits - 1) / n_splits;
+    int tiles_per_sp = (total_tiles + eff_splits - 1) / eff_splits;
     int tile_s = sp * tiles_per_sp * 16;
     int tile_e = min(t_max, tile_s + tiles_per_sp * 16);
 
     if (tile_s >= tile_e) {
         if (tg == 0 && half == 0 && vq) {
-            float* dst = split_buf + (((size_t)h * n_splits + sp) * 64 + q_idx) * 130;
+            float* dst = split_buf + (((size_t)h * n_splits + sp) * b_stride + q_idx) * 130;
             dst[0] = -1e30f;
             dst[1] = 0.0f;
         }
@@ -879,7 +882,7 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restri
             float sc0 = (m0 > -1e20f) ? expf(m0 - gm) : 0.0f;
             float sc1 = (m1 > -1e20f) ? expf(m1 - gm) : 0.0f;
             float gl = sm_l[0][gg][bt] * sc0 + sm_l[1][gg][bt] * sc1;
-            float* dst = split_buf + (((size_t)h_out * n_splits + sp) * 64 + (q_off + bt)) * 130;
+            float* dst = split_buf + (((size_t)h_out * n_splits + sp) * b_stride + (q_off + bt)) * 130;
             if (lane == 0) { dst[0] = gm; dst[1] = gl; }
 #pragma unroll
             for (int blk = 0; blk < 4; ++blk) {
@@ -917,19 +920,22 @@ extern "C" __global__ void attn_b48_gqa3_flash_split_q8kv_k(const float* __restr
     int q_dim = n_head * dh;
     int r_dim = n_head * d_rel;
 
-    int q_idx = qsub * 16 + col;
+    int q_idx = blockIdx.z * 64 + qsub * 16 + col;
     bool vq = (q_idx < B);
     int pos_q = pos0 + q_idx;
     int t_max = pos0 + B;
+    int b_stride = (B > 64) ? 128 : 64;
+    int eff_splits = min(n_splits, max(16, (t_max + 255) >> 8));
+    if (sp >= eff_splits) return;
 
     int total_tiles = (t_max + 15) / 16;
-    int tiles_per_sp = (total_tiles + n_splits - 1) / n_splits;
+    int tiles_per_sp = (total_tiles + eff_splits - 1) / eff_splits;
     int tile_s = sp * tiles_per_sp * 16;
     int tile_e = min(t_max, tile_s + tiles_per_sp * 16);
 
     if (tile_s >= tile_e) {
         if (half == 0 && vq) {
-            float* dst = split_buf + (((size_t)h * n_splits + sp) * 64 + q_idx) * 130;
+            float* dst = split_buf + (((size_t)h * n_splits + sp) * b_stride + q_idx) * 130;
             dst[0] = -1e30f;
             dst[1] = 0.0f;
         }
@@ -1093,7 +1099,7 @@ extern "C" __global__ void attn_b48_gqa3_flash_split_q8kv_k(const float* __restr
     }
 
     if (vq) {
-        float* dst = split_buf + (((size_t)h * n_splits + sp) * 64 + q_idx) * 130;
+        float* dst = split_buf + (((size_t)h * n_splits + sp) * b_stride + q_idx) * 130;
         if (half == 0) {
             dst[0] = m_q;
             dst[1] = l_q;
@@ -1110,24 +1116,26 @@ extern "C" __global__ void attn_b48_gqa3_flash_split_q8kv_k(const float* __restr
 
 extern "C" __global__ void attn_b8_flash_reduce_q8kv_k(const float* __restrict__ split_buf,
                                                        const float* __restrict__ gate,
+                                                       const int* __restrict__ d_pos0,
                                                        q8kv_q8_1_blk* __restrict__ out_q8,
-                                                       int n_head, int n_splits) {
+                                                       int n_head, int B, int b_stride, int n_splits) {
     int h = blockIdx.x;
     int bt = blockIdx.y;
     int wid = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int d = wid * 32 + lane;
     int q_dim = n_head * 128;
+    int eff_splits = min(n_splits, max(16, (*d_pos0 + B + 255) >> 8));
 
     float gm = -1e30f;
-    for (int sp = 0; sp < n_splits; ++sp) {
-        const float* p = split_buf + (((size_t)h * n_splits + sp) * 64 + bt) * 130;
+    for (int sp = 0; sp < eff_splits; ++sp) {
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * b_stride + bt) * 130;
         gm = fmaxf(gm, p[0]);
     }
     float gl = 0.0f;
     float go = 0.0f;
-    for (int sp = 0; sp < n_splits; ++sp) {
-        const float* p = split_buf + (((size_t)h * n_splits + sp) * 64 + bt) * 130;
+    for (int sp = 0; sp < eff_splits; ++sp) {
+        const float* p = split_buf + (((size_t)h * n_splits + sp) * b_stride + bt) * 130;
         if (p[0] > -1e20f) {
             float sc = expf(p[0] - gm);
             gl += p[1] * sc;
@@ -1946,16 +1954,18 @@ extern "C" int ink_kv_conv_qkvr_store_multi_snap_q8kv(hipStream_t s, float* Q, c
 }
 
 extern "C" int ink_attn_b8_flash_q8_q8kv(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const int8_t* kc, const int8_t* vc, const __half* ks, const __half* vs, const float* gate, const int* d_pos0, void* out_q8, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int max_ctx, int B) {
-    int n_splits = (max_ctx > 65536) ? 96 : ((max_ctx > 32768) ? 64 : ((max_ctx > 2048) ? 32 : 8));
+    int b_stride = (B > 64) ? 128 : 64;
+    int max_sp = (B > 64) ? 48 : 96;
+    int n_splits = (max_ctx > 65536) ? max_sp : ((max_ctx > 32768) ? ((64 < max_sp) ? 64 : max_sp) : ((max_ctx > 2048) ? 32 : 8));
     float* sbuf = nullptr;
     (void)hipGetSymbolAddress((void**)&sbuf, HIP_SYMBOL(g_q8kv_b8_split_buf));
-    if (B > 16 && B <= 64 && n_head == n_head_kv * 3 && dh == 128) {
+    if (B > 16 && B <= 128 && n_head == n_head_kv * 3 && dh == 128) {
         int nthreads = (B <= 48) ? 288 : 384;
-        attn_b48_gqa3_flash_split_q8kv_k<<<dim3(n_head_kv, n_splits), dim3(nthreads), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, d_pos0, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B, n_splits);
+        attn_b48_gqa3_flash_split_q8kv_k<<<dim3(n_head_kv, n_splits, (B + 63) / 64), dim3(nthreads), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, d_pos0, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B, n_splits);
     } else {
         attn_b8_gqa3_flash_split_q8kv_k<<<dim3(n_head_kv, n_splits, (B + 15) / 16), dim3(192), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, d_pos0, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B, n_splits);
     }
-    attn_b8_flash_reduce_q8kv_k<<<dim3(n_head, B), dim3(128), 0, s>>>(sbuf, gate, (q8kv_q8_1_blk*)out_q8, n_head, n_splits);
+    attn_b8_flash_reduce_q8kv_k<<<dim3(n_head, B), dim3(128), 0, s>>>(sbuf, gate, d_pos0, (q8kv_q8_1_blk*)out_q8, n_head, B, b_stride, n_splits);
     return 0;
 }
 
