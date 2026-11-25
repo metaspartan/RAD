@@ -1110,10 +1110,10 @@ fn run_scheduler(
             }
         }
 
-        let mut pf_budget = if active.is_empty() { 1024 } else { prefill_chunk_size.max(64).min(1024) };
+        let mut pf_budget = if active.is_empty() || prefilling.len() > active.len() { 2048 } else { prefill_chunk_size.max(64).min(1024) };
         while pf_budget > 0 {
             let Some(mut pf) = prefilling.pop_front() else { break; };
-            let end = (pf.offset + pf_budget).min(pf.job.prompt_ids.len());
+            let end = (pf.offset + pf_budget.min(1024)).min(pf.job.prompt_ids.len());
             let chunk = &pf.job.prompt_ids[pf.offset..end];
             pf_budget = pf_budget.saturating_sub(chunk.len());
             let pos0 = engine.seq_pos[pf.seq];
@@ -1355,13 +1355,59 @@ fn run_scheduler(
             if let Some(ref mut d) = drafter {
                 let all_ready = active.iter().all(|a| a.seq < d.max_seqs() && d.seq_ctx_len(a.seq) == engine.seq_pos[a.seq]);
                 if all_ready {
-                    let multi_k = if active.len() == 1 { spec_k } else { 4usize };
+                    let n_u = active.len();
+                    let max_user_k = (engine.multi_verify_cap / n_u).min(64);
+                    let mut ng_drafts: Option<Vec<Vec<i32>>> = None;
+                    if n_u >= 2 && max_user_k >= 8 {
+                        let mut cands: Vec<Option<Vec<i32>>> = Vec::with_capacity(n_u);
+                        let mut hit_count = 0usize;
+                        let mut max_hit_len = 0usize;
+                        for a in &active {
+                            let rem_kv = engine.max_ctx.saturating_sub(engine.seq_pos[a.seq] as usize);
+                            if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[a.seq], a.next_tok, max_user_k.min(rem_kv)) {
+                                if ng.len() >= 8 {
+                                    hit_count += 1;
+                                    max_hit_len = max_hit_len.max(ng.len());
+                                }
+                                cands.push(Some(ng));
+                            } else {
+                                cands.push(None);
+                            }
+                        }
+                        if hit_count * 2 >= n_u {
+                            let bk = ngram_bucket_len(max_hit_len);
+                            if bk >= 8 {
+                                let mut padded: Vec<Vec<i32>> = Vec::with_capacity(n_u);
+                                for (idx, c) in cands.into_iter().enumerate() {
+                                    let mut v = c.unwrap_or_else(|| vec![active[idx].next_tok]);
+                                    if v.len() > bk {
+                                        v.truncate(bk);
+                                    } else if v.len() < bk {
+                                        let pad = *v.last().unwrap_or(&active[idx].next_tok);
+                                        v.resize(bk, pad);
+                                    }
+                                    padded.push(v);
+                                }
+                                ng_drafts = Some(padded);
+                            }
+                        }
+                    }
+                    let multi_k = if let Some(ref ng) = ng_drafts {
+                        ng[0].len()
+                    } else if n_u == 1 {
+                        spec_k
+                    } else {
+                        4usize
+                    };
                     let seq_ids: Vec<i32> = active.iter().map(|a| a.seq as i32).collect();
                     let anchors: Vec<i32> = active.iter().map(|a| a.next_tok).collect();
                     let pos_before: Vec<i32> = active.iter().map(|a| engine.seq_pos[a.seq]).collect();
                     let t_step = Instant::now();
                     let res = (|| -> anyhow::Result<Vec<Vec<i32>>> {
-                        let drafts = d.draft_multi(&seq_ids, &anchors, &engine, multi_k)?;
+                        let drafts = match ng_drafts {
+                            Some(ng) => ng,
+                            None => d.draft_multi(&seq_ids, &anchors, &engine, multi_k)?,
+                        };
                         let preds = engine.verify_multi(&seq_ids, &drafts)?;
                         let mut emits = vec![0usize; active.len()];
                         let mut outs = Vec::with_capacity(active.len());
@@ -2848,7 +2894,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
     };
     let mut engine = InklingEngine::load_multi(Path::new(&opts.model), opts.ctx.max(4096), max_seqs)?;
     engine.capture_decode_graph()?;
-    let mut drafter = load_drafter(opts, &mut engine, max_seqs.min(8))?;
+    let mut drafter = load_drafter(opts, &mut engine, max_seqs.min(16))?;
     let load_s = t0.elapsed().as_secs_f64();
     let spec_mode = drafter.as_ref().map(|d| d.mode_name()).unwrap_or("none");
     println!("Loaded model in {:.2}s (spec={spec_mode}, ctx={}, max_seqs={max_seqs})", load_s, opts.ctx);
@@ -3060,6 +3106,79 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
                 let agg = tot as f64 / t1.elapsed().as_secs_f64();
                 let per_u = agg / b as f64;
                 println!("| Multi-User B={b} ({spec_mode} K={mk}) | {:.1} agg tok/s | {:.1} tok/s/user (ITL {:.1}ms) |", agg, per_u, 1000.0 / per_u);
+
+                let hk_max = (engine.multi_verify_cap / b).min(64);
+                if hk_max >= 16 {
+                    let edit_txt = "pub struct KvCachePool {\n    pub blocks: Vec<KvBlock>,\n    pub free_list: Vec<usize>,\n    pub block_size: usize,\n    pub max_blocks: usize,\n    pub hits: u64,\n    pub misses: u64,\n}\nimpl KvCachePool {\n    pub fn with_capacity(max_blocks: usize, block_size: usize) -> Self {\n        let mut blocks = Vec::with_capacity(max_blocks);\n        let mut free_list = Vec::with_capacity(max_blocks);\n        for i in 0..max_blocks {\n            blocks.push(KvBlock::new(i));\n            free_list.push(max_blocks - 1 - i);\n        }\n        Self { blocks, free_list, block_size, max_blocks, hits: 0, misses: 0 }\n    }\n    pub fn alloc_block(&mut self) -> Option<usize> {\n        let id = self.free_list.pop()?;\n        self.blocks[id].ref_count = 1;\n        self.blocks[id].dirty = true;\n        Some(id)\n    }\n    pub fn free_block(&mut self, id: usize) {\n        if id < self.blocks.len() && self.blocks[id].release() {\n            self.blocks[id].dirty = false;\n            self.free_list.push(id);\n        }\n    }\n    pub fn used_blocks(&self) -> usize {\n        self.max_blocks.saturating_sub(self.free_list.len())\n    }\n    pub fn free_blocks(&self) -> usize {\n        self.free_list.len()\n    }\n    pub fn utilization(&self) -> f64 {\n        if self.max_blocks == 0 { 0.0 } else { self.used_blocks() as f64 / self.max_blocks as f64 }\n    }\n}\n";
+                    let hp = format_prompt(
+                        &[ChatMessage { role: "user".into(), content: json!(format!("Output ONLY the exact `KvCachePool` struct and `impl KvCachePool` code verbatim (no markdown fences, no commentary):\n{edit_txt}")), tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }],
+                        false,
+                    );
+                    let hids: Vec<i32> = tokenizer.encode(hp, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+                    let mut hcur = vec![0i32; b];
+                    for u in 0..b {
+                        engine.reset_seq(u)?;
+                        d.reset_seq(u);
+                        let (t, _) = prefill_with_drafter(&mut engine, u, &hids, &[], None, Some(d), None)?;
+                        hcur[u] = t;
+                    }
+                    let warm_d: Vec<Vec<i32>> = (0..b).map(|u| vec![hcur[u]; hk_max]).collect();
+                    let _ = engine.verify_multi(&seq_ids, &warm_d)?;
+                    for u in 0..b {
+                        engine.reset_seq(u)?;
+                        d.reset_seq(u);
+                        let (t, _) = prefill_with_drafter(&mut engine, u, &hids, &[], None, Some(d), None)?;
+                        hcur[u] = t;
+                    }
+                    let mut htot = 0usize;
+                    let ht0 = Instant::now();
+                    let mut hrounds = 0usize;
+                    while htot < b * 240 && hrounds < 40 {
+                        let mut cands: Vec<Vec<i32>> = Vec::with_capacity(b);
+                        let mut min_l = hk_max;
+                        let mut all_ng = true;
+                        for u in 0..b {
+                            if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[u], hcur[u], hk_max) {
+                                min_l = min_l.min(ng.len());
+                                cands.push(ng);
+                            } else {
+                                all_ng = false;
+                                break;
+                            }
+                        }
+                        let (drafts, rk) = if all_ng && ngram_bucket_len(min_l) >= 8 {
+                            let bk = ngram_bucket_len(min_l);
+                            for c in &mut cands { c.truncate(bk); }
+                            (cands, bk)
+                        } else {
+                            (d.draft_multi(&seq_ids, &hcur, &engine, mk)?, mk)
+                        };
+                        let pos0: Vec<i32> = (0..b).map(|u| engine.seq_pos[u]).collect();
+                        let preds = engine.verify_multi(&seq_ids, &drafts)?;
+                        let mut emits = vec![0usize; b];
+                        for u in 0..b {
+                            let mut n_acc = 1usize;
+                            for j in 0..(rk - 1) {
+                                if preds[u][j] == drafts[u][j + 1] { n_acc += 1; } else { break; }
+                            }
+                            emits[u] = n_acc;
+                            for j in 0..n_acc {
+                                engine.seq_tokens[u].push(drafts[u][j]);
+                            }
+                            hcur[u] = preds[u][n_acc - 1];
+                            htot += n_acc;
+                        }
+                        engine.rewind_verify_multi(&seq_ids, &emits, rk)?;
+                        for u in 0..b {
+                            d.inject_batch_seq_async(u, &engine, u * rk, pos0[u], emits[u])?;
+                        }
+                        d.sync();
+                        hrounds += 1;
+                    }
+                    let hagg = htot as f64 / ht0.elapsed().as_secs_f64();
+                    let hpu = hagg / b as f64;
+                    println!("| Multi-User B={b} (Hybrid {spec_mode}+K={hk_max}) | {:.1} agg tok/s | {:.1} tok/s/user (ITL {:.1}ms) |", hagg, hpu, 1000.0 / hpu);
+                }
             }
         }
     }

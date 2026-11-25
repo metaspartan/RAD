@@ -24,7 +24,7 @@ RAD natively runs **Inkling-2-Mini** (26B MoE, 48 looped visits, hybrid SWA + fu
   - Spawns one dedicated GPU scheduler + DFlash 2 + Vision + Paged KV worker per GPU with **prefix-aware least-loaded routing** (matching prompt prefixes stick to the same GPU for KV cache hits while balancing concurrent requests across all GPUs) — zero PCIe all-reduce overhead and linear multi-user throughput & KV capacity scaling.
   - Automatic HIP peer-access detection (`hipDeviceCanAccessPeer` / `hipDeviceEnablePeerAccess`), cross-stream HIP event-synchronized (`hipEventRecord` / `hipStreamWaitEvent`) direct `hipMemcpyPeerAsync` + on-GPU `ink_vec_add` AllReduce/Broadcast with pinned-host fallback (`crates/rad-core/src/comm.rs`), tensor-parallel sharding plan (`crates/rad-core/src/tp.rs`), and GPU/P2P topology inspection via `rad info` and `GET /health`.
 - **Production OpenAI-Compatible Serving (`rad serve`)**
-  - Continuous batching up to `B=128` (**`1,856.0 agg tok/s`**), **Paged KV block manager** (`--kv-block-size 16`, copy-on-write prefix sharing & refcounting), **Budgeted Chunked Prefill** (`--prefill-chunk-size 512`, draining concurrent short prefills into batched decode without ramp-up stalls — **`604.1 agg tok/s` live 8-user SSE**), **JSON & Tool-Calling Grammar Constraints**, **`stop` sequences**, **`seed` / `presence_penalty` / `frequency_penalty`**, **`400 context_length_exceeded`** overflow guard, **Prometheus `GET /metrics`**, optional **multi-key API auth** (`Authorization: Bearer` & `X-API-Key`, `--metrics-auth`), CORS + `x-request-id` middleware, and non-conflicting default port **`6733`**.
+  - Continuous batching up to `B=128` (**`1,856.0 agg tok/s`** no-spec), **Multi-User Hybrid Speculative Verify (`K=32/64` per user + Per-User WMMA FlashAttention in `verify_multi`)** hitting **`2,460.7 agg tok/s` (`307.6 tok/s/user`, `3.3 ms` ITL) at `B=8`**, **`2,451.6 agg tok/s` (`153.2 tok/s/user`) at `B=16`**, and **`1,825.0 agg tok/s` (`456.3 tok/s/user`, `2.2 ms` ITL) at `B=4`**, **Paged KV block manager** (`--kv-block-size 16`, copy-on-write prefix sharing & refcounting), **Budgeted Chunked Prefill** (`--prefill-chunk-size 512`, **`1,289.0 agg tok/s` concurrent / `2,017 tok/s` peak 1s burst live 8-user SSE**), **JSON & Tool-Calling Grammar Constraints**, **`stop` sequences**, **`seed` / `presence_penalty` / `frequency_penalty`**, **`400 context_length_exceeded`** overflow guard, **Prometheus `GET /metrics`**, optional **multi-key API auth** (`Authorization: Bearer` & `X-API-Key`, `--metrics-auth`), CORS + `x-request-id` middleware, and non-conflicting default port **`6733`**.
   - Endpoints: `GET /health`, `GET /metrics`, `GET /v1/models`, `GET /v1/models/:id`, `POST /v1/tokenize`, `POST /v1/detokenize`, `POST /v1/chat/completions` (JSON + SSE + `stream_options.include_usage`), `POST /v1/completions` (single + batch), `POST /v1/responses` (HTTP + SSE with `usage` in `response.completed`), `GET /v1/responses` (WebSocket).
 
 ---
@@ -72,17 +72,20 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **Cold Load (`ctx=262144`, DFlash 2)** | **1.80 s** | On-GPU `Q4_0_SOA` + `Q8_0` conversion & `hipGraph` capture |
 | **Short Prompt TTFT (`24 tok`)** | **32.7 ± 0.0 ms** | 3-run mean; 8-warp LDS WMMA + high-occupancy `sink_dyn_bf16_smallb_k` |
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **21.2 ms** | Prefix-cache affinity hit + GQA 3:1 Split-KV FlashAttention |
-| **Multi-User Decode (`B=4`, Batched DFlash 2 `K=4`)** | **509.3 agg tok/s** | **`127.3 tok/s/user`** (`ITL 7.9 ms`, 1-launch rewind + unrolled `nt == 8` MoE) |
+| **Multi-User Decode (`B=4`, Batched DFlash 2 `K=4`)** | **514.5 agg tok/s** | **`128.6 tok/s/user`** (`ITL 7.8 ms`, 1-launch rewind + unrolled `nt == 8` MoE) |
+| **Multi-User Decode (`B=4`, Hybrid DFlash 2 + `K=64`)** | **1,825.0 agg tok/s** | **`456.3 tok/s/user`** (`ITL 2.2 ms`, Per-User WMMA FlashAttention + `K=64` multi-user verify) |
 | **Multi-User Decode (`B=8`, no-spec)** | **643.6 agg tok/s** | **`80.4 tok/s/user`** (`ITL 12.4 ms`, `hipGraph` + GQA-3:1 INT8 KV + `loop_ctrl_down_nt_k<8>`) |
-| **Multi-User Decode (`B=8`, Batched DSpark `K=4`)** | **458.6 agg tok/s** | `57.3 tok/s/user` |
-| **Multi-User Decode (`B=8`, Batched DFlash 2 `K=4`)** | **739.3 agg tok/s** | **`92.4 tok/s/user`** (`ITL 10.8 ms`; `blockIdx.z` MoE + `fused_rg B<=64` + GQA-3:1 INT8 KV) |
+| **Multi-User Decode (`B=8`, Batched DFlash 2 `K=4`)** | **740.5 agg tok/s** | **`92.6 tok/s/user`** (`ITL 10.8 ms`; `blockIdx.z` MoE + `fused_rg B<=64` + GQA-3:1 INT8 KV) |
+| **Multi-User Decode (`B=8`, Hybrid DFlash 2 + `K=64`)** | **2,460.7 agg tok/s** | **`307.6 tok/s/user`** (`ITL 3.3 ms`, Per-User WMMA FlashAttention + `512`-tok batched verify) |
 | **Multi-User Decode (`B=16`, no-spec)** | **926.3 agg tok/s** | **`57.9 tok/s/user`** (`ITL 17.3 ms`, unrolled `nt == 8` MoE + GQA-3:1 INT8 KV) |
+| **Multi-User Decode (`B=16`, Batched DFlash 2 `K=4`)** | **1,118.1 agg tok/s** | **`69.9 tok/s/user`** (`ITL 14.3 ms`) |
+| **Multi-User Decode (`B=16`, Hybrid DFlash 2 + `K=32`)** | **2,451.6 agg tok/s** | **`153.2 tok/s/user`** (`ITL 6.5 ms`, Per-User WMMA FlashAttention + `512`-tok batched verify) |
 | **Multi-User Decode (`B=32`, no-spec)** | **1,277.8 agg tok/s** | **`39.9 tok/s/user`** (`ITL 25.0 ms`; +47% via `blockIdx.z` hot-expert splitting & `fused_rg B<=64`) |
 | **Multi-User Decode (`B=64`, no-spec)** | **1,162.2 agg tok/s** | `18.2 tok/s/user` (8-warp `128×64` LDS WMMA MoE) |
 | **Multi-User Decode (`B=128`, no-spec)** | **1,856.0 agg tok/s** | **`14.5 tok/s/user`** (fused WMMA MoE-to-`Q8_1` + `float4` slot reduction) |
 | **Live SSE API (`/v1/chat/completions`, real code edit)** | **1,010.5 tok/s** | Live HTTP SSE streaming `1,600` Python tokens in `1.58 s` (`14.3×` stock `llama.cpp`; `1,001.1 tok/s` over `1,900` tok) |
 | **30-Turn Agentic E2E (`exec` + `write_file` + `read_file`)** | **92.0% avg prefix cache** | `30` turns up to `15.5K` ctx, `21` tool calls, `0` JSON errors, `38–65 ms` cached TTFT, GPU top-64 sampling (`ink_logits_topk64_batch`) |
-| **Live SSE API (8-User Concurrent, DFlash 2 `K=4`)** | **604.1 agg tok/s** | **`75.5 tok/s/user`** decode window (`591.2 agg tok/s` end-to-end wall-clock incl. prefill) |
+| **Live SSE API (8-User Concurrent, Hybrid `K=64`)** | **1,289.0 agg tok/s** | **`161.1 tok/s/user`** full-overlap concurrent (**`2,017 tok/s`** peak 1s burst; `907.8 agg tok/s` over `9,295` tok decode span) |
 
 ---
 

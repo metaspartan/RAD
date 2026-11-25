@@ -572,8 +572,8 @@ extern "C" __global__ void kv_conv_qkvr_store_multi_snap_q8kv_k(float* __restric
         float sc = k_dyn ? rsqrtf(9.0f) : rsqrtf(5.0f);
         float* k_hist = k_hist_pool + (size_t)seq * kv_dim * 3;
         float* v_hist = v_hist_pool + (size_t)seq * kv_dim * 3;
-        float* k_snap = k_snap_pool ? (k_snap_pool + (size_t)u * 8 * kv_dim * 3) : nullptr;
-        float* v_snap = v_snap_pool ? (v_snap_pool + (size_t)u * 8 * kv_dim * 3) : nullptr;
+        float* k_snap = k_snap_pool ? (k_snap_pool + (size_t)u * K * kv_dim * 3) : nullptr;
+        float* v_snap = v_snap_pool ? (v_snap_pool + (size_t)u * K * kv_dim * 3) : nullptr;
         float kh0[4], kh1[4], kh2[4], vh0[4], vh1[4], vh2[4];
 #pragma unroll
         for (int p = 0; p < 4; ++p) {

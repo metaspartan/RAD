@@ -4302,8 +4302,8 @@ extern "C" __global__ void kv_conv_qkvr_store_multi_snap_k(float* __restrict__ Q
         float sc = k_dyn ? rsqrtf(9.0f) : rsqrtf(5.0f);
         float* k_hist = k_hist_pool + (size_t)seq * kv_dim * 3;
         float* v_hist = v_hist_pool + (size_t)seq * kv_dim * 3;
-        float* k_snap = k_snap_pool ? (k_snap_pool + (size_t)u * 8 * kv_dim * 3) : nullptr;
-        float* v_snap = v_snap_pool ? (v_snap_pool + (size_t)u * 8 * kv_dim * 3) : nullptr;
+        float* k_snap = k_snap_pool ? (k_snap_pool + (size_t)u * K * kv_dim * 3) : nullptr;
+        float* v_snap = v_snap_pool ? (v_snap_pool + (size_t)u * K * kv_dim * 3) : nullptr;
         size_t seq_kv_stride = (size_t)n_head_kv * max_ctx * dh;
         __half* kc_base = k_cache_pool + (size_t)seq * seq_kv_stride;
         __half* vc_base = v_cache_pool + (size_t)seq * seq_kv_stride;
@@ -4394,7 +4394,7 @@ extern "C" __global__ void shortconv_res_multi_snap_k(const float* __restrict__ 
     int seq = d_seq_ids[u * K];
     int bt_base = u * K;
     float* hc = hist_pool + ((size_t)seq * n_embd + c) * 3;
-    float* sn_base = snap_pool ? (snap_pool + (size_t)u * 8 * n_embd * 3) : nullptr;
+    float* sn_base = snap_pool ? (snap_pool + (size_t)u * K * n_embd * 3) : nullptr;
     float h0 = hc[0], h1 = hc[1], h2 = hc[2];
     const float* wc = conv_w + (size_t)c * 4;
     float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
@@ -4437,7 +4437,7 @@ extern "C" __global__ void shortconv_res_multi_snap_clear_k(float* __restrict__ 
     int seq = d_seq_ids[u * K];
     int bt_base = u * K;
     float* hc = hist_pool + ((size_t)seq * n_embd + c) * 3;
-    float* sn_base = snap_pool ? (snap_pool + (size_t)u * 8 * n_embd * 3) : nullptr;
+    float* sn_base = snap_pool ? (snap_pool + (size_t)u * K * n_embd * 3) : nullptr;
     float h0 = hc[0], h1 = hc[1], h2 = hc[2];
     const float* wc = conv_w + (size_t)c * 4;
     float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
@@ -4465,7 +4465,7 @@ extern "C" __global__ void rewind_multi_all_slots_k(const uint64_t* __restrict__
                                                     const int* __restrict__ d_rw_u,
                                                     const int* __restrict__ d_rw_seq,
                                                     const int* __restrict__ d_rw_idx,
-                                                    int kv_n, int e_n) {
+                                                    int kv_n, int e_n, int k_stride) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int sl = blockIdx.y;
     int r = blockIdx.z;
@@ -4474,13 +4474,13 @@ extern "C" __global__ void rewind_multi_all_slots_k(const uint64_t* __restrict__
     int idx = d_rw_idx[r];
     const uint64_t* sp = slot_ptrs + (size_t)sl * 8;
     if (i < kv_n) {
-        size_t s_off = (size_t)(u * 8 + idx) * kv_n + i;
+        size_t s_off = (size_t)(u * k_stride + idx) * kv_n + i;
         size_t d_off = (size_t)su * kv_n + i;
         reinterpret_cast<float*>(sp[1])[d_off] = reinterpret_cast<const float*>(sp[0])[s_off];
         reinterpret_cast<float*>(sp[3])[d_off] = reinterpret_cast<const float*>(sp[2])[s_off];
     }
     if (i < e_n) {
-        size_t s_off = (size_t)(u * 8 + idx) * e_n + i;
+        size_t s_off = (size_t)(u * k_stride + idx) * e_n + i;
         size_t d_off = (size_t)su * e_n + i;
         reinterpret_cast<float*>(sp[5])[d_off] = reinterpret_cast<const float*>(sp[4])[s_off];
         reinterpret_cast<float*>(sp[7])[d_off] = reinterpret_cast<const float*>(sp[6])[s_off];
@@ -4497,9 +4497,9 @@ extern "C" int ink_shortconv_res_multi_snap_clear(hipStream_t s, float* raw, con
     return 0;
 }
 
-extern "C" int ink_rewind_multi_all_slots(hipStream_t s, const uint64_t* slot_ptrs, const int* d_rw_u, const int* d_rw_seq, const int* d_rw_idx, int n_slots, int n_rw, int kv_n, int e_n) {
+extern "C" int ink_rewind_multi_all_slots(hipStream_t s, const uint64_t* slot_ptrs, const int* d_rw_u, const int* d_rw_seq, const int* d_rw_idx, int n_slots, int n_rw, int kv_n, int e_n, int k_stride) {
     int max_n = (kv_n > e_n) ? kv_n : e_n;
-    rewind_multi_all_slots_k<<<dim3((max_n + 255) / 256, n_slots, n_rw), dim3(256), 0, s>>>(slot_ptrs, d_rw_u, d_rw_seq, d_rw_idx, kv_n, e_n);
+    rewind_multi_all_slots_k<<<dim3((max_n + 255) / 256, n_slots, n_rw), dim3(256), 0, s>>>(slot_ptrs, d_rw_u, d_rw_seq, d_rw_idx, kv_n, e_n, k_stride);
     return 0;
 }
 
