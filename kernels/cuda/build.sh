@@ -11,5 +11,6 @@ OUT="${SCRIPT_DIR}/librad_cuda_ops.so"
     "${SCRIPT_DIR}/rad_exl3.cu" \
     "${SCRIPT_DIR}/rad_exl3_mma.cu" \
     "${SCRIPT_DIR}/rad_dsv41_ops.cu" \
+    "${SCRIPT_DIR}/rad_dsv41_router.cu" \
     -o "${OUT}"
 echo "Built ${OUT} for ${ARCH}"
