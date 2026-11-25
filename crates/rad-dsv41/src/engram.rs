@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Result};
 use rad_cuda::comm::Tp2Comm;
-use rad_cuda::{CudaBuf, CudaFail};
+use rad_cuda::CudaBuf;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use tokenizers::normalizers::{Lowercase, NormalizerWrapper, Replace, Sequence, Strip, StripAccents, NFD, NFKC};
+use tokenizers::normalizers::{Lowercase, NormalizerWrapper, Replace, Sequence, StripAccents, NFD, NFKC};
 use tokenizers::{Normalizer, NormalizedString, Tokenizer};
 use crate::safetensors::SafetensorsIndex;
 use crate::weights::{load_raw_buf_replicated, Exl3Linear};
@@ -160,8 +160,6 @@ pub fn build_compressed_token_map(tok: &Tokenizer, vocab_size: usize) -> Result<
         NormalizerWrapper::Lowercase(Lowercase),
         NormalizerWrapper::Replace(Replace::new(r"[ \t\r\n]+", " ").map_err(|e| anyhow!("{e}"))?),
         NormalizerWrapper::Replace(Replace::new(r"^ $", sentinel).map_err(|e| anyhow!("{e}"))?),
-        NormalizerWrapper::Strip(Strip::new(true, true)),
-        NormalizerWrapper::Replace(Replace::new(sentinel, " ").map_err(|e| anyhow!("{e}"))?),
     ]);
     let mut map = vec![0i64; vocab_size];
     let mut key_to_id: HashMap<String, i64> = HashMap::with_capacity(100_000);
@@ -170,7 +168,7 @@ pub fn build_compressed_token_map(tok: &Tokenizer, vocab_size: usize) -> Result<
         let decoded = tok.decode(&[tid as u32], false).unwrap_or_default();
         let mut ns = NormalizedString::from(decoded.as_str());
         let _ = norm.normalize(&mut ns);
-        let key = ns.get().to_string();
+        let key = ns.get().trim().replace(sentinel, " ");
         let cid = if let Some(&existing) = key_to_id.get(&key) {
             existing
         } else {
@@ -229,7 +227,7 @@ impl EngramHost {
                     let dst = &mut out[(mr * 24 + col) * 256..(mr * 24 + col + 1) * 256];
                     for blk in 0..8 {
                         let e = sbuf[blk] as i32;
-                        let scale = if e == 0 { 0.0f32 } else { f32::from_bits(((e as u32) << 23)) };
+                        let scale = if e == 0 { 0.0f32 } else { f32::from_bits((e as u32) << 23) };
                         let base = blk * 32;
                         for j in 0..32 {
                             dst[base + j] = f32_to_f16(self.e4m3_lut[wbuf[base + j] as usize] * scale);
