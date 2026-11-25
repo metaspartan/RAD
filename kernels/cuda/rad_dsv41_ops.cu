@@ -179,8 +179,20 @@ __global__ void rope_yarn_f16_k(
     int half_r = rope_dim >> 1;
     if (i >= half_r) return;
     float base_freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
+    float factor = 16.0f;
+    float orig_ctx = 65536.0f;
+    float beta_fast = 32.0f;
+    float beta_slow = 1.0f;
+    float low = floorf((float)rope_dim * logf(orig_ctx / (beta_fast * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
+    float high = ceilf((float)rope_dim * logf(orig_ctx / (beta_slow * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
+    if (low < 0.0f) low = 0.0f;
+    if (high > (float)(rope_dim - 1)) high = (float)(rope_dim - 1);
+    float ramp = ((float)i - low) / fmaxf(high - low, 0.001f);
+    if (ramp < 0.0f) ramp = 0.0f;
+    if (ramp > 1.0f) ramp = 1.0f;
+    float freq = (base_freq / factor) * ramp + base_freq * (1.0f - ramp);
     float pos_f = (float)(start_pos + mr);
-    float ang = pos_f * base_freq;
+    float ang = pos_f * freq;
     float cs = cosf(ang);
     float sn = sinf(ang);
     int rope_off = head_dim - rope_dim;
@@ -219,14 +231,15 @@ __global__ void mhc_sinkhorn_mix_f16_k(
         for (int i = 0; i < 4; ++i) {
             s_post[i] = 2.0f / (1.0f + expf(-hc[4 + i]));
         }
-        float max_c = -1e30f;
-        for (int j = 0; j < 16; ++j) {
-            if (hc[8 + j] > max_c) max_c = hc[8 + j];
-        }
         float m[4][4];
         for (int r = 0; r < 4; ++r) {
+            float rmax = hc[8 + r * 4 + 0];
+            for (int c = 1; c < 4; ++c) {
+                float v = hc[8 + r * 4 + c];
+                if (v > rmax) rmax = v;
+            }
             for (int c = 0; c < 4; ++c) {
-                m[r][c] = expf(hc[8 + r * 4 + c] - max_c);
+                m[r][c] = expf(hc[8 + r * 4 + c] - rmax);
             }
         }
         for (int it = 0; it < sinkhorn_iters; ++it) {
@@ -282,6 +295,7 @@ __global__ void mqa_attn_sink_causal_f16_k(
     extern __shared__ float smem[];
     float* s_q = smem;
     float* s_acc = smem + head_dim;
+    __shared__ float wsum[32];
     for (int d = t; d < head_dim; d += blockDim.x) {
         s_q[d] = __half2float(qh[d]);
         s_acc[d] = 0.0f;
@@ -291,15 +305,14 @@ __global__ void mqa_attn_sink_causal_f16_k(
     if (seq_len > max_ctx) seq_len = max_ctx;
     float m_max = attn_sink ? attn_sink[h] : -1e30f;
     float l_sum = attn_sink ? 1.0f : 0.0f;
+    int lane = t & 31;
+    int warp = t >> 5;
     for (int p = 0; p < seq_len; ++p) {
         const half* kp = k_cache + (size_t)p * head_dim;
         float dot = 0.0f;
         for (int d = t; d < head_dim; d += blockDim.x) {
             dot += s_q[d] * __half2float(kp[d]);
         }
-        int lane = t & 31;
-        int warp = t >> 5;
-        __shared__ float wsum[32];
         for (int m = 16; m > 0; m >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, m);
         if (lane == 0) wsum[warp] = dot;
         __syncthreads();
@@ -310,6 +323,7 @@ __global__ void mqa_attn_sink_causal_f16_k(
         }
         __syncthreads();
         float score = wsum[0];
+        __syncthreads();
         float new_max = fmaxf(m_max, score);
         float alpha = expf(m_max - new_max);
         float beta = expf(score - new_max);

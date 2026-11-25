@@ -54,6 +54,12 @@ impl Tp2Comm {
         if self.stream.is_some() { 2 } else { 1 }
     }
 
+    pub fn set_nodelay(&self, nodelay: bool) {
+        if let Some(ref s) = self.stream {
+            let _ = s.set_nodelay(nodelay);
+        }
+    }
+
     pub fn send_bytes(&mut self, data: &[u8]) -> std::io::Result<()> {
         let Some(ref mut s) = self.stream else {
             return Ok(());

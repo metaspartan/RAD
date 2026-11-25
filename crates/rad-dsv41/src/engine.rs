@@ -61,6 +61,7 @@ pub struct Dsv41Engine {
     pub d_arg_ids: CudaBuf,
     pub d_best_val: CudaBuf,
     pub d_best_id: CudaBuf,
+    pub h_ar_buf: Vec<u16>,
     pub pos: usize,
     pub wht_scale: f32,
 }
@@ -74,6 +75,7 @@ impl Dsv41Engine {
     ) -> Result<Self> {
         let rank = comm.rank;
         let world = comm.world_size();
+        comm.set_nodelay(false);
         let cfg: DeepseekV41Config = if world > 1 && rank != 0 {
             let bytes = comm.recv_bytes()?;
             serde_json::from_slice(&bytes)?
@@ -111,6 +113,7 @@ impl Dsv41Engine {
         }
 
         let d = tc.hidden_size;
+        comm.set_nodelay(true);
         let n_heads_local = tc.num_attention_heads / world;
         let groups_local = tc.o_groups / world;
         let heads_per_grp = tc.num_attention_heads / tc.o_groups;
@@ -164,6 +167,7 @@ impl Dsv41Engine {
             d_arg_ids: CudaBuf::new(max_head_m * 256 * 4).map_err(CudaFail)?,
             d_best_val: CudaBuf::new(max_head_m * 4).map_err(CudaFail)?,
             d_best_id: CudaBuf::new(max_head_m * 4).map_err(CudaFail)?,
+            h_ar_buf: vec![0u16; MAX_BATCH * d],
             pos: 0,
             wht_scale: 1.0f32 / 128.0f32.sqrt(),
         })
@@ -202,11 +206,10 @@ impl Dsv41Engine {
         let d = self.cfg.text_config.hidden_size;
         let elems = m * d;
         rad_cuda::sync_device().map_err(CudaFail)?;
-        let mut f16_tmp = vec![0u16; elems];
-        let raw_out = unsafe { std::slice::from_raw_parts_mut(f16_tmp.as_mut_ptr() as *mut u8, elems * 2) };
+        let raw_out = unsafe { std::slice::from_raw_parts_mut(self.h_ar_buf.as_mut_ptr() as *mut u8, elems * 2) };
         self.d_branch_out.copy_to_host(raw_out).map_err(CudaFail)?;
-        comm.all_reduce_sum_f16(&mut f16_tmp)?;
-        let raw_in = unsafe { std::slice::from_raw_parts(f16_tmp.as_ptr() as *const u8, elems * 2) };
+        comm.all_reduce_sum_f16(&mut self.h_ar_buf[..elems])?;
+        let raw_in = unsafe { std::slice::from_raw_parts(self.h_ar_buf.as_ptr() as *const u8, elems * 2) };
         self.d_branch_out.copy_from(raw_in, None).map_err(CudaFail)?;
         Ok(())
     }
@@ -228,7 +231,8 @@ impl Dsv41Engine {
         }
 
         let start_pos = self.pos as i32;
-        let attn_scale = 1.0f32 / (tc.head_dim as f32).sqrt();
+        let mscale = 0.1f32 * tc.rope_scaling.factor.max(1.0).ln() + 1.0f32;
+        let attn_scale = (mscale * mscale) / (tc.head_dim as f32).sqrt();
 
         for l in 0..self.layers.len() {
             unsafe {
@@ -472,7 +476,6 @@ impl Dsv41Engine {
             self.all_reduce_branch(m, comm)?;
 
             unsafe {
-                let lw = &self.layers[l];
                 cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(
                     self.d_streams.ptr,
                     self.d_branch_out.ptr,
