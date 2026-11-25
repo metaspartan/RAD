@@ -57,7 +57,8 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | Workload | Throughput / Latency | Notes |
 | --- | --- | --- |
 | **Cold Load (`ctx=262144`, DFlash 2)** | **1.80 s** | On-GPU `Q4_0_SOA` + `Q8_0` conversion & `hipGraph` capture |
-| **Short Prompt TTFT (`24 tok`)** | **32.7 ± 0.0 ms** | 3-run mean; 8-warp LDS WMMA + high-occupancy `sink_dyn_bf16_smallb_k` |
+| **Short Prompt TTFT (`24 tok`, `B=1`)** | **32.7 ± 0.0 ms** | 3-run mean; 8-warp LDS WMMA + high-occupancy `sink_dyn_bf16_smallb_k` |
+| **8-User Concurrent Burst TTFT (`B=8`, live SSE)** | **107.2 ms avg** | `106.5–107.7 ms` across all 8 users (`3.2×` faster via batched multi-user prefill) |
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **21.2 ms** | Prefix-cache affinity hit + GQA 3:1 Split-KV FlashAttention |
 | **Multi-User Decode (`B=4`, Batched DFlash 2 `K=8`)** | **538.1 agg tok/s** | **`134.5 tok/s/user`** (`ITL 7.4 ms`, 32-tok `exp2f` SWA + single-launch `grid.z` WMMA) |
 | **Multi-User Decode (`B=4`, Hybrid DFlash 2 + `K=128`)** | **2,840.7 agg tok/s** | **`710.2 tok/s/user`** (`ITL 1.4 ms`, 32-tok `exp2f` Q8KV FlashAttention + `hipGraph`) |

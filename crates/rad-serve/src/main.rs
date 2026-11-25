@@ -953,6 +953,18 @@ fn prefill_with_drafter(
     }
 }
 
+fn prefill_tail_bucket(n: usize) -> usize {
+    if n <= 8 { 8 }
+    else if n <= 12 { 12 }
+    else if n <= 16 { 16 }
+    else if n <= 24 { 24 }
+    else if n <= 32 { 32 }
+    else if n <= 48 { 48 }
+    else if n <= 64 { 64 }
+    else if n <= 96 { 96 }
+    else { 128 }
+}
+
 fn ngram_bucket_len(avail: usize) -> usize {
     if avail >= 128 { 128 }
     else if avail >= 96 { 96 }
@@ -1159,6 +1171,117 @@ fn run_scheduler(
         let mut burst_ready: Vec<(PrefillSlot, i32, Option<grammar::JsonGrammarState>, grammar::SamplingParams)> = Vec::new();
         let mut pf_injected_any = false;
         while pf_budget > 0 {
+            if prefilling.len() >= 2 && engine.multi_verify_cap >= 16 {
+                let mut short_cnt = 0usize;
+                let mut max_rem = 0usize;
+                for pf in &prefilling {
+                    let rem = pf.job.prompt_ids.len().saturating_sub(pf.offset);
+                    if rem >= 1 && rem <= 128 {
+                        let cand_max = max_rem.max(rem);
+                        let cand_k = prefill_tail_bucket(cand_max);
+                        if (short_cnt + 1) <= 16 && (short_cnt + 1) * cand_k <= engine.multi_verify_cap {
+                            short_cnt += 1;
+                            max_rem = cand_max;
+                        }
+                    }
+                }
+                if short_cnt >= 2 {
+                    let k_pad = prefill_tail_bucket(max_rem);
+                    let mut batch_pfs: Vec<PrefillSlot> = Vec::with_capacity(short_cnt);
+                    let mut rest_pfs: VecDeque<PrefillSlot> = VecDeque::with_capacity(prefilling.len());
+                    while let Some(pf) = prefilling.pop_front() {
+                        let rem = pf.job.prompt_ids.len().saturating_sub(pf.offset);
+                        if batch_pfs.len() < short_cnt && rem >= 1 && rem <= k_pad {
+                            batch_pfs.push(pf);
+                        } else {
+                            rest_pfs.push_back(pf);
+                        }
+                    }
+                    prefilling = rest_pfs;
+                    let n_b = batch_pfs.len();
+                    let seq_ids: Vec<i32> = batch_pfs.iter().map(|p| p.seq as i32).collect();
+                    let pos_before: Vec<i32> = batch_pfs.iter().map(|p| engine.seq_pos[p.seq]).collect();
+                    let mut actual_lens: Vec<usize> = Vec::with_capacity(n_b);
+                    let mut padded_chunks: Vec<Vec<i32>> = Vec::with_capacity(n_b);
+                    let mut tot_actual = 0usize;
+                    for pf in &batch_pfs {
+                        let slice = &pf.job.prompt_ids[pf.offset..];
+                        actual_lens.push(slice.len());
+                        tot_actual += slice.len();
+                        let mut v = Vec::with_capacity(k_pad);
+                        v.extend_from_slice(slice);
+                        let pad = *slice.last().unwrap_or(&0);
+                        v.resize(k_pad, pad);
+                        padded_chunks.push(v);
+                    }
+                    pf_budget = pf_budget.saturating_sub(tot_actual);
+                    match engine.verify_multi(&seq_ids, &padded_chunks) {
+                        Ok(preds) => {
+                            let any_samp = batch_pfs.iter().any(|p| !p.job.json_grammar && !p.job.sampling.is_greedy());
+                            let topk_opt = if any_samp {
+                                engine.read_batch_topk64(n_b * k_pad).ok()
+                            } else {
+                                None
+                            };
+                            let _ = engine.rewind_verify_multi(&seq_ids, &actual_lens, k_pad);
+                            for (u, mut pf) in batch_pfs.into_iter().enumerate() {
+                                let su = pf.seq;
+                                let alen = actual_lens[u];
+                                let end = pf.job.prompt_ids.len();
+                                engine.seq_tokens[su].extend_from_slice(&pf.job.prompt_ids[pf.offset..end]);
+                                if let Some(ref mut d) = drafter {
+                                    if su < d.max_seqs() {
+                                        match d {
+                                            Drafter::DFlash2(df) => {
+                                                let inj_start = end.saturating_sub(df.swa_window);
+                                                if end > inj_start {
+                                                    let s0 = inj_start.saturating_sub(pf.offset);
+                                                    let cnt = alen - s0;
+                                                    let (fptr, mb) = engine.batch_dspark_feats_ptr();
+                                                    let _ = df.inject_target_feats_batch_seq_async(su, fptr, mb, u * k_pad + s0, pos_before[u] + s0 as i32, cnt);
+                                                    pf_injected_any = true;
+                                                } else {
+                                                    df.advance_ctx_len_seq(su, pos_before[u] + alen as i32);
+                                                }
+                                            }
+                                            Drafter::Dspark(_) => {
+                                                let _ = d.inject_batch_seq(su, &engine, u * k_pad, pos_before[u], alen);
+                                            }
+                                        }
+                                    }
+                                }
+                                let _ = engine.paged_kv.ensure_tokens(su, engine.seq_pos[su] as usize, &engine.seq_tokens[su]);
+                                let mut last_tok = preds[u][alen - 1];
+                                let mut gram = if pf.job.json_grammar { Some(grammar::JsonGrammarState::new_json()) } else { None };
+                                let mut sampling = pf.job.sampling;
+                                if let Some(ref mut g) = gram {
+                                    if let Ok(logits) = engine.read_batch_logits(u * k_pad + alen - 1) {
+                                        last_tok = vocab_grammar.select_best_token(&logits, g);
+                                    }
+                                } else if !sampling.is_greedy() {
+                                    if let Some((ref tk_vals, ref tk_ids)) = topk_opt {
+                                        let off = (u * k_pad + alen - 1) * 64;
+                                        let seq_len = engine.seq_tokens[su].len();
+                                        let recent = &engine.seq_tokens[su][seq_len.saturating_sub(128)..];
+                                        last_tok = grammar::sample_from_topk(&tk_vals[off..off + 64], &tk_ids[off..off + 64], recent, &mut sampling);
+                                    }
+                                }
+                                pf.offset = end;
+                                burst_ready.push((pf, last_tok, gram, sampling));
+                            }
+                            sync_kv_metrics(&engine, &metrics);
+                        }
+                        Err(e) => {
+                            let msg = format!("{e}");
+                            for pf in batch_pfs {
+                                let _ = pf.job.tx.send(GenEvent::Error(msg.clone()));
+                                free[pf.seq] = true;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
             let Some(mut pf) = prefilling.pop_front() else { break; };
             let end = (pf.offset + pf_budget.min(1024)).min(pf.job.prompt_ids.len());
             let chunk = &pf.job.prompt_ids[pf.offset..end];
