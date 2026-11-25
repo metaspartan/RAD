@@ -16,7 +16,9 @@ struct RadRdmaInfo {
 extern "C" {
     fn rad_rdma_init(dev_name: *const c_char, buf_bytes: usize, local_info: *mut RadRdmaInfo) -> *mut c_void;
     fn rad_rdma_connect(handle: *mut c_void, remote_info: *const RadRdmaInfo) -> i32;
-    fn rad_rdma_allreduce_f16(handle: *mut c_void, data: *mut u16, n_elems: i32) -> i32;
+    fn rad_rdma_send_dptr(handle: *mut c_void) -> *mut c_void;
+    fn rad_rdma_recv_dptr(handle: *mut c_void) -> *mut c_void;
+    fn rad_rdma_exchange_mapped(handle: *mut c_void, n_bytes: i32) -> i32;
     fn rad_rdma_close(handle: *mut c_void);
 }
 
@@ -178,13 +180,32 @@ impl Tp2Comm {
         Ok(out)
     }
 
-    pub fn all_reduce_sum_f16(&mut self, data: &mut [u16]) -> std::io::Result<()> {
-        if !self.rdma.is_null() {
-            let rc = unsafe { rad_rdma_allreduce_f16(self.rdma, data.as_mut_ptr(), data.len() as i32) };
-            if rc == 0 {
-                return Ok(());
-            }
+    pub fn rdma_ptrs(&self) -> Option<(*mut c_void, *mut c_void)> {
+        if self.rdma.is_null() {
+            return None;
         }
+        let s = unsafe { rad_rdma_send_dptr(self.rdma) };
+        let r = unsafe { rad_rdma_recv_dptr(self.rdma) };
+        if s.is_null() || r.is_null() {
+            None
+        } else {
+            Some((s, r))
+        }
+    }
+
+    pub fn rdma_exchange_mapped(&mut self, n_bytes: usize) -> std::io::Result<bool> {
+        if self.rdma.is_null() {
+            return Ok(false);
+        }
+        let rc = unsafe { rad_rdma_exchange_mapped(self.rdma, n_bytes as i32) };
+        if rc == 0 {
+            Ok(true)
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, format!("rdma exchange failed: {rc}")))
+        }
+    }
+
+    pub fn all_reduce_sum_f16(&mut self, data: &mut [u16]) -> std::io::Result<()> {
         let Some(ref mut s) = self.stream else {
             return Ok(());
         };

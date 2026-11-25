@@ -199,19 +199,23 @@ impl Dsv41Engine {
         );
     }
 
-    fn all_reduce_branch(&mut self, m: usize, comm: &mut Tp2Comm) -> Result<()> {
+    fn exchange_branch(&mut self, m: usize, comm: &mut Tp2Comm) -> Result<(*const c_void, *const c_void)> {
         if self.world <= 1 {
-            return Ok(());
+            return Ok((self.d_branch_out.ptr, std::ptr::null()));
         }
         let d = self.cfg.text_config.hidden_size;
         let elems = m * d;
         rad_cuda::sync_device().map_err(CudaFail)?;
+        if let Some((s_ptr, r_ptr)) = comm.rdma_ptrs() {
+            comm.rdma_exchange_mapped(elems * 2)?;
+            return Ok((s_ptr, r_ptr));
+        }
         let raw_out = unsafe { std::slice::from_raw_parts_mut(self.h_ar_buf.as_mut_ptr() as *mut u8, elems * 2) };
         self.d_branch_out.copy_to_host(raw_out).map_err(CudaFail)?;
         comm.all_reduce_sum_f16(&mut self.h_ar_buf[..elems])?;
         let raw_in = unsafe { std::slice::from_raw_parts(self.h_ar_buf.as_ptr() as *const u8, elems * 2) };
         self.d_branch_out.copy_from(raw_in, None).map_err(CudaFail)?;
-        Ok(())
+        Ok((self.d_branch_out.ptr, std::ptr::null()))
     }
 
     fn forward_layers(&mut self, tokens: &[i32], comm: &mut Tp2Comm) -> Result<()> {
@@ -232,6 +236,7 @@ impl Dsv41Engine {
 
         let start_pos = self.pos as i32;
         let attn_scale = 1.0f32 / (tc.head_dim as f32).sqrt();
+        let branch_dst = comm.rdma_ptrs().map(|(s, _)| s).unwrap_or(self.d_branch_out.ptr);
 
         for l in 0..self.layers.len() {
             unsafe {
@@ -339,16 +344,17 @@ impl Dsv41Engine {
                         );
                     }
                 }
-                self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, self.d_branch_out.ptr, mi, 0, stream);
+                self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, branch_dst, mi, 0, stream);
             }
 
-            self.all_reduce_branch(m, comm)?;
+            let (b_self, b_peer) = self.exchange_branch(m, comm)?;
 
             unsafe {
                 let lw = &self.layers[l];
                 cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(
                     self.d_streams.ptr,
-                    self.d_branch_out.ptr,
+                    b_self,
+                    b_peer,
                     self.d_h_coeff.ptr as *const f32,
                     mi,
                     d as i32,
@@ -471,7 +477,7 @@ impl Dsv41Engine {
                     self.d_moe_outs.ptr,
                     self.d_topk_weights.ptr as *const f32,
                     self.d_shared_out.ptr,
-                    self.d_branch_out.ptr,
+                    branch_dst,
                     mi,
                     tk,
                     d as i32,
@@ -479,12 +485,13 @@ impl Dsv41Engine {
                 );
             }
 
-            self.all_reduce_branch(m, comm)?;
+            let (b_self2, b_peer2) = self.exchange_branch(m, comm)?;
 
             unsafe {
                 cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(
                     self.d_streams.ptr,
-                    self.d_branch_out.ptr,
+                    b_self2,
+                    b_peer2,
                     self.d_h_coeff.ptr as *const f32,
                     mi,
                     d as i32,
@@ -549,6 +556,7 @@ impl Dsv41Engine {
         let stream: CudaStream = std::ptr::null_mut();
         let start_pos = self.pos as i32;
         let attn_scale = 1.0f32 / (tc.head_dim as f32).sqrt();
+        let branch_dst = comm.rdma_ptrs().map(|(s, _)| s).unwrap_or(self.d_branch_out.ptr);
         let sync_t = || -> f64 {
             let _ = rad_cuda::sync_device();
             0.0
@@ -596,20 +604,20 @@ impl Dsv41Engine {
                 let y_ptr = (self.d_wo_mid.ptr as *mut u8).add(gi * tc.o_lora_rank * 2) as *mut c_void;
                 self.exl3_proj(x_ptr, wo_slice, y_ptr, 1, 0, stream);
             }
-            self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, self.d_branch_out.ptr, 1, 0, stream);
+            self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, branch_dst, 1, 0, stream);
         }
         let _ = sync_t();
         let t_wo = t3.elapsed().as_secs_f64() * 1e6;
 
         let t4 = std::time::Instant::now();
-        self.all_reduce_branch(1, comm)?;
+        let (b_self, b_peer) = self.exchange_branch(1, comm)?;
         let _ = sync_t();
         let t_ar1 = t4.elapsed().as_secs_f64() * 1e6;
 
         let lw = &self.layers[0];
         let t5 = std::time::Instant::now();
         unsafe {
-            cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(self.d_streams.ptr, self.d_branch_out.ptr, self.d_h_coeff.ptr as *const f32, 1, d as i32, tc.hc_sinkhorn_iters as i32, tc.hc_eps, stream);
+            cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(self.d_streams.ptr, b_self, b_peer, self.d_h_coeff.ptr as *const f32, 1, d as i32, tc.hc_sinkhorn_iters as i32, tc.hc_eps, stream);
             cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_ffn_fn.ptr, lw.hc_ffn_base.ptr, lw.hc_ffn_scale.ptr, self.d_h_coeff.ptr, self.d_branch_in.ptr, 1, d as i32, tc.hc_eps, stream);
             cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.ffn_norm.ptr, self.d_normed.ptr, 1, d as i32, tc.rms_norm_eps, stream);
             cuda_ops::rad_cuda_moe_route_sqrtsoftplus(self.d_normed.ptr, lw.gate_w.ptr, lw.gate_bias.ptr, self.d_gate_raw.ptr, self.d_gate_sel.ptr, self.d_topk_ids.ptr, self.d_topk_weights.ptr, 1, tc.n_routed_experts as i32, d as i32, tc.num_experts_per_tok as i32, tc.routed_scaling_factor, stream);
@@ -638,13 +646,13 @@ impl Dsv41Engine {
             cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_up.ptr, tk, 1, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, stream);
             cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_moe_gate.ptr, self.d_moe_up.ptr, self.d_moe_act.ptr, tk * inter, tc.swiglu_limit, stream);
             cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_outs.ptr, tk, 1, inter, d as i32, bits, self.wht_scale, 1, exp_start, n_local, stream);
-            cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, self.d_branch_out.ptr, 1, tk, d as i32, stream);
+            cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, branch_dst, 1, tk, d as i32, stream);
         }
         let _ = sync_t();
         let t_moe = t7.elapsed().as_secs_f64() * 1e6;
 
         let t8 = std::time::Instant::now();
-        self.all_reduce_branch(1, comm)?;
+        let _ = self.exchange_branch(1, comm)?;
         let _ = sync_t();
         let t_ar2 = t8.elapsed().as_secs_f64() * 1e6;
 

@@ -133,6 +133,7 @@ extern "C" {
     pub fn rad_cuda_mhc_sinkhorn_mix_f16(
         streams: *mut c_void,
         branch_out: *const c_void,
+        peer_branch_out: *const c_void,
         h_coeff: *const f32,
         m: i32,
         d: i32,

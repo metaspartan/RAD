@@ -324,7 +324,6 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                     break;
                 }
                 gen_ids.push(next_tok as u32);
-                history.push(next_tok);
                 if let Ok(cur) = tok.decode(&gen_ids, true) {
                     if cur.len() > prev_str.len() && cur.is_char_boundary(prev_str.len()) {
                         let delta = cur[prev_str.len()..].to_string();
@@ -335,7 +334,9 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                         }
                     }
                 }
-                match eng.step_speculative(&history, next_tok, &mut comm) {
+                let res = eng.step_speculative(&history, next_tok, &mut comm);
+                history.push(next_tok);
+                match res {
                     Ok(accepted) => {
                         let last = *accepted.last().unwrap_or(&eos);
                         let mut stopped = false;

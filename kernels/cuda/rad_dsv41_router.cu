@@ -51,42 +51,59 @@ __global__ void moe_topk_select_k(
     float scaling_factor
 ) {
     int mr = blockIdx.x;
-    if (threadIdx.x != 0) return;
+    int t = threadIdx.x;
     const float* rs = raw_scores + (size_t)mr * n_experts;
     const float* ss = sel_scores + (size_t)mr * n_experts;
     int* ids_out = topk_ids + (size_t)mr * top_k;
     float* w_out = topk_weights + (size_t)mr * top_k;
-    int chosen[8];
-    float weights[8];
-    float wsum = 0.0f;
+
+    __shared__ float s_sel[512];
+    __shared__ float s_val[256];
+    __shared__ int s_idx[256];
+    __shared__ int chosen[8];
+    __shared__ float weights[8];
+
+    for (int e = t; e < n_experts; e += blockDim.x) {
+        s_sel[e] = ss[e];
+    }
+    __syncthreads();
+
     for (int k = 0; k < top_k; ++k) {
-        int best_e = -1;
-        float best_v = -1e30f;
-        for (int e = 0; e < n_experts; ++e) {
-            bool used = false;
-            for (int j = 0; j < k; ++j) {
-                if (chosen[j] == e) {
-                    used = true;
-                    break;
-                }
-            }
-            if (!used) {
-                float v = ss[e];
-                if (v > best_v) {
-                    best_v = v;
-                    best_e = e;
-                }
+        float bv = -1e30f;
+        int bi = 0;
+        for (int e = t; e < n_experts; e += blockDim.x) {
+            float v = s_sel[e];
+            if (v > bv) {
+                bv = v;
+                bi = e;
             }
         }
-        chosen[k] = best_e;
-        float w = rs[best_e];
-        weights[k] = w;
-        wsum += w;
+        s_val[t] = bv;
+        s_idx[t] = bi;
+        __syncthreads();
+        for (int stride = 128; stride > 0; stride >>= 1) {
+            if (t < stride && s_val[t + stride] > s_val[t]) {
+                s_val[t] = s_val[t + stride];
+                s_idx[t] = s_idx[t + stride];
+            }
+            __syncthreads();
+        }
+        if (t == 0) {
+            int best_e = s_idx[0];
+            chosen[k] = best_e;
+            weights[k] = rs[best_e];
+            s_sel[best_e] = -1e30f;
+        }
+        __syncthreads();
     }
-    float inv = scaling_factor / fmaxf(wsum, 1e-20f);
-    for (int k = 0; k < top_k; ++k) {
-        ids_out[k] = chosen[k];
-        w_out[k] = weights[k] * inv;
+    if (t == 0) {
+        float wsum = 0.0f;
+        for (int k = 0; k < top_k; ++k) wsum += weights[k];
+        float inv = scaling_factor / fmaxf(wsum, 1e-20f);
+        for (int k = 0; k < top_k; ++k) {
+            ids_out[k] = chosen[k];
+            w_out[k] = weights[k] * inv;
+        }
     }
 }
 
@@ -253,7 +270,7 @@ void rad_cuda_moe_route_sqrtsoftplus(
 ) {
     dim3 g1(n_experts, M);
     moe_gate_logits_f16_k<<<g1, 256, 0, stream>>>(x, gate_w, gate_bias, raw_scores, sel_scores, n_experts, D);
-    moe_topk_select_k<<<M, 1, 0, stream>>>(raw_scores, sel_scores, topk_ids, topk_weights, n_experts, top_k, scaling_factor);
+    moe_topk_select_k<<<M, 256, 0, stream>>>(raw_scores, sel_scores, topk_ids, topk_weights, n_experts, top_k, scaling_factor);
 }
 
 void rad_cuda_mhc_pre_and_coeff(

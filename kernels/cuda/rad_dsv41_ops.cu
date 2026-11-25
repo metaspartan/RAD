@@ -218,6 +218,7 @@ __global__ void rope_yarn_f16_k(
 __global__ void mhc_sinkhorn_mix_f16_k(
     float* __restrict__ streams,
     const half* __restrict__ branch_out,
+    const half* __restrict__ peer_branch_out,
     const float* __restrict__ h_coeff,
     int D,
     int sinkhorn_iters,
@@ -268,6 +269,9 @@ __global__ void mhc_sinkhorn_mix_f16_k(
         float x2 = sr[2 * D + i];
         float x3 = sr[3 * D + i];
         float b = __half2float(branch_out[(size_t)mr * D + i]);
+        if (peer_branch_out) {
+            b += __half2float(peer_branch_out[(size_t)mr * D + i]);
+        }
         #pragma unroll
         for (int r = 0; r < 4; ++r) {
             sr[r * D + i] = s_res[r * 4 + 0] * x0 + s_res[r * 4 + 1] * x1 +
@@ -484,6 +488,7 @@ void rad_cuda_rope_yarn_f16(
 void rad_cuda_mhc_sinkhorn_mix_f16(
     float* streams,
     const half* branch_out,
+    const half* peer_branch_out,
     const float* h_coeff,
     int M,
     int D,
@@ -493,7 +498,7 @@ void rad_cuda_mhc_sinkhorn_mix_f16(
 ) {
     dim3 grid((D + 255) / 256, M);
     mhc_sinkhorn_mix_f16_k<<<grid, 256, 0, stream>>>(
-        streams, branch_out, h_coeff, D, sinkhorn_iters, eps
+        streams, branch_out, peer_branch_out, h_coeff, D, sinkhorn_iters, eps
     );
 }
 

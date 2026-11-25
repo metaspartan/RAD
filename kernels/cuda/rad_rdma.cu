@@ -1,9 +1,9 @@
+#include <cuda_runtime.h>
 #include <infiniband/verbs.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <arm_neon.h>
 
 typedef struct {
     uint32_t qpn;
@@ -23,6 +23,8 @@ typedef struct {
     struct ibv_mr* recv_mr;
     uint8_t* send_buf;
     uint8_t* recv_buf;
+    void* send_dptr;
+    void* recv_dptr;
     size_t buf_bytes;
     uint32_t remote_rkey;
     uint64_t remote_addr;
@@ -46,6 +48,8 @@ static int find_roce_v2_gid(struct ibv_context* ctx, uint8_t port, union ibv_gid
     ibv_query_gid(ctx, port, 0, out_gid);
     return 0;
 }
+
+extern "C" {
 
 void* rad_rdma_init(const char* dev_name, size_t buf_bytes, RadRdmaInfo* local_info) {
     int num_devs = 0;
@@ -87,8 +91,13 @@ void* rad_rdma_init(const char* dev_name, size_t buf_bytes, RadRdmaInfo* local_i
     r->scq = ibv_create_cq(r->ctx, 64, NULL, NULL, 0);
     r->rcq = ibv_create_cq(r->ctx, 64, NULL, NULL, 0);
     r->buf_bytes = buf_bytes;
-    posix_memalign((void**)&r->send_buf, 4096, buf_bytes);
-    posix_memalign((void**)&r->recv_buf, 4096, buf_bytes);
+    if (cudaHostAlloc((void**)&r->send_buf, buf_bytes, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostAlloc((void**)&r->recv_buf, buf_bytes, cudaHostAllocMapped) != cudaSuccess) {
+        free(r);
+        return NULL;
+    }
+    cudaHostGetDevicePointer(&r->send_dptr, r->send_buf, 0);
+    cudaHostGetDevicePointer(&r->recv_dptr, r->recv_buf, 0);
     memset(r->send_buf, 0, buf_bytes);
     memset(r->recv_buf, 0, buf_bytes);
 
@@ -178,12 +187,19 @@ int rad_rdma_connect(void* handle, const RadRdmaInfo* remote_info) {
     return 0;
 }
 
-int rad_rdma_allreduce_f16(void* handle, uint16_t* data, int n_elems) {
+void* rad_rdma_send_dptr(void* handle) {
     RadRdmaCtx* r = (RadRdmaCtx*)handle;
-    size_t n_bytes = (size_t)n_elems * 2;
-    if (!r || n_bytes > r->buf_bytes) return -1;
+    return r ? r->send_dptr : NULL;
+}
 
-    memcpy(r->send_buf, data, n_bytes);
+void* rad_rdma_recv_dptr(void* handle) {
+    RadRdmaCtx* r = (RadRdmaCtx*)handle;
+    return r ? r->recv_dptr : NULL;
+}
+
+int rad_rdma_exchange_mapped(void* handle, int n_bytes) {
+    RadRdmaCtx* r = (RadRdmaCtx*)handle;
+    if (!r || (size_t)n_bytes > r->buf_bytes) return -1;
 
     struct ibv_sge sge;
     sge.addr = (uint64_t)(uintptr_t)r->send_buf;
@@ -214,18 +230,6 @@ int rad_rdma_allreduce_f16(void* handle, uint16_t* data, int n_elems) {
     memset(&rwr, 0, sizeof(rwr));
     rwr.wr_id = wc.wr_id;
     ibv_post_recv(r->qp, &rwr, &bad_rwr);
-
-    const __fp16* peer = (const __fp16*)r->recv_buf;
-    __fp16* dst = (__fp16*)data;
-    int i = 0;
-    for (; i + 8 <= n_elems; i += 8) {
-        float16x8_t a = vld1q_f16(dst + i);
-        float16x8_t b = vld1q_f16(peer + i);
-        vst1q_f16(dst + i, vaddq_f16(a, b));
-    }
-    for (; i < n_elems; ++i) {
-        dst[i] = (__fp16)((float)dst[i] + (float)peer[i]);
-    }
     return 0;
 }
 
@@ -239,7 +243,9 @@ void rad_rdma_close(void* handle) {
     if (r->recv_mr) ibv_dereg_mr(r->recv_mr);
     if (r->pd) ibv_dealloc_pd(r->pd);
     if (r->ctx) ibv_close_device(r->ctx);
-    free(r->send_buf);
-    free(r->recv_buf);
+    if (r->send_buf) cudaFreeHost(r->send_buf);
+    if (r->recv_buf) cudaFreeHost(r->recv_buf);
     free(r);
+}
+
 }
