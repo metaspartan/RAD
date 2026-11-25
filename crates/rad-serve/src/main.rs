@@ -610,29 +610,56 @@ fn format_prompt_with_tools(
                     }
                 }
                 let has_tcs = m.tool_calls.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
-                if !txt.is_empty() || !has_tcs || !enable_thinking {
+                let first_inline_tc = m
+                    .tool_calls
+                    .as_ref()
+                    .and_then(|v| v.first())
+                    .and_then(|tc| tc.get("id"))
+                    .and_then(|v| v.as_str())
+                    .and_then(grammar::lookup_raw_tool_call)
+                    .filter(|r| r.inline_after_text);
+                if first_inline_tc.is_none() && (!txt.is_empty() || !has_tcs || !enable_thinking) {
                     s.push_str("<|message_model|><|content_text|>");
                     s.push_str(&txt);
                     s.push_str("<|end_message|>");
                 }
                 if let Some(ref tcs) = m.tool_calls {
-                    for tc in tcs {
+                    for (tc_idx, tc) in tcs.iter().enumerate() {
                         let fn_obj = tc.get("function").unwrap_or(tc);
                         if let Some(name) = fn_obj.get("name").and_then(|v| v.as_str()) {
-                            let args_json = match fn_obj.get("arguments").or_else(|| fn_obj.get("args")) {
-                                Some(serde_json::Value::String(st)) => {
-                                    let trimmed = st.trim();
-                                    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
-                                        trimmed.to_string()
-                                    } else {
-                                        "{}".into()
-                                    }
+                            let cached_raw = tc
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .and_then(grammar::lookup_raw_tool_call);
+                            let call_json = cached_raw
+                                .as_ref()
+                                .map(|r| r.raw_payload.clone())
+                                .unwrap_or_else(|| {
+                                    let args_json = match fn_obj.get("arguments").or_else(|| fn_obj.get("args")) {
+                                        Some(serde_json::Value::String(st)) => {
+                                            let trimmed = st.trim();
+                                            if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+                                                trimmed.to_string()
+                                            } else {
+                                                "{}".into()
+                                            }
+                                        }
+                                        Some(v) if v.is_object() => serde_json::to_string(v).unwrap_or_else(|_| "{}".into()),
+                                        _ => "{}".into(),
+                                    };
+                                    let name_json = serde_json::to_string(name).unwrap_or_else(|_| format!("\"{name}\""));
+                                    format!("{{\"name\":{name_json},\"args\":{args_json}}}")
+                                });
+                            if tc_idx == 0 {
+                                if let Some(ref r) = first_inline_tc {
+                                    s.push_str("<|message_model|><|content_text|>");
+                                    s.push_str(&r.raw_prefix_text);
+                                    s.push_str("<|content_invoke_tool_json|>");
+                                    s.push_str(&call_json);
+                                    s.push_str("<|end_message|>");
+                                    continue;
                                 }
-                                Some(v) if v.is_object() => serde_json::to_string(v).unwrap_or_else(|_| "{}".into()),
-                                _ => "{}".into(),
-                            };
-                            let name_json = serde_json::to_string(name).unwrap_or_else(|_| format!("\"{name}\""));
-                            let call_json = format!("{{\"name\":{name_json},\"args\":{args_json}}}");
+                            }
                             s.push_str("<|message_model|>");
                             s.push_str(name);
                             s.push_str("<|content_invoke_tool_json|>");

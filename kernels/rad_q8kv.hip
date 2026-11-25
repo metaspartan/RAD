@@ -694,7 +694,9 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restri
         return;
     }
 
-    float q_scale = rsqrtf((float)dh);
+    const float LOG2E = 1.4426950408889634f;
+    const float LN2 = 0.6931471805599453f;
+    float q_scale = rsqrtf((float)dh) * LOG2E;
     q8kv_h8_v q_reg[8];
     float4 r_reg0 = make_float4(0.f, 0.f, 0.f, 0.f);
     float4 r_reg1 = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -710,8 +712,11 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restri
             for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)(qh[dbase + j] * q_scale);
         }
         const float4* rh4 = reinterpret_cast<const float4*>(R + (size_t)q_idx * r_dim + (size_t)h * d_rel);
-        r_reg0 = rh4[0]; r_reg1 = rh4[1]; r_reg2 = rh4[2]; r_reg3 = rh4[3];
-        sink_q = sinks[(size_t)q_idx * n_head + h];
+        r_reg0 = make_float4(rh4[0].x * LOG2E, rh4[0].y * LOG2E, rh4[0].z * LOG2E, rh4[0].w * LOG2E);
+        r_reg1 = make_float4(rh4[1].x * LOG2E, rh4[1].y * LOG2E, rh4[1].z * LOG2E, rh4[1].w * LOG2E);
+        r_reg2 = make_float4(rh4[2].x * LOG2E, rh4[2].y * LOG2E, rh4[2].z * LOG2E, rh4[2].w * LOG2E);
+        r_reg3 = make_float4(rh4[3].x * LOG2E, rh4[3].y * LOG2E, rh4[3].z * LOG2E, rh4[3].w * LOG2E);
+        sink_q = sinks[(size_t)q_idx * n_head + h] * LOG2E;
     } else {
 #pragma unroll
         for (int db = 0; db < 8; ++db) {
@@ -829,26 +834,30 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restri
             }
             float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
             float m_new = fmaxf(m_q, tile_max);
-            float alpha = (m_q > -1e20f) ? expf(m_q - m_new) : 0.0f;
+            bool need_rescale = (m_new > m_q && m_q > -1e20f);
+            float alpha = (m_q > -1e20f) ? (need_rescale ? exp2f(m_q - m_new) : 1.0f) : 0.0f;
 
             q8kv_h8_v p_reg;
             float local_sum = 0.0f;
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                float p = (sc_arr[i] > -1e20f) ? expf(sc_arr[i] - m_new) : 0.0f;
+                float p = (sc_arr[i] > -1e20f) ? exp2f(sc_arr[i] - m_new) : 0.0f;
                 p_reg[i] = (_Float16)p;
                 local_sum += p;
             }
             l_q = l_q * alpha + local_sum + __shfl_xor(local_sum, 16, 32);
             m_q = m_new;
 
+            if (need_rescale) {
+#pragma unroll
+                for (int db = 0; db < 8; ++db) o_acc[db] *= alpha;
+            }
 #pragma unroll
             for (int db = 0; db < 8; ++db) {
                 q8kv_h8_v vt_v;
                 int d_row = db * 16 + col;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) vt_v[j] = sm_u.kv.vt[tg][d_row][half * 8 + j];
-                o_acc[db] *= alpha;
                 o_acc[db] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vt_v, p_reg, o_acc[db]);
             }
         }
@@ -879,11 +888,11 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_q8kv_k(const float* __restri
             float m0 = sm_m[0][gg][bt];
             float m1 = sm_m[1][gg][bt];
             float gm = fmaxf(m0, m1);
-            float sc0 = (m0 > -1e20f) ? expf(m0 - gm) : 0.0f;
-            float sc1 = (m1 > -1e20f) ? expf(m1 - gm) : 0.0f;
+            float sc0 = (m0 > -1e20f) ? exp2f(m0 - gm) : 0.0f;
+            float sc1 = (m1 > -1e20f) ? exp2f(m1 - gm) : 0.0f;
             float gl = sm_l[0][gg][bt] * sc0 + sm_l[1][gg][bt] * sc1;
             float* dst = split_buf + (((size_t)h_out * n_splits + sp) * b_stride + (q_off + bt)) * 130;
-            if (lane == 0) { dst[0] = gm; dst[1] = gl; }
+            if (lane == 0) { dst[0] = (gm > -1e20f) ? (gm * LN2) : -1e30f; dst[1] = gl; }
 #pragma unroll
             for (int blk = 0; blk < 4; ++blk) {
                 int d = blk * 32 + lane;
@@ -942,7 +951,9 @@ extern "C" __global__ void attn_b48_gqa3_flash_split_q8kv_k(const float* __restr
         return;
     }
 
-    float q_scale = rsqrtf((float)dh);
+    const float LOG2E = 1.4426950408889634f;
+    const float LN2 = 0.6931471805599453f;
+    float q_scale = rsqrtf((float)dh) * LOG2E;
     q8kv_h8_v q_reg[8];
     float4 r_reg0 = make_float4(0.f, 0.f, 0.f, 0.f);
     float4 r_reg1 = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -958,8 +969,11 @@ extern "C" __global__ void attn_b48_gqa3_flash_split_q8kv_k(const float* __restr
             for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)(qh[dbase + j] * q_scale);
         }
         const float4* rh4 = reinterpret_cast<const float4*>(R + (size_t)q_idx * r_dim + (size_t)h * d_rel);
-        r_reg0 = rh4[0]; r_reg1 = rh4[1]; r_reg2 = rh4[2]; r_reg3 = rh4[3];
-        sink_q = sinks[(size_t)q_idx * n_head + h];
+        r_reg0 = make_float4(rh4[0].x * LOG2E, rh4[0].y * LOG2E, rh4[0].z * LOG2E, rh4[0].w * LOG2E);
+        r_reg1 = make_float4(rh4[1].x * LOG2E, rh4[1].y * LOG2E, rh4[1].z * LOG2E, rh4[1].w * LOG2E);
+        r_reg2 = make_float4(rh4[2].x * LOG2E, rh4[2].y * LOG2E, rh4[2].z * LOG2E, rh4[2].w * LOG2E);
+        r_reg3 = make_float4(rh4[3].x * LOG2E, rh4[3].y * LOG2E, rh4[3].z * LOG2E, rh4[3].w * LOG2E);
+        sink_q = sinks[(size_t)q_idx * n_head + h] * LOG2E;
     } else {
 #pragma unroll
         for (int db = 0; db < 8; ++db) {
@@ -1072,26 +1086,30 @@ extern "C" __global__ void attn_b48_gqa3_flash_split_q8kv_k(const float* __restr
             }
             float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
             float m_new = fmaxf(m_q, tile_max);
-            float alpha = (m_q > -1e20f) ? expf(m_q - m_new) : 0.0f;
+            bool need_rescale = (m_new > m_q && m_q > -1e20f);
+            float alpha = (m_q > -1e20f) ? (need_rescale ? exp2f(m_q - m_new) : 1.0f) : 0.0f;
 
             q8kv_h8_v p_reg;
             float local_sum = 0.0f;
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                float p = (sc_arr[i] > -1e20f) ? expf(sc_arr[i] - m_new) : 0.0f;
+                float p = (sc_arr[i] > -1e20f) ? exp2f(sc_arr[i] - m_new) : 0.0f;
                 p_reg[i] = (_Float16)p;
                 local_sum += p;
             }
             l_q = l_q * alpha + local_sum + __shfl_xor(local_sum, 16, 32);
             m_q = m_new;
 
+            if (need_rescale) {
+#pragma unroll
+                for (int db = 0; db < 8; ++db) o_acc[db] *= alpha;
+            }
 #pragma unroll
             for (int db = 0; db < 8; ++db) {
                 q8kv_h8_v vt_v;
                 int d_row = db * 16 + col;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) vt_v[j] = sm_vt[d_row][sub_off + half * 8 + j];
-                o_acc[db] *= alpha;
                 o_acc[db] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vt_v, p_reg, o_acc[db]);
             }
         }
@@ -1101,7 +1119,7 @@ extern "C" __global__ void attn_b48_gqa3_flash_split_q8kv_k(const float* __restr
     if (vq) {
         float* dst = split_buf + (((size_t)h * n_splits + sp) * b_stride + q_idx) * 130;
         if (half == 0) {
-            dst[0] = m_q;
+            dst[0] = (m_q > -1e20f) ? (m_q * LN2) : -1e30f;
             dst[1] = l_q;
         }
 #pragma unroll

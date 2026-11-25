@@ -1,5 +1,38 @@
 use rad_core::Tokenizer;
 use serde_json::Value;
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawToolCall {
+    pub inline_after_text: bool,
+    pub raw_prefix_text: String,
+    pub raw_payload: String,
+}
+
+static RAW_TOOL_CALL_CACHE: OnceLock<Mutex<VecDeque<(String, RawToolCall)>>> = OnceLock::new();
+
+pub fn remember_raw_tool_call(id: &str, entry: RawToolCall) {
+    if id.is_empty() || entry.raw_payload.is_empty() {
+        return;
+    }
+    let cache = RAW_TOOL_CALL_CACHE.get_or_init(|| Mutex::new(VecDeque::with_capacity(512)));
+    if let Ok(mut guard) = cache.lock() {
+        if let Some(pos) = guard.iter().position(|(k, _)| k == id) {
+            guard.remove(pos);
+        }
+        if guard.len() >= 512 {
+            guard.pop_front();
+        }
+        guard.push_back((id.to_string(), entry));
+    }
+}
+
+pub fn lookup_raw_tool_call(id: &str) -> Option<RawToolCall> {
+    let cache = RAW_TOOL_CALL_CACHE.get()?;
+    let guard = cache.lock().ok()?;
+    guard.iter().rev().find(|(k, _)| k == id).map(|(_, v)| v.clone())
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Container {
@@ -699,6 +732,8 @@ pub struct InklingStreamParser {
     header_ids: Vec<u32>,
     tool_ids: Vec<u32>,
     tool_name_hint: String,
+    tool_inline_after_text: bool,
+    tool_inline_prefix: String,
     call_prefix: String,
     allowed_tools: Vec<String>,
     pub emitted_calls: Vec<ParsedToolCall>,
@@ -743,6 +778,8 @@ impl InklingStreamParser {
             header_ids: Vec::new(),
             tool_ids: Vec::new(),
             tool_name_hint: String::new(),
+            tool_inline_after_text: false,
+            tool_inline_prefix: String::new(),
             call_prefix,
             allowed_tools,
             emitted_calls: Vec::new(),
@@ -758,7 +795,18 @@ impl InklingStreamParser {
         let idx = self.emitted_calls.len();
         let cid = format!("{}_{}", self.call_prefix, idx);
         let hint = std::mem::take(&mut self.tool_name_hint);
+        let inline_after_text = self.tool_inline_after_text;
+        let raw_prefix_text = std::mem::take(&mut self.tool_inline_prefix);
+        self.tool_inline_after_text = false;
         if let Some(tc) = parse_single_tool_call(&payload, &hint, &self.allowed_tools, cid) {
+            remember_raw_tool_call(
+                &tc.id,
+                RawToolCall {
+                    inline_after_text,
+                    raw_prefix_text,
+                    raw_payload: payload,
+                },
+            );
             self.emitted_calls.push(tc.clone());
             return Some(tc);
         }
@@ -802,13 +850,29 @@ impl InklingStreamParser {
                 self.mode = StreamMode::Text;
             }
             TOK_INVOKE_TOOL_JSON => {
-                self.tool_name_hint = tok.decode(&self.header_ids, true).unwrap_or_default().trim().to_string();
+                if self.mode == StreamMode::Text {
+                    self.tool_inline_after_text = true;
+                    self.tool_inline_prefix = tok.decode(&self.text_ids, true).unwrap_or_default();
+                    self.tool_name_hint = self.tool_inline_prefix.trim().to_string();
+                } else {
+                    self.tool_inline_after_text = false;
+                    self.tool_inline_prefix.clear();
+                    self.tool_name_hint = tok.decode(&self.header_ids, true).unwrap_or_default().trim().to_string();
+                }
                 self.header_ids.clear();
                 self.tool_ids.clear();
                 self.mode = StreamMode::ToolJson;
             }
             TOK_INVOKE_TOOL_TEXT => {
-                self.tool_name_hint = tok.decode(&self.header_ids, true).unwrap_or_default().trim().to_string();
+                if self.mode == StreamMode::Text {
+                    self.tool_inline_after_text = true;
+                    self.tool_inline_prefix = tok.decode(&self.text_ids, true).unwrap_or_default();
+                    self.tool_name_hint = self.tool_inline_prefix.trim().to_string();
+                } else {
+                    self.tool_inline_after_text = false;
+                    self.tool_inline_prefix.clear();
+                    self.tool_name_hint = tok.decode(&self.header_ids, true).unwrap_or_default().trim().to_string();
+                }
                 self.header_ids.clear();
                 self.tool_ids.clear();
                 self.mode = StreamMode::ToolText;
@@ -842,6 +906,14 @@ impl InklingStreamParser {
         if matches!(self.mode, StreamMode::ToolJson | StreamMode::ToolText) {
             if let Some(tc) = self.flush_tool(tok) {
                 out.push(StreamDelta::ToolCall(tc));
+            }
+        } else if self.mode == StreamMode::PendingHeader && !self.header_ids.is_empty() {
+            let ids = std::mem::take(&mut self.header_ids);
+            self.text_ids.extend_from_slice(&ids);
+            if let Ok(s) = tok.decode(&ids, true) {
+                if !s.is_empty() {
+                    out.push(StreamDelta::Text(s));
+                }
             }
         }
         out
@@ -948,6 +1020,18 @@ mod tests {
         assert_eq!(tc4.arguments, r#"{"command":"ls -la"}"#);
 
         assert!(parse_single_tool_call("not valid json at all", "exec", &allowed, "c3".into()).is_none());
+    }
+
+    #[test]
+    fn raw_tool_call_cache_roundtrip() {
+        let entry = RawToolCall {
+            inline_after_text: true,
+            raw_prefix_text: "read_file".into(),
+            raw_payload: r#"{"name": "read_file", "args": {"path": "src/main.rs", "limit": 50}}"#.into(),
+        };
+        remember_raw_tool_call("call_test_roundtrip_0", entry.clone());
+        assert_eq!(lookup_raw_tool_call("call_test_roundtrip_0"), Some(entry));
+        assert_eq!(lookup_raw_tool_call("call_nonexistent_xyz"), None);
     }
 
     #[test]
