@@ -122,6 +122,46 @@ __global__ void wht128_pre_mul_f16_k(
     yr[3] = __float2half(v3);
 }
 
+__global__ void wht128_post_mul_f32_to_f16_k(
+    const float* __restrict__ z_f32,
+    const half* __restrict__ svh,
+    half* __restrict__ y,
+    int N,
+    float scale,
+    int add_to_y
+) {
+    int blk = blockIdx.x;
+    int row = blockIdx.y;
+    int lane = threadIdx.x;
+    int col = blk * 128 + lane * 4;
+    const float* zr = z_f32 + (size_t)row * N + col;
+    float v0 = zr[0];
+    float v1 = zr[1];
+    float v2 = zr[2];
+    float v3 = zr[3];
+    if (scale > 0.0f) {
+        warp_wht128_f32(v0, v1, v2, v3, lane, scale);
+    }
+    if (svh) {
+        v0 *= __half2float(svh[col + 0]);
+        v1 *= __half2float(svh[col + 1]);
+        v2 *= __half2float(svh[col + 2]);
+        v3 *= __half2float(svh[col + 3]);
+    }
+    half* yr = y + (size_t)row * N + col;
+    if (add_to_y) {
+        yr[0] = __float2half(__half2float(yr[0]) + v0);
+        yr[1] = __float2half(__half2float(yr[1]) + v1);
+        yr[2] = __float2half(__half2float(yr[2]) + v2);
+        yr[3] = __float2half(__half2float(yr[3]) + v3);
+    } else {
+        yr[0] = __float2half(v0);
+        yr[1] = __float2half(v1);
+        yr[2] = __float2half(v2);
+        yr[3] = __float2half(v3);
+    }
+}
+
 template <int BITS>
 __global__ __launch_bounds__(256)
 void exl3_reconstruct_mul1_k(
@@ -171,30 +211,30 @@ void exl3_reconstruct_mul1_k(
 
 template <int BITS, int M_MAX>
 __global__ __launch_bounds__(256)
-void exl3_gemv_mul1_k(
+void exl3_gemv_splitk_mul1_k(
     const half* __restrict__ x_rot,
     const uint16_t* __restrict__ trellis,
-    const half* __restrict__ svh,
-    half* __restrict__ y,
+    float* __restrict__ z_f32,
     int M,
     int K,
     int N,
-    float wht_scale,
-    int add_to_y
+    int split_k
 ) {
     constexpr int PACKED_U16 = 16 * BITS;
     constexpr int PACKED_U32 = 8 * BITS;
     int t = threadIdx.x;
     int lane = t & 31;
     int warp = t >> 5;
-    int n_block = blockIdx.x;
-    int n_tile_base = n_block * 8;
+    int n_tile = blockIdx.x * 8 + warp;
+    int sk = blockIdx.y;
     int K_tiles = K >> 4;
     int N_tiles = N >> 4;
+    if (n_tile >= N_tiles) return;
+
+    int kt_start = (K_tiles * sk) / split_k;
+    int kt_end = (K_tiles * (sk + 1)) / split_k;
 
     __shared__ uint32_t s_packed[8][PACKED_U32];
-    __shared__ float s_x[M_MAX][16];
-    __shared__ float s_out[M_MAX][128];
 
     float acc0[M_MAX];
     float acc1[M_MAX];
@@ -212,17 +252,13 @@ void exl3_gemv_mul1_k(
     int c0 = (lane >> 3) * 2 + c_sub;
     int c1 = c0 + 8;
 
-    for (int kt = 0; kt < K_tiles; ++kt) {
-        const uint16_t* g_src = trellis + ((size_t)kt * N_tiles + n_tile_base) * PACKED_U16;
-        if (t < PACKED_U16) {
-            ((int4*)s_packed)[t] = ((const int4*)g_src)[t];
+    for (int kt = kt_start; kt < kt_end; ++kt) {
+        const uint32_t* g_tile = (const uint32_t*)(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
+        #pragma unroll
+        for (int w = lane; w < PACKED_U32; w += 32) {
+            s_packed[warp][w] = __ldg(g_tile + w);
         }
-        if (t < M * 16) {
-            int mr = t >> 4;
-            int kc = t & 15;
-            s_x[mr][kc] = __half2float(x_rot[(size_t)mr * K + kt * 16 + kc]);
-        }
-        __syncthreads();
+        __syncwarp();
 
         half2 f0, f1, f2, f3;
         dq8_mul1<BITS>(s_packed[warp], lane * 8, f0, f1, f2, f3);
@@ -235,20 +271,24 @@ void exl3_gemv_mul1_k(
         float w21 = __half2float(__low2half(f3));
         float w31 = __half2float(__high2half(f3));
 
+        int k_base = kt * 16;
         #pragma unroll
         for (int m = 0; m < M_MAX; ++m) {
             if (m < M) {
-                float x0 = s_x[m][r0];
-                float x1 = s_x[m][r1];
-                float x2 = s_x[m][r2];
-                float x3 = s_x[m][r3];
+                const half* xm = x_rot + (size_t)m * K + k_base;
+                float x0 = __half2float(__ldg(xm + r0));
+                float x1 = __half2float(__ldg(xm + r1));
+                float x2 = __half2float(__ldg(xm + r2));
+                float x3 = __half2float(__ldg(xm + r3));
                 acc0[m] = fmaf(w00, x0, fmaf(w10, x1, fmaf(w20, x2, fmaf(w30, x3, acc0[m]))));
                 acc1[m] = fmaf(w01, x0, fmaf(w11, x1, fmaf(w21, x2, fmaf(w31, x3, acc1[m]))));
             }
         }
-        __syncthreads();
+        __syncwarp();
     }
 
+    int col0 = n_tile * 16 + c0;
+    int col1 = n_tile * 16 + c1;
     #pragma unroll
     for (int m = 0; m < M_MAX; ++m) {
         if (m < M) {
@@ -257,40 +297,14 @@ void exl3_gemv_mul1_k(
             acc1[m] += __shfl_xor_sync(0xFFFFFFFFu, acc1[m], 1);
             acc1[m] += __shfl_xor_sync(0xFFFFFFFFu, acc1[m], 2);
             if ((lane & 3) == 0) {
-                s_out[m][warp * 16 + c0] = acc0[m];
-                s_out[m][warp * 16 + c1] = acc1[m];
+                if (split_k == 1) {
+                    z_f32[(size_t)m * N + col0] = acc0[m];
+                    z_f32[(size_t)m * N + col1] = acc1[m];
+                } else {
+                    atomicAdd(&z_f32[(size_t)m * N + col0], acc0[m]);
+                    atomicAdd(&z_f32[(size_t)m * N + col1], acc1[m]);
+                }
             }
-        }
-    }
-    __syncthreads();
-
-    if (warp < M) {
-        int m = warp;
-        int col = n_block * 128 + lane * 4;
-        float v0 = s_out[m][lane * 4 + 0];
-        float v1 = s_out[m][lane * 4 + 1];
-        float v2 = s_out[m][lane * 4 + 2];
-        float v3 = s_out[m][lane * 4 + 3];
-        if (wht_scale > 0.0f) {
-            warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
-        }
-        if (svh) {
-            v0 *= __half2float(svh[col + 0]);
-            v1 *= __half2float(svh[col + 1]);
-            v2 *= __half2float(svh[col + 2]);
-            v3 *= __half2float(svh[col + 3]);
-        }
-        half* ym = y + (size_t)m * N + col;
-        if (add_to_y) {
-            ym[0] = __float2half(__half2float(ym[0]) + v0);
-            ym[1] = __float2half(__half2float(ym[1]) + v1);
-            ym[2] = __float2half(__half2float(ym[2]) + v2);
-            ym[3] = __float2half(__half2float(ym[3]) + v3);
-        } else {
-            ym[0] = __float2half(v0);
-            ym[1] = __float2half(v1);
-            ym[2] = __float2half(v2);
-            ym[3] = __float2half(v3);
         }
     }
 }
@@ -322,9 +336,8 @@ void exl3_moe_gemv_mul1_k(
     const half* svh = svh_ptrs ? svh_ptrs[eid] : nullptr;
     const half* x_src = x_per_expert ? (x_in + (size_t)slot * K) : x_in;
 
-    int K_tiles = K >> 4;
     int N_tiles = N >> 4;
-    int n_tile_base = n_block * 8;
+    int n_tile = n_block * 8 + warp;
 
     __shared__ uint32_t s_packed[8][PACKED_U32];
     __shared__ float s_x128[128];
@@ -358,11 +371,12 @@ void exl3_moe_gemv_mul1_k(
         #pragma unroll
         for (int sub = 0; sub < 8; ++sub) {
             int kt = kt0 + sub;
-            const uint16_t* g_src = trellis + ((size_t)kt * N_tiles + n_tile_base) * PACKED_U16;
-            if (t < PACKED_U16) {
-                ((int4*)s_packed)[t] = ((const int4*)g_src)[t];
+            const uint32_t* g_tile = (const uint32_t*)(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
+            #pragma unroll
+            for (int w = lane; w < PACKED_U32; w += 32) {
+                s_packed[warp][w] = __ldg(g_tile + w);
             }
-            __syncthreads();
+            __syncwarp();
             half2 f0, f1, f2, f3;
             dq8_mul1<BITS>(s_packed[warp], lane * 8, f0, f1, f2, f3);
             int off = sub * 16;
@@ -378,8 +392,9 @@ void exl3_moe_gemv_mul1_k(
                    fmaf(__half2float(__high2half(f2)), x1,
                    fmaf(__half2float(__low2half(f3)), x2,
                    fmaf(__half2float(__high2half(f3)), x3, acc1))));
-            __syncthreads();
+            __syncwarp();
         }
+        __syncthreads();
     }
 
     acc0 += __shfl_xor_sync(0xFFFFFFFFu, acc0, 1);
@@ -455,6 +470,7 @@ void rad_cuda_exl3_gemv_f16(
     const half* x_rot,
     const uint16_t* trellis,
     const half* svh,
+    float* z_scratch_f32,
     half* y,
     int M,
     int K,
@@ -464,32 +480,44 @@ void rad_cuda_exl3_gemv_f16(
     int add_to_y,
     cudaStream_t stream
 ) {
-    dim3 grid(N / 128);
+    int n_blocks = N / 128;
+    int target_ctas = 192;
+    int split_k = (target_ctas + n_blocks - 1) / n_blocks;
+    int max_sk = K / 128;
+    if (split_k > max_sk) split_k = max_sk;
+    if (split_k > 32) split_k = 32;
+    if (split_k < 1) split_k = 1;
+    if (split_k > 1) {
+        cudaMemsetAsync(z_scratch_f32, 0, (size_t)M * N * sizeof(float), stream);
+    }
+    dim3 grid(n_blocks, split_k);
     if (M == 1) {
         switch (bits) {
-            case 3: exl3_gemv_mul1_k<3, 1><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, 1, K, N, wht_scale, add_to_y); break;
-            case 4: exl3_gemv_mul1_k<4, 1><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, 1, K, N, wht_scale, add_to_y); break;
-            case 5: exl3_gemv_mul1_k<5, 1><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, 1, K, N, wht_scale, add_to_y); break;
-            case 6: exl3_gemv_mul1_k<6, 1><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, 1, K, N, wht_scale, add_to_y); break;
-            case 8: exl3_gemv_mul1_k<8, 1><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, 1, K, N, wht_scale, add_to_y); break;
+            case 3: exl3_gemv_splitk_mul1_k<3, 1><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, 1, K, N, split_k); break;
+            case 4: exl3_gemv_splitk_mul1_k<4, 1><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, 1, K, N, split_k); break;
+            case 5: exl3_gemv_splitk_mul1_k<5, 1><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, 1, K, N, split_k); break;
+            case 6: exl3_gemv_splitk_mul1_k<6, 1><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, 1, K, N, split_k); break;
+            case 8: exl3_gemv_splitk_mul1_k<8, 1><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, 1, K, N, split_k); break;
         }
     } else if (M <= 5) {
         switch (bits) {
-            case 3: exl3_gemv_mul1_k<3, 5><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, M, K, N, wht_scale, add_to_y); break;
-            case 4: exl3_gemv_mul1_k<4, 5><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, M, K, N, wht_scale, add_to_y); break;
-            case 5: exl3_gemv_mul1_k<5, 5><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, M, K, N, wht_scale, add_to_y); break;
-            case 6: exl3_gemv_mul1_k<6, 5><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, M, K, N, wht_scale, add_to_y); break;
-            case 8: exl3_gemv_mul1_k<8, 5><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, M, K, N, wht_scale, add_to_y); break;
+            case 3: exl3_gemv_splitk_mul1_k<3, 5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 4: exl3_gemv_splitk_mul1_k<4, 5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 5: exl3_gemv_splitk_mul1_k<5, 5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 6: exl3_gemv_splitk_mul1_k<6, 5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 8: exl3_gemv_splitk_mul1_k<8, 5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
         }
     } else {
         switch (bits) {
-            case 3: exl3_gemv_mul1_k<3, 8><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, M, K, N, wht_scale, add_to_y); break;
-            case 4: exl3_gemv_mul1_k<4, 8><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, M, K, N, wht_scale, add_to_y); break;
-            case 5: exl3_gemv_mul1_k<5, 8><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, M, K, N, wht_scale, add_to_y); break;
-            case 6: exl3_gemv_mul1_k<6, 8><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, M, K, N, wht_scale, add_to_y); break;
-            case 8: exl3_gemv_mul1_k<8, 8><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, y, M, K, N, wht_scale, add_to_y); break;
+            case 3: exl3_gemv_splitk_mul1_k<3, 8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 4: exl3_gemv_splitk_mul1_k<4, 8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 5: exl3_gemv_splitk_mul1_k<5, 8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 6: exl3_gemv_splitk_mul1_k<6, 8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 8: exl3_gemv_splitk_mul1_k<8, 8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
         }
     }
+    dim3 post_grid(n_blocks, M);
+    wht128_post_mul_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh, y, N, wht_scale, add_to_y);
 }
 
 void rad_cuda_exl3_moe_gemv_f16(

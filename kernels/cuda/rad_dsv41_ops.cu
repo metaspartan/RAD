@@ -135,13 +135,11 @@ __global__ void mhc_sinkhorn_mix_f16_k(
     int sinkhorn_iters,
     float eps
 ) {
-    __shared__ float s_pre[4];
     __shared__ float s_post[4];
     __shared__ float s_res[16];
     int t = threadIdx.x;
     if (t == 0) {
         for (int i = 0; i < 4; ++i) {
-            s_pre[i] = 1.0f / (1.0f + expf(-h_coeff[i]));
             s_post[i] = 2.0f / (1.0f + expf(-h_coeff[4 + i]));
         }
         float m[4][4];
