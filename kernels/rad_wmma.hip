@@ -712,8 +712,8 @@ extern "C" __global__ void sink_dyn_bf16_wmma_k(const uint16_t* __restrict__ wsi
     else { W = wvdyn; X = X2; Y = Vdyn; n_out = dyn_dim; row0 = 16; }
     if (row0 >= n_out) return;
 
-    __shared__ _Float16 sm_w[16][32];
-    __shared__ _Float16 sm_x[64][32];
+    __shared__ _Float16 sm_w[16][40];
+    __shared__ _Float16 sm_x[64][40];
 
     int n_r = min(16, n_out - row0);
     int nt = min(64, B - t0);
@@ -920,7 +920,7 @@ extern "C" __global__ void moe_gu_q4_0_wmma_k(const uint8_t* __restrict__ W,
     __shared__ uint4 sm_wu[4][64];
     __shared__ float sm_dg[4][64];
     __shared__ float sm_du[4][64];
-    __shared__ int2 sm_xq[4][4][64];
+    __shared__ int2 sm_xq[4][4][66];
     __shared__ float sm_xd[4][64];
     __shared__ int32_t sm_xs[4][64];
 
@@ -1028,6 +1028,8 @@ extern "C" __global__ void moe_gu_q4_0_wmma_k(const uint8_t* __restrict__ W,
             }
             __syncthreads();
         }
+        float inv_beta = 1.0f / beta;
+        float inv_lb = (lb > 0.0f) ? (1.0f / lb) : 0.0f;
         if (n0 + col < nt) {
             int idx0 = off0 + t0 + n0 + col;
             float* dst = act_out + ((size_t)tok_sorted[idx0] * n_used + slot_sorted[idx0]) * n_ff;
@@ -1037,9 +1039,9 @@ extern "C" __global__ void moe_gu_q4_0_wmma_k(const uint8_t* __restrict__ W,
                 if (r < n_ff) {
                     float g = ag0[i] * sc;
                     float u = au0[i] * sc;
-                    float sg = 1.0f / (1.0f + expf(-g));
-                    float act = beta * tanhf(g / beta) * sg;
-                    float up = (lb > 0.0f) ? (lb * tanhf(u / lb)) : u;
+                    float sg = 1.0f / (1.0f + exp2f(-g * LOG2E));
+                    float act = beta * tanhf(g * inv_beta) * sg;
+                    float up = (lb > 0.0f) ? (lb * tanhf(u * inv_lb)) : u;
                     dst[r] = act * up;
                 }
             }
@@ -1053,9 +1055,9 @@ extern "C" __global__ void moe_gu_q4_0_wmma_k(const uint8_t* __restrict__ W,
                 if (r < n_ff) {
                     float g = ag1[i] * sc;
                     float u = au1[i] * sc;
-                    float sg = 1.0f / (1.0f + expf(-g));
-                    float act = beta * tanhf(g / beta) * sg;
-                    float up = (lb > 0.0f) ? (lb * tanhf(u / lb)) : u;
+                    float sg = 1.0f / (1.0f + exp2f(-g * LOG2E));
+                    float act = beta * tanhf(g * inv_beta) * sg;
+                    float up = (lb > 0.0f) ? (lb * tanhf(u * inv_lb)) : u;
                     dst[r] = act * up;
                 }
             }

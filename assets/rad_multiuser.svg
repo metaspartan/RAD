@@ -29,7 +29,7 @@
   <rect width="960" height="502" rx="16" fill="url(#bg)"/>
   <rect x="1" y="1" width="958" height="500" rx="15" fill="none" stroke="#1e293b" stroke-width="2"/>
 
-  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="23" font-weight="700" fill="#f8fafc">RAD v0.30.2 Multi-User Scaling: Inkling-2-Mini on Single R9700</text>
+  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="23" font-weight="700" fill="#f8fafc">RAD v0.30.3 Multi-User Scaling: Inkling-2-Mini on Single R9700</text>
   <text x="36" y="70" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">Aggregate Decode Throughput (tok/s) with Bank-Free WMMA, Padded sm_vt &amp; 32-Tok exp2f FlashAttention</text>
 
   <rect x="36" y="90" width="888" height="372" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
@@ -62,17 +62,17 @@
   <rect x="365" y="317" width="316" height="22" rx="5" fill="url(#greenGrad)"/>
   <text x="691" y="333" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">3,011.4 tok/s</text>
 
-  <text x="56" y="366" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Live HTTP SSE (412.3 tok/s/user)</text>
-  <rect x="365" y="351" width="346" height="22" rx="5" fill="url(#cyanGrad)"/>
-  <text x="721" y="367" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">3,295.9 tok/s (temp=0.2)</text>
+  <text x="56" y="366" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Live HTTP SSE (413.5 tok/s/user)</text>
+  <rect x="365" y="351" width="347" height="22" rx="5" fill="url(#cyanGrad)"/>
+  <text x="722" y="367" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">3,306.5 tok/s (temp=0.2)</text>
 
-  <text x="56" y="400" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Hybrid DFlash 2 + K=128 (483.0/user)</text>
+  <text x="56" y="400" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Hybrid DFlash 2 + K=128 (483.4/user)</text>
   <rect x="365" y="385" width="405" height="22" rx="5" fill="url(#greenGrad)"/>
-  <text x="780" y="401" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">3,863.7 tok/s</text>
+  <text x="780" y="401" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">3,867.1 tok/s</text>
 
-  <text x="56" y="434" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">B=16 Hybrid DFlash 2 + K=64 (256.3/user)</text>
+  <text x="56" y="434" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">B=16 Hybrid DFlash 2 + K=64 (256.5/user)</text>
   <rect x="365" y="419" width="430" height="22" rx="5" fill="url(#greenGrad)"/>
-  <text x="805" y="435" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">4,100.4 tok/s</text>
+  <text x="805" y="435" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">4,103.8 tok/s</text>
 
   <text x="36" y="484" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="11.5" fill="#64748b">Measured on a single AMD Radeon AI PRO R9700 (32 GB, gfx1201, ROCm 7.14) via `rad bench` &amp; `rad serve` | github.com/metaspartan/RAD</text>
 </svg>

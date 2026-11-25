@@ -321,8 +321,8 @@ def test_streaming_stop_sequences(base_url, headers):
 def test_sampling_top_k_min_p_seed(base_url, headers):
     p_det = {
         "model": "inkling-2-mini",
-        "messages": [{"role": "user", "content": "Give one short sentence about stars."}],
-        "max_tokens": 24,
+        "messages": [{"role": "user", "content": "What is 17 * 19? Reply with just the number."}],
+        "max_tokens": 16,
         "temperature": 0.7,
         "top_k": 1,
         "seed": 4242,

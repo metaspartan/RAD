@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <math.h>
 
+static constexpr float S_LOG2E = 1.4426950408889634f;
+
 struct q8_1_blk {
     float d;
     int32_t s;
@@ -3116,7 +3118,7 @@ extern "C" __global__ void attn_decode_gqa_splitkv_k(const float* __restrict__ Q
 
     int p0 = lane * 2;
     int p1 = lane * 2 + 64;
-    float q_scale = rsqrtf((float)dh);
+    float q_scale = rsqrtf((float)dh) * S_LOG2E;
     float q0a[3], q0b[3], q1a[3], q1b[3];
     float rv[3], sk[3];
     float m[3], l[3], o0[3], o1[3], o2[3], o3[3];
@@ -3128,8 +3130,8 @@ extern "C" __global__ void attn_decode_gqa_splitkv_k(const float* __restrict__ Q
         q0b[g] = qh[p0 + 1] * q_scale;
         q1a[g] = qh[p1] * q_scale;
         q1b[g] = qh[p1 + 1] * q_scale;
-        rv[g] = (lane < d_rel) ? R[(size_t)h * d_rel + lane] : 0.0f;
-        sk[g] = sinks[h];
+        rv[g] = (lane < d_rel) ? (R[(size_t)h * d_rel + lane] * S_LOG2E) : 0.0f;
+        sk[g] = sinks[h] * S_LOG2E;
         m[g] = (sp == 0 && wid == 0) ? 0.0f : -1e30f;
         l[g] = (sp == 0 && wid == 0) ? 1.0f : 0.0f;
         o0[g] = 0.0f; o1[g] = 0.0f; o2[g] = 0.0f; o3[g] = 0.0f;
@@ -3159,8 +3161,8 @@ extern "C" __global__ void attn_decode_gqa_splitkv_k(const float* __restrict__ Q
             }
             score -= sk[g];
             float m_new = fmaxf(m[g], score);
-            float alpha = (m[g] > -1e20f) ? expf(m[g] - m_new) : 0.0f;
-            float p = expf(score - m_new);
+            float alpha = (m[g] > -1e20f) ? exp2f(m[g] - m_new) : 0.0f;
+            float p = exp2f(score - m_new);
             l[g] = l[g] * alpha + p;
             m[g] = m_new;
             o0[g] = fmaf(p, v0.x, o0[g] * alpha);
@@ -3188,7 +3190,7 @@ extern "C" __global__ void attn_decode_gqa_splitkv_k(const float* __restrict__ Q
             float go0 = 0.0f, go1 = 0.0f, go2 = 0.0f, go3 = 0.0f;
 #pragma unroll
             for (int w = 0; w < 8; ++w) {
-                float sc = (sm_m[w] > -1e20f) ? expf(sm_m[w] - gm) : 0.0f;
+                float sc = (sm_m[w] > -1e20f) ? exp2f(sm_m[w] - gm) : 0.0f;
                 gl += sm_l[w] * sc;
                 go0 += sm_o[w][d0] * sc;
                 go1 += sm_o[w][d1] * sc;
@@ -3226,12 +3228,12 @@ extern "C" __global__ void attn_decode_splitkv_reduce_q8_k(const float* __restri
     for (int sp = 0; sp < n_splits; ++sp) {
         float ms = base[(size_t)sp * 130];
         if (ms > -1e20f) {
-            float sc = expf(ms - gm);
+            float sc = exp2f(ms - gm);
             gl += base[(size_t)sp * 130 + 1] * sc;
             go += base[(size_t)sp * 130 + 2 + d] * sc;
         }
     }
-    float v = (go / gl) / (1.0f + expf(-gate[(size_t)h * 128 + d]));
+    float v = (go / gl) / (1.0f + exp2f(-gate[(size_t)h * 128 + d] * S_LOG2E));
     __shared__ int8_t smq[4][32];
     store_q8_1_from_warp(v, lane, out_q8 + h * 4 + wid, smq[wid]);
 }
@@ -3292,7 +3294,7 @@ extern "C" __global__ void moe_gu_q4_0_b1_to_q8_k(const uint8_t* __restrict__ W,
         float g = s_warp_sum8(ag) * sc;
         float u = s_warp_sum8(au) * sc;
         if (lane8 == 0) {
-            float sg = 1.0f / (1.0f + expf(-g));
+            float sg = 1.0f / (1.0f + exp2f(-g * S_LOG2E));
             float act = beta * tanhf(g / beta) * sg;
             float up = (lb > 0.0f) ? (lb * tanhf(u / lb)) : u;
             sm_v[grp] = act * up;
@@ -3689,7 +3691,7 @@ extern "C" __global__ void inkling_attn_multi_gqa3_q8_k(const float* __restrict_
 
     int p0 = lane * 2;
     int p1 = lane * 2 + 64;
-    float q_scale = rsqrtf((float)dh);
+    float q_scale = rsqrtf((float)dh) * S_LOG2E;
     float q0a[3], q0b[3], q1a[3], q1b[3];
     float rv[3], sk[3];
     float m[3], l[3], o0[3], o1[3], o2[3], o3[3];
@@ -3701,8 +3703,8 @@ extern "C" __global__ void inkling_attn_multi_gqa3_q8_k(const float* __restrict_
         q0b[g] = qh[p0 + 1] * q_scale;
         q1a[g] = qh[p1] * q_scale;
         q1b[g] = qh[p1 + 1] * q_scale;
-        rv[g] = (lane < d_rel) ? R[(size_t)bt * r_dim + (size_t)h * d_rel + lane] : 0.0f;
-        sk[g] = sinks[(size_t)bt * n_head + h];
+        rv[g] = (lane < d_rel) ? (R[(size_t)bt * r_dim + (size_t)h * d_rel + lane] * S_LOG2E) : 0.0f;
+        sk[g] = sinks[(size_t)bt * n_head + h] * S_LOG2E;
         m[g] = (wid == 0) ? 0.0f : -1e30f;
         l[g] = (wid == 0) ? 1.0f : 0.0f;
         o0[g] = 0.0f; o1[g] = 0.0f; o2[g] = 0.0f; o3[g] = 0.0f;
@@ -3733,8 +3735,8 @@ extern "C" __global__ void inkling_attn_multi_gqa3_q8_k(const float* __restrict_
             if (has_rb) score += __shfl(s_warp_sum32(rb_l * rv[g]), 0, 32);
             score -= sk[g];
             float m_new = fmaxf(m[g], score);
-            float alpha = (m[g] > -1e20f) ? expf(m[g] - m_new) : 0.0f;
-            float p = expf(score - m_new);
+            float alpha = (m[g] > -1e20f) ? exp2f(m[g] - m_new) : 0.0f;
+            float p = exp2f(score - m_new);
             l[g] = l[g] * alpha + p;
             m[g] = m_new;
             o0[g] = fmaf(p, v0.x, o0[g] * alpha);
@@ -3763,7 +3765,7 @@ extern "C" __global__ void inkling_attn_multi_gqa3_q8_k(const float* __restrict_
             float go0 = 0.0f, go1 = 0.0f, go2 = 0.0f, go3 = 0.0f;
 #pragma unroll
             for (int w = 0; w < 8; ++w) {
-                float sc = (sm_m[w] > -1e20f) ? expf(sm_m[w] - gm) : 0.0f;
+                float sc = (sm_m[w] > -1e20f) ? exp2f(sm_m[w] - gm) : 0.0f;
                 gl += sm_l[w] * sc;
                 go0 += sm_o[w][d0] * sc;
                 go1 += sm_o[w][d1] * sc;
@@ -3773,10 +3775,10 @@ extern "C" __global__ void inkling_attn_multi_gqa3_q8_k(const float* __restrict_
             float inv_l = 1.0f / gl;
             int h = h0 + g;
             const float* gh = gate + (size_t)bt * q_dim + (size_t)h * dh;
-            float v0 = (go0 * inv_l) / (1.0f + expf(-gh[d0]));
-            float v1 = (go1 * inv_l) / (1.0f + expf(-gh[d1]));
-            float v2 = (go2 * inv_l) / (1.0f + expf(-gh[d2]));
-            float v3 = (go3 * inv_l) / (1.0f + expf(-gh[d3]));
+            float v0 = (go0 * inv_l) / (1.0f + exp2f(-gh[d0] * S_LOG2E));
+            float v1 = (go1 * inv_l) / (1.0f + exp2f(-gh[d1] * S_LOG2E));
+            float v2 = (go2 * inv_l) / (1.0f + exp2f(-gh[d2] * S_LOG2E));
+            float v3 = (go3 * inv_l) / (1.0f + exp2f(-gh[d3] * S_LOG2E));
             size_t qbase = ((size_t)bt * n_head + h) * 4;
             store_q8_1_from_warp(v0, lane, out_q8 + qbase + 0, smq);
             store_q8_1_from_warp(v1, lane, out_q8 + qbase + 1, smq);
@@ -4711,7 +4713,7 @@ __global__ void dflash2_gu_swiglu_q8_nt_k(const uint8_t* __restrict__ wg,
         float g = s_warp_sum8(ag[m]);
         float u = s_warp_sum8(au[m]);
         if (lane8 == 0) {
-            sm_v[m][grp] = (row < n_ff) ? ((g / (1.0f + expf(-g))) * u) : 0.0f;
+            sm_v[m][grp] = (row < n_ff) ? ((g / (1.0f + exp2f(-g * S_LOG2E))) * u) : 0.0f;
         }
     }
     __syncthreads();
