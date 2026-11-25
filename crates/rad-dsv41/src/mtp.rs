@@ -2,8 +2,9 @@ use anyhow::Result;
 use rad_cuda::comm::Tp2Comm;
 use rad_cuda::{CudaBuf, CudaFail};
 use crate::config::DeepseekV41Config;
+use crate::engine::MAX_BATCH;
 use crate::safetensors::SafetensorsIndex;
-use crate::weights::{load_raw_buf_replicated, Exl3Linear, LayerWeights};
+use crate::weights::{load_raw_buf_replicated, load_raw_buf_row_shard, Exl3Linear, LayerWeights};
 
 pub struct MtpKvCache {
     pub k_cache: CudaBuf,
@@ -14,11 +15,14 @@ pub struct DsparkMtp {
     pub main_norm: CudaBuf,
     pub main_proj: Exl3Linear,
     pub final_norm: CudaBuf,
+    pub markov_embed: CudaBuf,
+    pub markov_head: CudaBuf,
     pub layers: Vec<LayerWeights>,
     pub kv_caches: Vec<MtpKvCache>,
-    pub d_ctx_raw: CudaBuf,
-    pub d_ctx_norm: CudaBuf,
-    pub d_ctx_proj: CudaBuf,
+    pub d_taps_f16: CudaBuf,
+    pub d_main_proj: CudaBuf,
+    pub d_main_x: CudaBuf,
+    pub d_logits_row: CudaBuf,
     pub last_ctx_row: usize,
 }
 
@@ -34,6 +38,8 @@ impl DsparkMtp {
         let main_norm = load_raw_buf_replicated(idx.as_deref_mut(), "mtp.0.main_norm.weight", comm)?;
         let main_proj = Exl3Linear::load_replicated(idx.as_deref_mut(), "mtp.0.main_proj", comm)?;
         let final_norm = load_raw_buf_replicated(idx.as_deref_mut(), &format!("mtp.{}.norm.weight", n_mtp - 1), comm)?;
+        let markov_embed = load_raw_buf_replicated(idx.as_deref_mut(), &format!("mtp.{}.markov_head.embed.weight", n_mtp - 1), comm)?;
+        let markov_head = load_raw_buf_row_shard(idx.as_deref_mut(), &format!("mtp.{}.markov_head.head.weight", n_mtp - 1), comm)?;
         let mut layers = Vec::with_capacity(n_mtp);
         let mut kv_caches = Vec::with_capacity(n_mtp);
         for i in 0..n_mtp {
@@ -50,15 +56,19 @@ impl DsparkMtp {
             });
         }
         let d = tc.hidden_size;
+        let vocab_local = tc.vocab_size / comm.world_size();
         Ok(Self {
             main_norm,
             main_proj,
             final_norm,
+            markov_embed,
+            markov_head,
             layers,
             kv_caches,
-            d_ctx_raw: CudaBuf::new(16 * 3 * d * 4).map_err(CudaFail)?,
-            d_ctx_norm: CudaBuf::new(3 * d * 2).map_err(CudaFail)?,
-            d_ctx_proj: CudaBuf::new(d * 2).map_err(CudaFail)?,
+            d_taps_f16: CudaBuf::new(MAX_BATCH * 3 * d * 2).map_err(CudaFail)?,
+            d_main_proj: CudaBuf::new(MAX_BATCH * d * 2).map_err(CudaFail)?,
+            d_main_x: CudaBuf::new(MAX_BATCH * d * 2).map_err(CudaFail)?,
+            d_logits_row: CudaBuf::new(vocab_local * 2).map_err(CudaFail)?,
             last_ctx_row: 0,
         })
     }

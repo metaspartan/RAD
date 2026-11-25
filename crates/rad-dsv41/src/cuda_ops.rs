@@ -96,6 +96,7 @@ extern "C" {
         stream: CudaStream,
     );
 
+    #[allow(dead_code)]
     pub fn rad_cuda_mhc_collapse_mean_f16(
         streams: *const c_void,
         out: *mut c_void,
@@ -170,6 +171,7 @@ extern "C" {
         stream: CudaStream,
     );
 
+    #[allow(dead_code)]
     pub fn rad_cuda_mtp_add_proj_to_mhc_f32(
         embed: *const c_void,
         tok_ids: *const i32,
@@ -177,6 +179,44 @@ extern "C" {
         streams: *mut c_void,
         m: i32,
         d: i32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_mhc_collapse_mean_to_f16(
+        streams: *const c_void,
+        out: *mut c_void,
+        m: i32,
+        d: i32,
+        out_stride: i32,
+        out_col_off: i32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_mqa_attn_sink_dspark_f16(
+        q: *const c_void,
+        k_ring: *const c_void,
+        v_ring: *const c_void,
+        kv_blk: *const c_void,
+        attn_sink: *const f32,
+        out: *mut c_void,
+        m: i32,
+        n_heads: i32,
+        q0: i32,
+        max_ctx: i32,
+        sliding_window: i32,
+        head_dim: i32,
+        scale: f32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_markov_bias_add_f16(
+        logits_row: *const c_void,
+        markov_head: *const c_void,
+        markov_embed: *const c_void,
+        prev_tok: i32,
+        out_row: *mut c_void,
+        vocab_local: i32,
+        rank: i32,
         stream: CudaStream,
     );
 

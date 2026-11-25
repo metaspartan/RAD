@@ -310,9 +310,9 @@ __global__ void mqa_attn_sink_causal_f16_k(
     int mr = blockIdx.y;
     int t = threadIdx.x;
     const half* qh = q + ((size_t)mr * n_heads + h) * head_dim;
-    extern __shared__ float smem[];
-    float* s_q = smem;
-    float* s_acc = smem + head_dim;
+    extern __shared__ float dspark_smem[];
+    float* s_q = dspark_smem;
+    float* s_acc = dspark_smem + head_dim;
     __shared__ float wsum[32];
     for (int d = t; d < head_dim; d += blockDim.x) {
         s_q[d] = __half2float(qh[d]);
@@ -678,6 +678,195 @@ void rad_cuda_wo_a_gather_group_f16(
     int grp_dim = heads_per_grp * head_dim;
     dim3 grid((grp_dim + 255) / 256, M);
     wo_a_gather_group_f16_k<<<grid, 256, 0, stream>>>(attn_out, grp_in, n_heads_local, heads_per_grp, head_dim, gi);
+}
+
+__global__ void mhc_collapse_mean_to_f16_k(
+    const float* __restrict__ streams,
+    half* __restrict__ out,
+    int D,
+    int out_stride,
+    int out_col_off
+) {
+    int mr = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < D) {
+        const float* sr = streams + (size_t)mr * 4 * D;
+        float v = 0.25f * (sr[0 * D + i] + sr[1 * D + i] + sr[2 * D + i] + sr[3 * D + i]);
+        out[(size_t)mr * out_stride + out_col_off + i] = __float2half(v);
+    }
+}
+
+__global__ void mqa_attn_sink_dspark_f16_k(
+    const half* __restrict__ q,
+    const half* __restrict__ k_ring,
+    const half* __restrict__ v_ring,
+    const half* __restrict__ kv_blk,
+    const float* __restrict__ attn_sink,
+    half* __restrict__ out,
+    int n_heads,
+    int q0,
+    int max_ctx,
+    int sliding_window,
+    int blk_len,
+    int head_dim,
+    float scale
+) {
+    int h = blockIdx.x;
+    int mr = blockIdx.y;
+    int t = threadIdx.x;
+    const half* qh = q + ((size_t)mr * n_heads + h) * head_dim;
+    extern __shared__ float dspark_smem[];
+    float* s_q = dspark_smem;
+    float* s_acc = dspark_smem + head_dim;
+    __shared__ float wsum[32];
+    for (int d = t; d < head_dim; d += blockDim.x) {
+        s_q[d] = __half2float(qh[d]);
+        s_acc[d] = 0.0f;
+    }
+    __syncthreads();
+    int p_start = (sliding_window > 0 && q0 > sliding_window) ? (q0 - sliding_window) : 0;
+    float m_max = attn_sink ? attn_sink[h] : -1e30f;
+    float l_sum = attn_sink ? 1.0f : 0.0f;
+    int lane = t & 31;
+    int warp = t >> 5;
+    for (int p = p_start; p < q0; ++p) {
+        int slot = p % max_ctx;
+        const half* kp = k_ring + (size_t)slot * head_dim;
+        float dot = 0.0f;
+        for (int d = t; d < head_dim; d += blockDim.x) {
+            dot += s_q[d] * __half2float(kp[d]);
+        }
+        for (int m = 16; m > 0; m >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, m);
+        if (lane == 0) wsum[warp] = dot;
+        __syncthreads();
+        if (warp == 0) {
+            float v = (lane < (blockDim.x >> 5)) ? wsum[lane] : 0.0f;
+            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+            if (lane == 0) wsum[0] = v * scale;
+        }
+        __syncthreads();
+        float score = wsum[0];
+        __syncthreads();
+        float new_max = fmaxf(m_max, score);
+        float alpha = expf(m_max - new_max);
+        float beta = expf(score - new_max);
+        l_sum = l_sum * alpha + beta;
+        m_max = new_max;
+        const half* vp = v_ring + (size_t)slot * head_dim;
+        for (int d = t; d < head_dim; d += blockDim.x) {
+            s_acc[d] = s_acc[d] * alpha + beta * __half2float(vp[d]);
+        }
+    }
+    for (int b = 0; b < blk_len; ++b) {
+        const half* kb = kv_blk + (size_t)b * head_dim;
+        float dot = 0.0f;
+        for (int d = t; d < head_dim; d += blockDim.x) {
+            dot += s_q[d] * __half2float(kb[d]);
+        }
+        for (int m = 16; m > 0; m >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, m);
+        if (lane == 0) wsum[warp] = dot;
+        __syncthreads();
+        if (warp == 0) {
+            float v = (lane < (blockDim.x >> 5)) ? wsum[lane] : 0.0f;
+            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+            if (lane == 0) wsum[0] = v * scale;
+        }
+        __syncthreads();
+        float score = wsum[0];
+        __syncthreads();
+        float new_max = fmaxf(m_max, score);
+        float alpha = expf(m_max - new_max);
+        float beta = expf(score - new_max);
+        l_sum = l_sum * alpha + beta;
+        m_max = new_max;
+        for (int d = t; d < head_dim; d += blockDim.x) {
+            s_acc[d] = s_acc[d] * alpha + beta * __half2float(kb[d]);
+        }
+    }
+    float inv = 1.0f / fmaxf(l_sum, 1e-20f);
+    half* oh = out + ((size_t)mr * n_heads + h) * head_dim;
+    for (int d = t; d < head_dim; d += blockDim.x) {
+        oh[d] = __float2half(s_acc[d] * inv);
+    }
+}
+
+__global__ void markov_bias_add_f16_k(
+    const half* __restrict__ logits_row,
+    const half* __restrict__ markov_head,
+    const __nv_bfloat16* __restrict__ markov_embed,
+    int prev_tok,
+    half* __restrict__ out_row,
+    int vocab_local,
+    int rank
+) {
+    __shared__ float s_emb[256];
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) {
+        s_emb[i] = __bfloat162float(markov_embed[(size_t)prev_tok * rank + i]);
+    }
+    __syncthreads();
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v < vocab_local) {
+        const half2* mh2 = reinterpret_cast<const half2*>(markov_head + (size_t)v * rank);
+        int r2 = rank >> 1;
+        float dot = 0.0f;
+        for (int i = 0; i < r2; ++i) {
+            float2 wv = __half22float2(mh2[i]);
+            dot = fmaf(wv.x, s_emb[2 * i], dot);
+            dot = fmaf(wv.y, s_emb[2 * i + 1], dot);
+        }
+        out_row[v] = __float2half(__half2float(logits_row[v]) + dot);
+    }
+}
+
+void rad_cuda_mhc_collapse_mean_to_f16(
+    const float* streams,
+    half* out,
+    int M,
+    int D,
+    int out_stride,
+    int out_col_off,
+    cudaStream_t stream
+) {
+    dim3 grid((D + 255) / 256, M);
+    mhc_collapse_mean_to_f16_k<<<grid, 256, 0, stream>>>(streams, out, D, out_stride, out_col_off);
+}
+
+void rad_cuda_mqa_attn_sink_dspark_f16(
+    const half* q,
+    const half* k_ring,
+    const half* v_ring,
+    const half* kv_blk,
+    const float* attn_sink,
+    half* out,
+    int M,
+    int n_heads,
+    int q0,
+    int max_ctx,
+    int sliding_window,
+    int head_dim,
+    float scale,
+    cudaStream_t stream
+) {
+    dim3 grid(n_heads, M);
+    size_t smem = (size_t)head_dim * 2 * sizeof(float);
+    mqa_attn_sink_dspark_f16_k<<<grid, 128, smem, stream>>>(
+        q, k_ring, v_ring, kv_blk, attn_sink, out, n_heads, q0, max_ctx, sliding_window, M, head_dim, scale
+    );
+}
+
+void rad_cuda_markov_bias_add_f16(
+    const half* logits_row,
+    const half* markov_head,
+    const __nv_bfloat16* markov_embed,
+    int prev_tok,
+    half* out_row,
+    int vocab_local,
+    int rank,
+    cudaStream_t stream
+) {
+    markov_bias_add_f16_k<<<(vocab_local + 255) / 256, 256, 0, stream>>>(
+        logits_row, markov_head, markov_embed, prev_tok, out_row, vocab_local, rank
+    );
 }
 
 void rad_cuda_wo_a_scatter_group_f16(

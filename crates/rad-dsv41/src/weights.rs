@@ -247,6 +247,26 @@ pub fn load_raw_buf_replicated(
     buf_from_slice(&bytes)
 }
 
+pub fn load_raw_buf_row_shard(
+    idx: Option<&mut SafetensorsIndex>,
+    name: &str,
+    comm: &mut Tp2Comm,
+) -> Result<CudaBuf> {
+    let world = comm.world_size();
+    if world <= 1 {
+        return load_raw_buf_replicated(idx, name, comm);
+    }
+    if comm.rank != 0 {
+        let bytes = comm.recv_bytes()?;
+        return buf_from_slice(&bytes);
+    }
+    let idx = idx.ok_or_else(|| anyhow!("rank 0 missing safetensors index"))?;
+    let bytes = idx.get_tensor(name)?.1;
+    let half = bytes.len() / world;
+    comm.send_bytes(&bytes[half..])?;
+    buf_from_slice(&bytes[..half])
+}
+
 pub struct ExpertWeights {
     pub w1: Exl3Linear,
     pub w2: Exl3Linear,

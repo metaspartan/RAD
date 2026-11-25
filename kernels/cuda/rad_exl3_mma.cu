@@ -718,7 +718,7 @@ void rad_cuda_exl3_moe_mma_f16(
             d_sorted, d_eids, d_offs, d_lens, d_ng
         );
         int max_groups = (pairs < n_local_experts + (pairs / 16) + 1) ? pairs : (n_local_experts + (pairs / 16) + 1);
-        int split_k = (n_blocks * max_groups < 192) ? 2 : 1;
+        int split_k = (n_blocks * max_groups < 128) ? 4 : ((n_blocks * max_groups < 256) ? 2 : 1);
         if (K / 128 < split_k) split_k = K / 128;
         if (split_k < 1) split_k = 1;
         if (split_k > 1) {

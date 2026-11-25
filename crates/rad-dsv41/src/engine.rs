@@ -324,12 +324,15 @@ impl Dsv41Engine {
             unsafe {
                 if let Some(ref mtp) = self.mtp {
                     if let Some(slot) = tc.dspark_target_layer_ids.iter().position(|&id| id == l) {
-                        let rows_save = m.min(16);
-                        for mr in 0..rows_save {
-                            let s_ptr = (self.d_streams.ptr as *const u8).add(mr * 4 * d * 4) as *const c_void;
-                            let dst_ctx = (mtp.d_ctx_raw.ptr as *mut u8).add((mr * 3 + slot) * d * 4) as *mut c_void;
-                            cuda_ops::rad_cuda_mhc_collapse_mean_f16(s_ptr, dst_ctx, 1, d as i32, stream);
-                        }
+                        cuda_ops::rad_cuda_mhc_collapse_mean_to_f16(
+                            self.d_streams.ptr,
+                            mtp.d_taps_f16.ptr,
+                            mi,
+                            d as i32,
+                            (3 * d) as i32,
+                            (slot * d) as i32,
+                            stream,
+                        );
                     }
                 }
                 let lw = &self.layers[l];
@@ -758,6 +761,20 @@ impl Dsv41Engine {
                 );
             }
         }
+        if let Some(mtp) = self.mtp.take() {
+            unsafe {
+                self.exl3_proj(mtp.d_taps_f16.ptr, &mtp.main_proj, mtp.d_main_proj.ptr, mi, 0, stream);
+                cuda_ops::rad_cuda_rms_norm_bf16w_f16(mtp.d_main_proj.ptr, mtp.main_norm.ptr, mtp.d_main_x.ptr, mi, d as i32, tc.rms_norm_eps, stream);
+                for ml in 0..mtp.layers.len() {
+                    let mlw = &mtp.layers[ml];
+                    self.exl3_proj(mtp.d_main_x.ptr, &mlw.wkv, self.d_kv.ptr, mi, 0, stream);
+                    cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, mlw.kv_norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, stream);
+                    cuda_ops::rad_cuda_rope_yarn_f16(std::ptr::null_mut(), self.d_kv_normed.ptr, mi, 0, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, 1.0f32, stream);
+                    cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv_normed.ptr, self.d_kv_normed.ptr, mtp.kv_caches[ml].k_cache.ptr, mtp.kv_caches[ml].v_cache.ptr, mi, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
+                }
+            }
+            self.mtp = Some(mtp);
+        }
         self.pos += m;
         Ok(())
     }
@@ -968,10 +985,7 @@ impl Dsv41Engine {
         self.d_tok_ids.copy_from(tok_bytes, None).map_err(CudaFail)?;
 
         unsafe {
-            let ctx_src = (mtp.d_ctx_raw.ptr as *const u8).add(mtp.last_ctx_row * 3 * d * 4) as *const c_void;
-            cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(ctx_src, mtp.main_norm.ptr, mtp.d_ctx_norm.ptr, 3, d as i32, tc.rms_norm_eps, stream);
-            self.exl3_proj(mtp.d_ctx_norm.ptr, &mtp.main_proj, mtp.d_ctx_proj.ptr, 1, 0, stream);
-            cuda_ops::rad_cuda_mtp_add_proj_to_mhc_f32(self.embed.ptr, self.d_tok_ids.ptr as *const i32, mtp.d_ctx_proj.ptr, self.d_streams.ptr, mi, d as i32, stream);
+            cuda_ops::rad_cuda_embed_to_mhc_f16(self.embed.ptr, self.d_tok_ids.ptr as *const i32, self.d_streams.ptr, mi, d as i32, stream);
         }
 
         for l in 0..mtp.layers.len() {
@@ -986,9 +1000,8 @@ impl Dsv41Engine {
                 self.exl3_proj(self.d_normed.ptr, &lw.wkv, self.d_kv.ptr, mi, 0, stream);
                 cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, lw.kv_norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, stream);
                 cuda_ops::rad_cuda_rope_yarn_f16(self.d_q.ptr, self.d_kv_normed.ptr, mi, n_heads_local as i32, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, 1.0f32, stream);
-                cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv_normed.ptr, self.d_kv_normed.ptr, mtp.kv_caches[l].k_cache.ptr, mtp.kv_caches[l].v_cache.ptr, mi, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
                 let sink_ptr = (lw.attn_sink.ptr as *const f32).add(self.rank * n_heads_local);
-                cuda_ops::rad_cuda_mqa_attn_sink_causal_f16(self.d_q.ptr, mtp.kv_caches[l].k_cache.ptr, mtp.kv_caches[l].v_cache.ptr, sink_ptr, self.d_attn_out.ptr, mi, n_heads_local as i32, start_pos, self.max_ctx as i32, tc.sliding_window as i32, tc.head_dim as i32, attn_scale, stream);
+                cuda_ops::rad_cuda_mqa_attn_sink_dspark_f16(self.d_q.ptr, mtp.kv_caches[l].k_cache.ptr, mtp.kv_caches[l].v_cache.ptr, self.d_kv_normed.ptr, sink_ptr, self.d_attn_out.ptr, mi, n_heads_local as i32, start_pos, self.max_ctx as i32, tc.sliding_window as i32, tc.head_dim as i32, attn_scale, stream);
                 cuda_ops::rad_cuda_rope_yarn_f16(self.d_attn_out.ptr, std::ptr::null_mut(), mi, n_heads_local as i32, 0, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, -1.0f32, stream);
                 for (gi, wo_slice) in lw.wo_a_slices.iter().enumerate() {
                     cuda_ops::rad_cuda_wo_a_gather_group_f16(self.d_attn_out.ptr, self.d_wo_grp_in.ptr, mi, n_heads_local as i32, heads_per_grp as i32, tc.head_dim as i32, gi as i32, stream);
@@ -1028,22 +1041,47 @@ impl Dsv41Engine {
             cuda_ops::rad_cuda_mhc_pre_mix_only(self.d_streams.ptr, self.d_pre_b.ptr, self.d_branch_in.ptr, mi, d as i32, stream);
             cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, mtp.final_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
             self.exl3_proj(self.d_normed.ptr, &self.head, self.d_logits.ptr, mi, 0, stream);
-            cuda_ops::rad_cuda_argmax_f16(self.d_logits.ptr, self.d_arg_vals.ptr, self.d_arg_ids.ptr, self.d_best_val.ptr, self.d_best_id.ptr, mi, self.head.n as i32, stream);
         }
-        rad_cuda::sync_device().map_err(CudaFail)?;
-        let mut best_vals = vec![0.0f32; blk];
-        let mut best_ids = vec![0i32; blk];
-        self.d_best_val.copy_to_host(unsafe { std::slice::from_raw_parts_mut(best_vals.as_mut_ptr() as *mut u8, blk * 4) }).map_err(CudaFail)?;
-        self.d_best_id.copy_to_host(unsafe { std::slice::from_raw_parts_mut(best_ids.as_mut_ptr() as *mut u8, blk * 4) }).map_err(CudaFail)?;
-        let offset = (self.rank * self.head.n) as i32;
-        for id in &mut best_ids {
-            *id += offset;
-        }
-        comm.all_reduce_argmax(&mut best_vals, &mut best_ids)?;
-        self.mtp = Some(mtp);
-        let mut out = Vec::with_capacity(blk);
+        let v_local = self.head.n;
+        let m_rank = tc.dspark_markov_rank.max(1) as i32;
+        let offset = (self.rank * v_local) as i32;
+        let mut out = Vec::with_capacity(blk + 1);
         out.push(anchor);
-        out.extend_from_slice(&best_ids[..(blk - 1)]);
+        for i in 0..blk {
+            let prev_tok = *out.last().unwrap();
+            unsafe {
+                let row_ptr = (self.d_logits.ptr as *const u8).add(i * v_local * 2) as *const c_void;
+                cuda_ops::rad_cuda_markov_bias_add_f16(
+                    row_ptr,
+                    mtp.markov_head.ptr,
+                    mtp.markov_embed.ptr,
+                    prev_tok,
+                    mtp.d_logits_row.ptr,
+                    v_local as i32,
+                    m_rank,
+                    stream,
+                );
+                cuda_ops::rad_cuda_argmax_f16(
+                    mtp.d_logits_row.ptr,
+                    self.d_arg_vals.ptr,
+                    self.d_arg_ids.ptr,
+                    self.d_best_val.ptr,
+                    self.d_best_id.ptr,
+                    1,
+                    v_local as i32,
+                    stream,
+                );
+            }
+            rad_cuda::sync_device().map_err(CudaFail)?;
+            let mut bval = [0.0f32; 1];
+            let mut bid = [0i32; 1];
+            self.d_best_val.copy_to_host(unsafe { std::slice::from_raw_parts_mut(bval.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
+            self.d_best_id.copy_to_host(unsafe { std::slice::from_raw_parts_mut(bid.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
+            bid[0] += offset;
+            comm.all_reduce_argmax(&mut bval, &mut bid)?;
+            out.push(bid[0]);
+        }
+        self.mtp = Some(mtp);
         Ok(out)
     }
 
