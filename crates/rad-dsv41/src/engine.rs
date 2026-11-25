@@ -67,7 +67,7 @@ impl Dsv41Engine {
         max_layers: Option<usize>,
     ) -> Result<Self> {
         let cfg = DeepseekV41Config::load(model_dir)?;
-        let tc = &cfg.text_config;
+        let tc = cfg.text_config.clone();
         let mut idx = SafetensorsIndex::open(model_dir)?;
 
         let embed = load_raw_buf(&mut idx, "embed.weight")?;
@@ -170,7 +170,7 @@ impl Dsv41Engine {
 
         self.d_tok_id.copy_from(&token_id.to_le_bytes(), None).map_err(CudaFail)?;
         unsafe {
-            cuda_ops::rad_cuda_embed_bf16_to_f16(self.embed.ptr, self.d_tok_id.ptr, self.d_branch_in.ptr, 1, d as i32, stream);
+            cuda_ops::rad_cuda_embed_bf16_to_f16(self.embed.ptr, self.d_tok_id.ptr as *const i32, self.d_branch_in.ptr, 1, d as i32, stream);
             for r in 0..4 {
                 let dst = (self.d_streams.ptr as *mut u8).add(r * d * 2) as *mut c_void;
                 rad_cuda::cudaMemcpyAsync(dst, self.d_branch_in.ptr, d * 2, rad_cuda::CUDA_MEMCPY_DEVICE_TO_DEVICE, stream);
