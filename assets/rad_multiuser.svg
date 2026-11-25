@@ -54,13 +54,13 @@
   <rect x="365" y="249" width="148" height="22" rx="5" fill="url(#cyanGrad)"/>
   <text x="523" y="265" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">1,277.8 tok/s</text>
 
-  <text x="56" y="298" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Live HTTP SSE (up to 240/user)</text>
-  <rect x="365" y="283" width="162" height="22" rx="5" fill="url(#cyanGrad)"/>
-  <text x="537" y="299" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">1,401.4 tok/s (2,533 peak)</text>
+  <text x="56" y="298" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=128 LDS WMMA MoE (14.5 tok/s/user)</text>
+  <rect x="365" y="283" width="214" height="22" rx="5" fill="url(#purpleGrad)"/>
+  <text x="589" y="299" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#c084fc">1,856.0 tok/s</text>
 
-  <text x="56" y="332" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=128 LDS WMMA MoE (14.5 tok/s/user)</text>
-  <rect x="365" y="317" width="214" height="22" rx="5" fill="url(#purpleGrad)"/>
-  <text x="589" y="333" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#c084fc">1,856.0 tok/s</text>
+  <text x="56" y="332" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Live HTTP SSE (252.1 tok/s/user)</text>
+  <rect x="365" y="317" width="233" height="22" rx="5" fill="url(#cyanGrad)"/>
+  <text x="608" y="333" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">2,017.0 tok/s (2,590 peak)</text>
 
   <text x="56" y="366" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=4 Hybrid DFlash 2 + K=128 (676.7/user)</text>
   <rect x="365" y="351" width="313" height="22" rx="5" fill="url(#greenGrad)"/>

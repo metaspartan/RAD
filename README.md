@@ -72,7 +72,7 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **Multi-User Decode (`B=128`, no-spec)** | **1,856.0 agg tok/s** | **`14.5 tok/s/user`** (fused WMMA MoE-to-`Q8_1` + `float4` slot reduction) |
 | **Live SSE API (`/v1/chat/completions`, real code edit)** | **1,074.8 tok/s** | Live HTTP SSE streaming `2,048` Python tokens in `1.91 s` (**`1,073.4 tok/s`** at `temp=0.2` via GPU top-64 sampling) |
 | **Multi-Turn Agentic E2E (`exec` + `write_file` + `read_file`)** | **98.8% prefix cache** | Up to `30` turns / `15.5K` ctx, `0` JSON errors, `38–74 ms` cached TTFT, stop-token speculative rewind |
-| **Live SSE API (8-User Concurrent, Hybrid `K=128`, `temp=0.2`)** | **1,401.4 agg tok/s** | Full-overlap concurrent (**`2,533 tok/s`** peak 1s burst; up to `239.8 tok/s/user` at `temp=0.2`) |
+| **Live SSE API (8-User Concurrent, Hybrid `K=128`, `temp=0.2`)** | **2,017.0 agg tok/s** | **`252.1 tok/s/user`** full-overlap concurrent (**`2,590 tok/s`** peak 1s burst; `237.9` avg / up to `281.8 tok/s/user`) |
 
 ---
 

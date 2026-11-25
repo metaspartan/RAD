@@ -1110,7 +1110,7 @@ fn run_scheduler(
             }
         }
 
-        let mut pf_budget = if active.is_empty() || prefilling.len() > active.len() { 2048 } else { prefill_chunk_size.max(64).min(1024) };
+        let mut pf_budget = if active.is_empty() || prefilling.len() > active.len() { 8192 } else { prefill_chunk_size.max(64).min(1024) };
         while pf_budget > 0 {
             let Some(mut pf) = prefilling.pop_front() else { break; };
             let end = (pf.offset + pf_budget.min(1024)).min(pf.job.prompt_ids.len());
@@ -1144,7 +1144,9 @@ fn run_scheduler(
                     pf.offset = end;
                     if pf.offset < pf.job.prompt_ids.len() {
                         prefilling.push_back(pf);
-                        break;
+                        if !active.is_empty() && prefilling.len() <= active.len() {
+                            break;
+                        }
                     } else {
                         let pp_s = pf.started_at.elapsed().as_secs_f64();
                         let pp_ms = pp_s * 1000.0;
@@ -1383,11 +1385,20 @@ fn run_scheduler(
                             }
                         }
                         if hit_count * 2 >= n_u {
-                            let bk = ngram_bucket_len(max_hit_len);
+                            let raw_bk = ngram_bucket_len(max_hit_len);
+                            let bk = if hit_count < n_u { raw_bk.min(64) } else { raw_bk };
                             if bk >= 8 {
                                 let mut padded: Vec<Vec<i32>> = Vec::with_capacity(n_u);
                                 for (idx, c) in cands.into_iter().enumerate() {
-                                    let mut v = c.unwrap_or_else(|| vec![active[idx].next_tok]);
+                                    let mut v = match c {
+                                        Some(ng) if ng.len() >= 8 => ng,
+                                        _ => {
+                                            let su = active[idx].seq;
+                                            let df_k = spec_k.min(bk);
+                                            d.draft_seq(su, active[idx].next_tok, &engine, df_k)
+                                                .unwrap_or_else(|_| vec![active[idx].next_tok])
+                                        }
+                                    };
                                     if v.len() > bk {
                                         v.truncate(bk);
                                     } else if v.len() < bk {
