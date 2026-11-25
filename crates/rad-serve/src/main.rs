@@ -1219,7 +1219,7 @@ fn run_scheduler(
                     let pos0 = engine.seq_pos[seq];
                     let t_step = Instant::now();
                     let res = (|| -> anyhow::Result<Vec<i32>> {
-                        let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[seq], slot.next_tok, 48) {
+                        let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[seq], slot.next_tok, 64) {
                             ng
                         } else if seq == 0 {
                             d.draft(slot.next_tok, &engine, spec_k)?
@@ -2755,6 +2755,7 @@ fn load_drafter(opts: &CliOpts, engine: &mut InklingEngine, max_seqs: usize) -> 
         if Path::new(p).exists() {
             engine.capture_verify_graph(8)?;
             engine.capture_verify_graph(48)?;
+            engine.capture_verify_graph(64)?;
             let mut d = DFlash2Drafter::load_multi(Path::new(p), opts.ctx, max_seqs)?;
             d.capture_draft_graph(engine, 8)?;
             return Ok(Some(Drafter::DFlash2(d)));
@@ -3079,7 +3080,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
                 let mut rounds = 0usize;
                 let td = Instant::now();
                 while gen < 200 {
-                    let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[0], ct, 48) {
+                    let draft = if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[0], ct, 64) {
                         ng
                     } else {
                         d.draft(ct, &engine, k_len)?

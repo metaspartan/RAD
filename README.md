@@ -8,11 +8,11 @@ RAD natively runs **Inkling-2-Mini** (26B MoE, 48 looped visits, hybrid SWA + fu
 
 ## Highlights
 
-- **256K Long-Context Speculative Frontier (`730.8 tok/s @ 32K`, `690.4 tok/s @ 64K`, `441.3 tok/s @ 128K`, `523.2 tok/s @ 256K` & `4,201.9 tok/s` `pp2048` on Single 32 GB R9700)**
-  - **INT8 Full-Attention KV Cache (`kernels/rad_q8kv.hip`):** Per-head-token `int8_t` + FP16 scale KV cache for all 12 full-attention layers across `B=1`, `verify_b8..48`, prefill, and GQA-3:1 shared-KV multi-user (`inkling_attn_multi_gqa3_q8_q8kv_k`) — fitting full **256K context (`262,144` tokens)** on a single 32 GB R9700 with **1.80 s** cold load and warp-reduced Split-KV reduction.
-  - **Q48-Shared Split-96 WMMA FlashAttention & `blockIdx.z` Hot-Expert `sudot4` MoE (`attn_b48_gqa3_flash_split_q8kv_k`, `moe_gu_q4_0_sudot4_to_q8_k`, `moe_dn_q4_0_sudot4_k`):** Processes all `B <= 48` speculative draft tokens across 3 Q-tiles × 3 GQA heads in a single `uint4` 128-bit coalesced 32-KV-tile pass with `blockIdx.z` hot-expert token splitting (`gz=2..4`), fused router+grouping+`Q8_1` up to `B <= 64`, single-pass `6-gram → 4-gram → 3-gram` prompt lookup, zero-memset in-place shortconv clearing, high-occupancy `sink_dyn_bf16_smallb_k`, and pre-captured `K=48` HIP graphs.
-  - **64-Q-Token GQA-3:1 Full & SWA Prefill FlashAttention + FP16 MoE Slot Reduction + 6-Part WMMA `sink_dyn`:** Shares K/V loads across 64 Q tokens × 3 GQA heads (`384` threads, 10.5 KB LDS) across all 48 layers with FP16 `moe_dn_slots` halving MoE reduction HBM traffic, 6-part WMMA `sink_dyn_bf16` (`dyn_dim <= 32`), and parallel SWA KV conv & shortconv residual prefill kernels — driving **`4,201.9 tok/s`** `pp2048` prefill (**`5.49×`** stock `llama.cpp`), **`3,586.9 tok/s`** at 32K (`9.13 s`), **`3,181.1 tok/s`** at 64K, **`2,609.1 tok/s`** at 128K, and **`1,926.5 tok/s`** at 256K.
-  - **Native [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) Speculative Decoding (`302.2 tok/s` Pure-Gen Code, `269.9 tok/s` Math, `244.7 tok/s` Pure-Gen 2K, `110.9 tok/s` Prose):** Zero-copy `safetensors` loader + 5-layer parallel block-diffusion drafter with WMMA GQA 4:1 Split-16 FlashAttention, fused `dflash2_rmsnorm_q8` / `dflash2_conv_q8` / `dflash2_proj_conv_add_q4` / `dflash2_gu_swiglu_q8`, 16-chunk parallel top-16 candidate selector (`draft=1.68–1.83 ms`), 1-launch batched multi-user rewind (`rewind_multi_all_slots_k`), batched multi-user speculation up to `B=16`, and async SWA-windowed feature injection (`inject=0.01–0.02 ms`).
+- **256K Long-Context Speculative Frontier (`798.3 tok/s @ 2K`, `757.2 tok/s @ 32K`, `715.2 tok/s @ 64K`, `501.0 tok/s @ 128K`, `542.4 tok/s @ 256K` & `4,206.0 tok/s` `pp2048` on Single 32 GB R9700)**
+  - **INT8 Full-Attention KV Cache (`kernels/rad_q8kv.hip`):** Per-head-token `int8_t` + FP16 scale KV cache for all 12 full-attention layers across `B=1`, `verify_b8..64`, prefill, and GQA-3:1 shared-KV multi-user (`inkling_attn_multi_gqa3_q8_q8kv_k`) — fitting full **256K context (`262,144` tokens)** on a single 32 GB R9700 with **1.80 s** cold load and warp-reduced Split-KV reduction.
+  - **Q64-Shared Split-96 WMMA FlashAttention & `blockIdx.z` Hot-Expert `sudot4` MoE (`attn_b48_gqa3_flash_split_q8kv_k`, `moe_gu_q4_0_sudot4_to_q8_k`, `moe_dn_q4_0_sudot4_k`):** Processes all `B <= 64` speculative draft tokens across 4 Q-tiles × 3 GQA heads (384 threads) in a single `uint4` 128-bit coalesced 32-KV-tile pass with `blockIdx.z` hot-expert token splitting (`gz=2..4`), fused router+grouping+`Q8_1` up to `B <= 64`, single-pass `6-gram → 4-gram → 3-gram` `K=64` prompt lookup, zero-memset in-place shortconv clearing, high-occupancy `sink_dyn_bf16_smallb_k`, and pre-captured `K=48/64` HIP graphs.
+  - **64-Q-Token GQA-3:1 Full & SWA Prefill FlashAttention + FP16 MoE Slot Reduction + 6-Part WMMA `sink_dyn`:** Shares K/V loads across 64 Q tokens × 3 GQA heads (`384` threads, 10.5 KB LDS) across all 48 layers with FP16 `moe_dn_slots` halving MoE reduction HBM traffic, 6-part WMMA `sink_dyn_bf16` (`dyn_dim <= 32`), and parallel SWA KV conv & shortconv residual prefill kernels — driving **`4,206.0 tok/s`** `pp2048` prefill (**`5.49×`** stock `llama.cpp`), **`3,586.9 tok/s`** at 32K (`9.13 s`), **`3,181.1 tok/s`** at 64K, **`2,609.3 tok/s`** at 128K, and **`1,927.5 tok/s`** at 256K.
+  - **Native [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) Speculative Decoding (`302.2 tok/s` Pure-Gen Code, `271.4 tok/s` Math, `244.7 tok/s` Pure-Gen 2K, `110.9 tok/s` Prose):** Zero-copy `safetensors` loader + 5-layer parallel block-diffusion drafter with WMMA GQA 4:1 Split-16 FlashAttention, fused `dflash2_rmsnorm_q8` / `dflash2_conv_q8` / `dflash2_proj_conv_add_q4` / `dflash2_gu_swiglu_q8`, 16-chunk parallel top-16 candidate selector (`draft=1.68–1.83 ms`), 1-launch batched multi-user rewind (`rewind_multi_all_slots_k`), batched multi-user speculation up to `B=16`, and async SWA-windowed feature injection (`inject=0.01–0.02 ms`).
   - **Native Agentic Tool Calling & Multi-Turn Prefix Caching:** Full Inkling-2-Mini native `tool_declare` / `<|content_invoke_tool_json|>` (`{"name":...,"args":...}`) / `<|message_tool|>` prompt formatting, real-time token-ID `InklingStreamParser`, balanced JSON tool-arg extraction, automatic repeated-tool-loop breaker with nucleus/repetition-penalty sampling, and multi-turn KV prefix caching with `cached_tokens` reported in both JSON and SSE `stream_options.include_usage`.
 - **Native GPU Vision (`mmproj-F16.gguf`, Enabled by Default)**
   - Full 23-layer HIP ViT encoder (`640×640`, `20×20` patches, LayerScale `ls1`/`ls2`, bidirectional self-attention, `2×2` spatial merge, `inkling2v` MLP projector) outputting 256 multimodal embeddings directly into `InklingEngine` and `DFlash2Drafter`.
@@ -35,33 +35,33 @@ RAD natively runs **Inkling-2-Mini** (26B MoE, 48 looped visits, hybrid SWA + fu
 
 ![RAD vs Stock llama.cpp and RTX PRO 6000 Blackwell](assets/rad_benchmark.svg)
 
-Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)**, **same GGUF (`Inkling-2-Mini-UD-Q4_K_XL-v2.gguf`)**, and **same `B=1` / `pp2048` / `tg128`** (`rad bench` 3-run `mean ± stddev`, on-GPU `Q4_0_SOA` weight repacking, **INT8 full-attention KV cache + FP16 SWA KV**) — achieving **4.29×–10.37× faster decode** and **5.49× faster `pp2048` prefill** than stock `llama.cpp`, and outperforming Unsloth's claimed **125 tok/s** on an **NVIDIA RTX PRO 6000 Blackwell (96 GB, ~\$8,500)** by **2.42×–5.85×**:
+Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)**, **same GGUF (`Inkling-2-Mini-UD-Q4_K_XL-v2.gguf`)**, and **same `B=1` / `pp2048` / `tg128`** (`rad bench` 3-run `mean ± stddev`, on-GPU `Q4_0_SOA` weight repacking, **INT8 full-attention KV cache + FP16 SWA KV**) — achieving **4.29×–11.32× faster decode** and **5.49× faster `pp2048` prefill** than stock `llama.cpp`, and outperforming Unsloth's claimed **125 tok/s** on an **NVIDIA RTX PRO 6000 Blackwell (96 GB, ~\$8,500)** by **2.42×–6.39×**:
 
 | Engine / Hardware | Decode (`tok/s`) | `pp2048` Prefill (`tok/s`) | Notes |
 | --- | --- | --- | --- |
 | **Stock `llama.cpp` (R9700 + DSpark)** | `70.5 tok/s` | `765.5 tok/s` | `-fa on -ctk q8_0 -ctv q8_0 --spec-type draft-dspark` |
-| **RAD (R9700, No-Spec `hipGraph`)** | **`110.6 ± 0.7 tok/s`** (`1.57×`) | **`4,201.9 ± 2.7 tok/s`** (**`5.49×`**) | `tg128 @ d=2048 = 101.9 tok/s`; `pp512 = 3,408.1 ± 2.3 tok/s` |
+| **RAD (R9700, No-Spec `hipGraph`)** | **`110.6 ± 0.7 tok/s`** (`1.57×`) | **`4,206.0 ± 3.7 tok/s`** (**`5.49×`**) | `tg128 @ d=2048 = 101.9 tok/s`; `pp512 = 3,415.3 ± 7.3 tok/s` |
 | **Unsloth RTX PRO 6000 Blackwell** | `125.0 tok/s` *(claimed)* | — | 96 GB workstation GPU (~\$8,500) |
-| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`4,201.9 tok/s`** (**`5.49×`**) | `verify=23.7 ms`, `avg_emit=4.27` |
-| **RAD (R9700 + DFlash 2 `K=8`, Pure Gen)** | **`302.2 tok/s`** (**`4.29×`**) | **`4,143.2 ± 1.6 tok/s`** (**`5.41×`**) | **2.42× vs. RTX PRO 6000 Blackwell**, `Math=269.9 tok/s`, `2K Pure Gen=244.7 tok/s`, `Prose=110.9 tok/s` |
-| **RAD (Hybrid DFlash 2 + `K=48`, 32K–256K)** | **`730.8 tok/s`** (**`10.37×`**) | **`3,586.9 tok/s`** (**`4.69×`**) | **5.85× vs. RTX PRO 6000 Blackwell**; **`690.4 tok/s`** at 64K, **`441.3 tok/s`** at 128K, **`523.2 tok/s`** at 256K |
+| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`4,206.0 tok/s`** (**`5.49×`**) | `verify=23.7 ms`, `avg_emit=4.27` |
+| **RAD (R9700 + DFlash 2 `K=8`, Pure Gen)** | **`302.2 tok/s`** (**`4.29×`**) | **`4,145.5 ± 0.9 tok/s`** (**`5.42×`**) | **2.42× vs. RTX PRO 6000 Blackwell**, `Math=271.4 tok/s`, `2K Pure Gen=244.7 tok/s`, `Prose=110.9 tok/s` |
+| **RAD (Hybrid DFlash 2 + `K=64`, 2K–256K)** | **`798.3 tok/s`** (**`11.32×`**) | **`4,012.7 tok/s`** (**`5.24×`**) | **6.39× vs. RTX PRO 6000 Blackwell**; **`757.2 tok/s`** at 32K, **`715.2 tok/s`** at 64K, **`501.0 tok/s`** at 128K, **`542.4 tok/s`** at 256K |
 
 ### Long-Context Decode & Prefill (`2K → 256K`, Single 32 GB R9700)
 
 ![RAD Long-Context 2K to 256K Scaling on Single R9700](assets/rad_longctx.svg)
 
-Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO R9700 (32 GB) with INT8 full-attention KV cache, Q48-Shared Split-96 WMMA FlashAttention, GQA-3:1 Shared-KV Prefill FlashAttention, `blockIdx.z` hot-expert MoE splitting, FP16 MoE slot reduction, and hybrid DFlash 2 + `6-gram` `K=48` prompt-lookup speculation (`1.80 s` cold load at 256K):
+Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO R9700 (32 GB) with INT8 full-attention KV cache, Q64-Shared Split-96 WMMA FlashAttention, GQA-3:1 Shared-KV Prefill FlashAttention, `blockIdx.z` hot-expert MoE splitting, FP16 MoE slot reduction, and hybrid DFlash 2 + `6-gram` `K=64` prompt-lookup speculation (`1.80 s` cold load at 256K):
 
 | Context Depth | Prompt Tokens | Prefill (`tok/s`) | Prefill Time | Decode (`tok/s`) | Avg Emit / Round |
 | --- | --- | --- | --- | --- | --- |
-| **2K** | 1,977 | **4,005.5 tok/s** | 0.49 s | **604.7 tok/s** | 28.9 |
-| **4K** | 4,067 | **4,012.7 tok/s** | 1.01 s | **546.2 tok/s** | 28.9 |
-| **8K** | 8,057 | **3,945.4 tok/s** | 2.04 s | **597.0 tok/s** | 28.9 |
-| **16K** | 16,227 | **3,818.2 tok/s** | 4.25 s | **587.4 tok/s** | 28.9 |
-| **32K** | 32,757 | **3,586.9 tok/s** | 9.13 s | **730.8 tok/s** | 40.5 |
-| **64K** | 65,437 | **3,181.1 tok/s** | 20.57 s | **690.4 tok/s** | 40.7 |
-| **128K** | 130,987 | **2,609.1 tok/s** | 50.20 s | **441.3 tok/s** | 28.9 |
-| **256K** | 261,707 | **1,926.5 tok/s** | 135.85 s | **523.2 tok/s** | 40.5 |
+| **2K** | 1,977 | **4,012.3 tok/s** | 0.49 s | **798.3 tok/s** | 40.2 |
+| **4K** | 4,067 | **4,012.7 tok/s** | 1.01 s | **619.1 tok/s** | 40.2 |
+| **8K** | 8,057 | **3,945.4 tok/s** | 2.04 s | **732.0 tok/s** | 40.2 |
+| **16K** | 16,227 | **3,818.2 tok/s** | 4.25 s | **720.4 tok/s** | 40.2 |
+| **32K** | 32,757 | **3,586.9 tok/s** | 9.13 s | **757.2 tok/s** | 51.8 |
+| **64K** | 65,437 | **3,181.1 tok/s** | 20.57 s | **715.2 tok/s** | 52.0 |
+| **128K** | 130,987 | **2,609.3 tok/s** | 50.20 s | **501.0 tok/s** | 40.2 |
+| **256K** | 261,707 | **1,927.5 tok/s** | 135.78 s | **542.4 tok/s** | 51.8 |
 
 ### Multi-User Continuous Batching & Batched Speculative Decoding
 
@@ -75,12 +75,12 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **Multi-User Decode (`B=4`, Batched DFlash 2 `K=4`)** | **509.3 agg tok/s** | **`127.3 tok/s/user`** (`ITL 7.9 ms`, 1-launch rewind + unrolled `nt == 8` MoE) |
 | **Multi-User Decode (`B=8`, no-spec)** | **643.6 agg tok/s** | **`80.4 tok/s/user`** (`ITL 12.4 ms`, `hipGraph` + GQA-3:1 INT8 KV + `loop_ctrl_down_nt_k<8>`) |
 | **Multi-User Decode (`B=8`, Batched DSpark `K=4`)** | **458.6 agg tok/s** | `57.3 tok/s/user` |
-| **Multi-User Decode (`B=8`, Batched DFlash 2 `K=4`)** | **737.5 agg tok/s** | **`92.2 tok/s/user`** (`ITL 10.8 ms`; `blockIdx.z` MoE + `fused_rg B<=64` + GQA-3:1 INT8 KV) |
+| **Multi-User Decode (`B=8`, Batched DFlash 2 `K=4`)** | **739.3 agg tok/s** | **`92.4 tok/s/user`** (`ITL 10.8 ms`; `blockIdx.z` MoE + `fused_rg B<=64` + GQA-3:1 INT8 KV) |
 | **Multi-User Decode (`B=16`, no-spec)** | **926.3 agg tok/s** | **`57.9 tok/s/user`** (`ITL 17.3 ms`, unrolled `nt == 8` MoE + GQA-3:1 INT8 KV) |
 | **Multi-User Decode (`B=32`, no-spec)** | **1,277.8 agg tok/s** | **`39.9 tok/s/user`** (`ITL 25.0 ms`; +47% via `blockIdx.z` hot-expert splitting & `fused_rg B<=64`) |
 | **Multi-User Decode (`B=64`, no-spec)** | **1,162.2 agg tok/s** | `18.2 tok/s/user` (8-warp `128×64` LDS WMMA MoE) |
 | **Multi-User Decode (`B=128`, no-spec)** | **1,856.0 agg tok/s** | **`14.5 tok/s/user`** (fused WMMA MoE-to-`Q8_1` + `float4` slot reduction) |
-| **Live SSE API (`/v1/chat/completions` & `/v1/responses`, 32K)** | **623.4 / 627.1 tok/s** | Live HTTP SSE at `32,452` prompt tokens (`3,591–3,611 tok/s` prefill, `252.3–265.7 tok/s` Code pure-gen) |
+| **Live SSE API (`/v1/chat/completions` & `/v1/responses`, 32K)** | **714.2 / 721.4 tok/s** | Live HTTP SSE at `32,452` prompt tokens (`3,573–3,592 tok/s` prefill, `252.3–265.7 tok/s` Code pure-gen) |
 | **Live SSE API (8-User Concurrent, DFlash 2 `K=4`)** | **604.1 agg tok/s** | **`75.5 tok/s/user`** decode window (`591.2 agg tok/s` end-to-end wall-clock incl. prefill) |
 
 ---
@@ -195,8 +195,8 @@ python3 scripts/test_serve.py
 - **Debian / Ubuntu (`.deb`):**
   Download `rad_<version>_amd64.deb` from GitHub Releases or build locally:
   ```bash
-  bash packaging/deb/build_deb.sh 0.13.0
-  sudo dpkg -i dist/rad_0.13.0_amd64.deb
+  bash packaging/deb/build_deb.sh 0.14.0
+  sudo dpkg -i dist/rad_0.14.0_amd64.deb
   ```
 - **Homebrew (Linuxbrew):**
   ```bash

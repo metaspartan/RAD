@@ -41,7 +41,7 @@
   <rect width="960" height="636" rx="16" fill="url(#bg)"/>
   <rect x="1" y="1" width="958" height="634" rx="15" fill="none" stroke="#1e293b" stroke-width="2"/>
 
-  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="23" font-weight="700" fill="#f8fafc">RAD v0.13.0 vs. Stock llama.cpp &amp; RTX PRO 6000 Blackwell — Inkling-2-Mini</text>
+  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="23" font-weight="700" fill="#f8fafc">RAD v0.14.0 vs. Stock llama.cpp &amp; RTX PRO 6000 Blackwell — Inkling-2-Mini</text>
   <text x="36" y="70" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">Single-User Decode &amp; Prefill on AMD Radeon AI PRO R9700 (32 GB, ~$1,250) — Higher is Better</text>
 
   <rect x="36" y="90" width="888" height="292" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
@@ -70,9 +70,9 @@
   <rect x="340" y="302" width="170" height="24" rx="5" fill="url(#greenGrad)"/>
   <text x="520" y="319" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#6ee7b7">302.2 tok/s (4.29×)</text>
 
-  <text x="56" y="356" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#f8fafc">RAD (Hybrid DFlash 2 + K=48, 32K–256K)</text>
+  <text x="56" y="356" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#f8fafc">RAD (Hybrid DFlash 2 + K=64, 2K–256K)</text>
   <rect x="340" y="340" width="400" height="24" rx="5" fill="url(#limeGrad)"/>
-  <text x="750" y="357" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#4ade80">730.8 tok/s (10.37×)</text>
+  <text x="750" y="357" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#4ade80">798.3 tok/s (11.32×)</text>
 
   <rect x="36" y="398" width="888" height="196" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
   <text x="56" y="428" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="15" font-weight="700" fill="#e2e8f0">Long-Prompt Prefill Throughput — pp2048 (tok/s)</text>
@@ -83,11 +83,11 @@
 
   <text x="56" y="516" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#cbd5e1">RAD + DFlash 2 (pp2048 Batched Inject)</text>
   <rect x="340" y="500" width="394" height="24" rx="5" fill="url(#orangeGrad)"/>
-  <text x="744" y="517" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#fb923c">4,143.2 tok/s (5.41×)</text>
+  <text x="744" y="517" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#fb923c">4,145.5 tok/s (5.42×)</text>
 
   <text x="56" y="558" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#f8fafc">RAD (R9700, pp2048 64Q GQA-3:1 WMMA)</text>
   <rect x="340" y="542" width="400" height="24" rx="5" fill="url(#amberGrad)"/>
-  <text x="750" y="559" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#fbbf24">4,201.9 tok/s (5.49×)</text>
+  <text x="750" y="559" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" font-weight="700" fill="#fbbf24">4,206.0 tok/s (5.49×)</text>
 
   <text x="36" y="618" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="11.5" fill="#64748b">Measured on identical AMD Radeon AI PRO R9700 (gfx1201, ROCm) via `rad bench` &amp; live HTTP | Inkling-2-Mini Q4_K_XL + DFlash 2 | github.com/metaspartan/RAD</text>
 </svg>
