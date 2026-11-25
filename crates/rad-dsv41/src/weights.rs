@@ -295,12 +295,27 @@ fn upload_ptr_table(ptrs: &[u64]) -> Result<CudaBuf> {
 
 impl LayerWeights {
     pub fn load(
-        mut idx: Option<&mut SafetensorsIndex>,
+        idx: Option<&mut SafetensorsIndex>,
         cfg: &DeepseekV41Config,
         layer_idx: usize,
         comm: &mut Tp2Comm,
     ) -> Result<Self> {
-        let p = format!("layers.{layer_idx}");
+        Self::load_prefix(
+            idx,
+            cfg,
+            &format!("layers.{layer_idx}"),
+            cfg.text_config.n_routed_experts,
+            comm,
+        )
+    }
+
+    pub fn load_prefix(
+        mut idx: Option<&mut SafetensorsIndex>,
+        cfg: &DeepseekV41Config,
+        p: &str,
+        n_routed_experts: usize,
+        comm: &mut Tp2Comm,
+    ) -> Result<Self> {
         let tc = &cfg.text_config;
         let world = comm.world_size();
         let rank = comm.rank;
@@ -313,7 +328,7 @@ impl LayerWeights {
             wo_a_slices.push(Exl3Linear::load_rank_only(idx.as_deref_mut(), &p0, &p1, comm)?);
         }
 
-        let exp_per_rank = tc.n_routed_experts / world;
+        let exp_per_rank = n_routed_experts / world;
         let expert_start = rank * exp_per_rank;
         let mut experts = Vec::with_capacity(exp_per_rank);
         for e_local in 0..exp_per_rank {

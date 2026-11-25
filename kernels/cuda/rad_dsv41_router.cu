@@ -16,11 +16,15 @@ __global__ void moe_gate_logits_f16_k(
     int mr = blockIdx.y;
     if (e >= n_experts) return;
     int t = threadIdx.x;
-    const half* xr = x + (size_t)mr * D;
-    const half* we = gate_w + (size_t)e * D;
+    const half2* xr2 = reinterpret_cast<const half2*>(x + (size_t)mr * D);
+    const half2* we2 = reinterpret_cast<const half2*>(gate_w + (size_t)e * D);
+    int d2 = D >> 1;
     float dot = 0.0f;
-    for (int i = t; i < D; i += blockDim.x) {
-        dot = fmaf(__half2float(xr[i]), __half2float(we[i]), dot);
+    for (int i = t; i < d2; i += blockDim.x) {
+        float2 xv = __half22float2(xr2[i]);
+        float2 wv = __half22float2(we2[i]);
+        dot = fmaf(xv.x, wv.x, dot);
+        dot = fmaf(xv.y, wv.y, dot);
     }
     int lane = t & 31;
     int warp = t >> 5;
@@ -120,14 +124,16 @@ __global__ void mhc_coeff_proj_k(
     int mr = blockIdx.y;
     if (c >= 24) return;
     int t = threadIdx.x;
-    const float* sr = streams + (size_t)mr * D4;
-    const float* row = hc_fn + (size_t)c * D4;
+    const float4* sr4 = reinterpret_cast<const float4*>(streams + (size_t)mr * D4);
+    const float4* row4 = reinterpret_cast<const float4*>(hc_fn + (size_t)c * D4);
+    int d4_vec = D4 >> 2;
     float dot = 0.0f;
     float ss = 0.0f;
-    for (int i = t; i < D4; i += blockDim.x) {
-        float x = sr[i];
-        ss = fmaf(x, x, ss);
-        dot = fmaf(x, row[i], dot);
+    for (int i = t; i < d4_vec; i += blockDim.x) {
+        float4 x = sr4[i];
+        float4 w = row4[i];
+        ss = fmaf(x.x, x.x, fmaf(x.y, x.y, fmaf(x.z, x.z, fmaf(x.w, x.w, ss))));
+        dot = fmaf(x.x, w.x, fmaf(x.y, w.y, fmaf(x.z, w.z, fmaf(x.w, w.w, dot))));
     }
     int lane = t & 31;
     int warp = t >> 5;

@@ -152,8 +152,19 @@ extern "C" {
         n_heads: i32,
         start_pos: i32,
         max_ctx: i32,
+        sliding_window: i32,
         head_dim: i32,
         scale: f32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_mtp_add_proj_to_mhc_f32(
+        embed: *const c_void,
+        tok_ids: *const i32,
+        proj: *const c_void,
+        streams: *mut c_void,
+        m: i32,
+        d: i32,
         stream: CudaStream,
     );
 

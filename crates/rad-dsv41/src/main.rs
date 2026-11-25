@@ -143,9 +143,19 @@ fn worker_loop(eng: &mut Dsv41Engine, comm: &mut Tp2Comm) -> Result<()> {
                 let mut pval = 0u32;
                 comm.broadcast_u32(&mut pval)?;
                 eng.pos = pval as usize;
+                let mut crow = 0u32;
+                comm.broadcast_u32(&mut crow)?;
+                if let Some(ref mut mtp) = eng.mtp {
+                    mtp.last_ctx_row = crow as usize;
+                }
             }
             4 => {
                 eng.profile_step(eng.cfg.bos_token_id, comm)?;
+            }
+            5 => {
+                let mut a_val = 0u32;
+                comm.broadcast_u32(&mut a_val)?;
+                let _ = eng.draft_dspark(a_val as i32, comm)?;
             }
             99 => break,
             _ => {}

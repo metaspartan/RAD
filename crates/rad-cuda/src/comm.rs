@@ -103,7 +103,7 @@ impl Tp2Comm {
                 s.write_all(local_bytes)?;
             }
             let rc = unsafe { rad_rdma_connect(h, &remote_info) };
-            let mut ready = [if rc == 0 { 1u8 } else { 0u8 }];
+            let ready = [if rc == 0 { 1u8 } else { 0u8 }];
             let mut peer_ready = [0u8; 1];
             if rank == 0 {
                 s.write_all(&ready)?;
@@ -119,7 +119,6 @@ impl Tp2Comm {
                 }
             } else {
                 unsafe { rad_rdma_close(h) };
-                ready[0] = 0;
             }
         } else if !h.is_null() {
             unsafe { rad_rdma_close(h) };

@@ -290,6 +290,7 @@ __global__ void mqa_attn_sink_causal_f16_k(
     int n_heads,
     int start_pos,
     int max_ctx,
+    int sliding_window,
     int head_dim,
     float scale
 ) {
@@ -308,11 +309,12 @@ __global__ void mqa_attn_sink_causal_f16_k(
     __syncthreads();
     int seq_len = start_pos + mr + 1;
     if (seq_len > max_ctx) seq_len = max_ctx;
+    int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
     float m_max = attn_sink ? attn_sink[h] : -1e30f;
     float l_sum = attn_sink ? 1.0f : 0.0f;
     int lane = t & 31;
     int warp = t >> 5;
-    for (int p = 0; p < seq_len; ++p) {
+    for (int p = p_start; p < seq_len; ++p) {
         const half* kp = k_cache + (size_t)p * head_dim;
         float dot = 0.0f;
         for (int d = t; d < head_dim; d += blockDim.x) {
@@ -502,6 +504,26 @@ void rad_cuda_mhc_sinkhorn_mix_f16(
     );
 }
 
+__global__ void mtp_add_proj_to_mhc_f32_k(
+    const __nv_bfloat16* __restrict__ embed,
+    const int* __restrict__ tok_ids,
+    const half* __restrict__ proj,
+    float* __restrict__ streams,
+    int D
+) {
+    int mr = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < D) {
+        int tid = tok_ids[mr];
+        float v = __bfloat162float(embed[(size_t)tid * D + i]) + __half2float(proj[i]);
+        float* sr = streams + (size_t)mr * 4 * D;
+        sr[0 * D + i] = v;
+        sr[1 * D + i] = v;
+        sr[2 * D + i] = v;
+        sr[3 * D + i] = v;
+    }
+}
+
 void rad_cuda_mqa_attn_sink_causal_f16(
     const half* q,
     const half* k_cache,
@@ -512,6 +534,7 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     int n_heads,
     int start_pos,
     int max_ctx,
+    int sliding_window,
     int head_dim,
     float scale,
     cudaStream_t stream
@@ -519,8 +542,21 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     size_t smem = (size_t)head_dim * 2 * sizeof(float);
     dim3 grid(n_heads, M);
     mqa_attn_sink_causal_f16_k<<<grid, 256, smem, stream>>>(
-        q, k_cache, v_cache, attn_sink, out, n_heads, start_pos, max_ctx, head_dim, scale
+        q, k_cache, v_cache, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, head_dim, scale
     );
+}
+
+void rad_cuda_mtp_add_proj_to_mhc_f32(
+    const __nv_bfloat16* embed,
+    const int* tok_ids,
+    const half* proj,
+    float* streams,
+    int M,
+    int D,
+    cudaStream_t stream
+) {
+    dim3 grid((D + 255) / 256, M);
+    mtp_add_proj_to_mhc_f32_k<<<grid, 256, 0, stream>>>(embed, tok_ids, proj, streams, D);
 }
 
 void rad_cuda_wo_a_gather_group_f16(

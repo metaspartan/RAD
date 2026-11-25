@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::path::Path;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScalingConfig {
     pub rope_type: String,
@@ -11,6 +12,7 @@ pub struct RopeScalingConfig {
     pub original_max_position_embeddings: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TextConfig {
     pub vocab_size: usize,
@@ -67,6 +69,7 @@ pub struct TextConfig {
     pub dspark_target_layer_ids: Vec<usize>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeepseekV41Config {
     pub bos_token_id: i32,

@@ -114,7 +114,7 @@ fn extract_content_str(m: &serde_json::Value) -> String {
 }
 
 pub fn format_dsv41_prompt(messages: &[serde_json::Value], tools: Option<&[serde_json::Value]>) -> String {
-    let mut out = String::from("<｜begin▁of▁sentence｜>");
+    let mut out = String::from("<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n");
     let mut sys_text = String::new();
     for m in messages {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -142,7 +142,6 @@ pub fn format_dsv41_prompt(messages: &[serde_json::Value], tools: Option<&[serde
         }
     }
     if !sys_text.is_empty() {
-        out.push_str("<｜System｜>");
         out.push_str(&sys_text);
     }
     let mut prev_user = false;

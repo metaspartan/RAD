@@ -40,6 +40,7 @@ impl SafetensorsIndex {
         })
     }
 
+    #[allow(dead_code)]
     pub fn contains(&self, name: &str) -> bool {
         self.weight_map.contains_key(name)
     }
