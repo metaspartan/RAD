@@ -6,6 +6,10 @@ members = [
     "crates/rad-core",
     "crates/rad-serve",
 ]
+exclude = [
+    "crates/rad-cuda",
+    "crates/rad-dsv41",
+]
 
 [workspace.package]
 version = "0.31.0"

@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "rad-dsv41"
 version = "0.31.0"
