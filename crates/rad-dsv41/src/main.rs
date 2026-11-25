@@ -195,6 +195,29 @@ fn run_bench_layer(model_dir: &PathBuf, max_ctx: usize, max_layers: usize, comm:
     let mut pcmd = 4u32;
     comm.broadcast_u32(&mut pcmd)?;
     eng.profile_step(eng.cfg.bos_token_id, comm)?;
+
+    let test_seq = vec![0i32, 1000, 2000, 3000];
+    let mut r0 = 0u32;
+    comm.broadcast_u32(&mut r0)?;
+    eng.pos = 0;
+    let mut seq_preds = Vec::new();
+    for &t in &test_seq {
+        let mut one = vec![t];
+        let mut c = 2u32;
+        comm.broadcast_u32(&mut c)?;
+        comm.broadcast_i32_vec(&mut one)?;
+        seq_preds.push(eng.step_decode(t, comm)?);
+    }
+    let mut r1 = 0u32;
+    comm.broadcast_u32(&mut r1)?;
+    eng.pos = 0;
+    let mut b_in = test_seq.clone();
+    let mut c2 = 2u32;
+    comm.broadcast_u32(&mut c2)?;
+    comm.broadcast_i32_vec(&mut b_in)?;
+    let batch_preds = eng.step_batch(&test_seq, comm)?;
+    println!("PARITY M=1 vs M=4: seq={seq_preds:?} batch={batch_preds:?} match={}", seq_preds == batch_preds);
+
     let mut quit = 99u32;
     let _ = comm.broadcast_u32(&mut quit);
     Ok(())
