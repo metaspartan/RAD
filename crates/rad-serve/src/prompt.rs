@@ -47,7 +47,15 @@ pub(crate) fn normalize_tool_specs(tools: &[serde_json::Value]) -> (Vec<serde_js
     (specs, names)
 }
 
-pub(crate) fn detect_repeated_tool_loop(messages: &[ChatMessage]) -> bool {
+pub(crate) fn canonical_tool_sig(name: &str, raw_args: &str) -> String {
+    let norm_args = match serde_json::from_str::<serde_json::Value>(raw_args.trim()) {
+        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| raw_args.trim().to_string()),
+        Err(_) => raw_args.trim().to_string(),
+    };
+    format!("{}:{}", name.trim(), norm_args)
+}
+
+pub(crate) fn detect_repeated_tool_loop(messages: &[ChatMessage]) -> (usize, Option<String>) {
     let mut recent_sigs: Vec<String> = Vec::new();
     for m in messages.iter().rev() {
         if m.role == "assistant" {
@@ -61,14 +69,14 @@ pub(crate) fn detect_repeated_tool_loop(messages: &[ChatMessage]) -> bool {
                             .get("arguments")
                             .or_else(|| fn_obj.get("args"))
                             .map(|v| match v {
-                                serde_json::Value::String(s) => s.trim().to_string(),
+                                serde_json::Value::String(s) => s.clone(),
                                 other => serde_json::to_string(other).unwrap_or_default(),
                             })
                             .unwrap_or_default();
-                        parts.push(format!("{name}:{args}"));
+                        parts.push(canonical_tool_sig(name, &args));
                     }
                     recent_sigs.push(parts.join("|"));
-                    if recent_sigs.len() >= 4 {
+                    if recent_sigs.len() >= 6 {
                         break;
                     }
                 }
@@ -76,10 +84,40 @@ pub(crate) fn detect_repeated_tool_loop(messages: &[ChatMessage]) -> bool {
         }
     }
     if recent_sigs.len() < 2 {
-        return false;
+        return (0, None);
     }
     let last = &recent_sigs[0];
-    recent_sigs[1..].iter().any(|prev| prev == last)
+    let repeats = recent_sigs[1..].iter().filter(|prev| *prev == last).count();
+    if repeats > 0 {
+        (repeats, Some(last.clone()))
+    } else {
+        (0, None)
+    }
+}
+
+pub(crate) fn apply_tool_loop_guard(
+    prompt: &mut String,
+    sampling: &mut grammar::SamplingParams,
+    repeat_count: usize,
+) {
+    if repeat_count == 0 {
+        return;
+    }
+    if repeat_count == 1 {
+        sampling.temperature = sampling.temperature.max(0.6);
+        sampling.repetition_penalty = sampling.repetition_penalty.max(1.22);
+        let nudge = "<|message_system|><|content_text|>You already ran that exact tool call and received its output above. Do NOT repeat the same command again. Take a different action or answer the user directly.<|end_message|>";
+        if let Some(pos) = prompt.rfind("<|message_model|>") {
+            prompt.insert_str(pos, nudge);
+        }
+    } else {
+        sampling.temperature = sampling.temperature.max(0.75);
+        sampling.repetition_penalty = sampling.repetition_penalty.max(1.32);
+        let nudge = "<|message_system|><|content_text|>STOP: You have repeated the exact same tool call multiple times in a row. That identical tool call is now blocked. Do NOT run it again. Either run a completely different command to make progress or reply directly to the user in plain text now.<|end_message|>";
+        if let Some(pos) = prompt.rfind("<|message_model|>") {
+            prompt.insert_str(pos, nudge);
+        }
+    }
 }
 
 pub(crate) fn format_prompt_with_tools(
@@ -547,5 +585,44 @@ mod tests {
         let (r, c) = split_thinking(raw, true);
         assert_eq!(r.as_deref(), Some("step 1"));
         assert_eq!(c, "final answer");
+    }
+
+    #[test]
+    fn repeated_tool_loop_normalizes_json_and_escalates() {
+        let make_turn = |args: &str| ChatMessage {
+            role: "assistant".into(),
+            content: json!("checking"),
+            tool_calls: Some(vec![json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "exec", "arguments": args}
+            })]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+        let msgs2 = vec![
+            make_turn(r#"{"command": "ls -la", "cwd": "/tmp"}"#),
+            make_turn(r#"{"cwd":"/tmp","command":"ls -la"}"#),
+        ];
+        let (cnt2, sig2) = detect_repeated_tool_loop(&msgs2);
+        assert_eq!(cnt2, 1);
+        assert!(sig2.is_some());
+
+        let msgs3 = vec![
+            make_turn(r#"{"command": "ls -la"}"#),
+            make_turn(r#"{"command":"ls -la"}"#),
+            make_turn(r#"{"command": "ls -la"}"#),
+        ];
+        let (cnt3, sig3) = detect_repeated_tool_loop(&msgs3);
+        assert_eq!(cnt3, 2);
+        assert_eq!(sig3.as_deref(), Some(canonical_tool_sig("exec", r#"{"command":"ls -la"}"#).as_str()));
+
+        let mut prompt = String::from("<|begin_of_text|><|message_model|><|content_text|>");
+        let mut samp = grammar::SamplingParams::greedy();
+        apply_tool_loop_guard(&mut prompt, &mut samp, cnt3);
+        assert!(samp.temperature >= 0.75);
+        assert!(samp.repetition_penalty >= 1.32);
+        assert!(prompt.contains("blocked"));
     }
 }

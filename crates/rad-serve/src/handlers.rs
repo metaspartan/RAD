@@ -13,7 +13,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::grammar;
-use crate::prompt::{convert_anthropic_request, detect_repeated_tool_loop, format_prompt_with_tools, format_responses_input_with_tools};
+use crate::prompt::{apply_tool_loop_guard, canonical_tool_sig, convert_anthropic_request, detect_repeated_tool_loop, format_prompt_with_tools, format_responses_input_with_tools};
 use crate::scheduler::collect_job;
 use crate::types::*;
 
@@ -230,7 +230,8 @@ pub(crate) async fn chat_completions(
     let base_seed = req.seed.unwrap_or_else(|| now_unix() ^ REQ_SEQ.load(Ordering::Relaxed));
     let extra_pen = req.presence_penalty.unwrap_or(0.0).max(req.frequency_penalty.unwrap_or(0.0)).clamp(0.0, 2.0);
     let eff_rep = req.repetition_penalty.unwrap_or_else(|| if extra_pen > 1e-4 { 1.0 + 0.15 * extra_pen } else { 1.0 });
-    let loop_detected = detect_repeated_tool_loop(&req.messages);
+    let (loop_repeats, repeated_sig) = detect_repeated_tool_loop(&req.messages);
+    let blocked_sig: Option<String> = if loop_repeats >= 2 { repeated_sig } else { None };
     let mut sampling = grammar::SamplingParams {
         temperature: req.temperature.unwrap_or(0.0).max(0.0),
         top_p: req.top_p.unwrap_or(0.95).clamp(0.0, 1.0),
@@ -239,18 +240,9 @@ pub(crate) async fn chat_completions(
         repetition_penalty: eff_rep,
         seed: base_seed,
     };
-    if loop_detected {
-        sampling.temperature = sampling.temperature.max(0.5);
-        sampling.repetition_penalty = sampling.repetition_penalty.max(1.15);
-    }
 
     let (mut prompt, images, allowed_tools) = format_prompt_with_tools(&req.messages, req.tools.as_deref(), initial_thinking);
-    if loop_detected {
-        let nudge = "<|message_system|><|content_text|>You already ran that exact tool call and received its output above. Do NOT repeat the same command again — inspect something new or summarize your findings now.<|end_message|>";
-        if let Some(pos) = prompt.rfind("<|message_model|>") {
-            prompt.insert_str(pos, nudge);
-        }
-    }
+    apply_tool_loop_guard(&mut prompt, &mut sampling, loop_repeats);
     if force_tool_json {
         let extra = if let Some(ref fn_name) = forced_tool_name {
             format!("<|message_system|><|content_text|>You MUST call tool `{fn_name}` by responding ONLY with valid JSON: {{\"name\": \"{fn_name}\", \"arguments\": {{...}}}}.<|end_message|>")
@@ -362,6 +354,9 @@ pub(crate) async fn chat_completions(
                                     }
                                 }
                                 grammar::StreamDelta::ToolCall(tc) => {
+                                    if blocked_sig.as_deref() == Some(canonical_tool_sig(&tc.name, &tc.arguments).as_str()) {
+                                        continue;
+                                    }
                                     let idx = tc_index;
                                     tc_index += 1;
                                     let tc_delta = json!([{
@@ -427,6 +422,9 @@ pub(crate) async fn chat_completions(
                     GenEvent::Done { finish_reason, pred_n, .. } => {
                         for d in parser.finish(&tok) {
                             if let grammar::StreamDelta::ToolCall(tc) = d {
+                                if blocked_sig.as_deref() == Some(canonical_tool_sig(&tc.name, &tc.arguments).as_str()) {
+                                    continue;
+                                }
                                 let idx = tc_index;
                                 tc_index += 1;
                                 let tc_delta = json!([{
@@ -505,6 +503,9 @@ pub(crate) async fn chat_completions(
     st.metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
     let pred_n = out_ids.len();
     let mut parsed = grammar::parse_inkling_tokens(&out_ids, &st.tokenizer, initial_thinking, &allowed_tools, &call_prefix);
+    if let Some(ref bsig) = blocked_sig {
+        parsed.tool_calls.retain(|tc| canonical_tool_sig(&tc.name, &tc.arguments) != *bsig);
+    }
     if !stop_seqs.is_empty() && parsed.tool_calls.is_empty() {
         let mut earliest: Option<usize> = None;
         for ss in &stop_seqs {
@@ -766,7 +767,10 @@ pub(crate) async fn anthropic_messages(
     if let Some(k) = req.top_k { sampling.top_k = k; }
     if let Some(mp) = req.min_p { sampling.min_p = mp.clamp(0.0, 1.0); }
     let (msgs, oai_tools, enable_thinking) = convert_anthropic_request(&req);
-    let (prompt, images, allowed_tools) = format_prompt_with_tools(&msgs, oai_tools.as_deref(), enable_thinking);
+    let (loop_repeats, repeated_sig) = detect_repeated_tool_loop(&msgs);
+    let blocked_sig: Option<String> = if loop_repeats >= 2 { repeated_sig } else { None };
+    let (mut prompt, images, allowed_tools) = format_prompt_with_tools(&msgs, oai_tools.as_deref(), enable_thinking);
+    apply_tool_loop_guard(&mut prompt, &mut sampling, loop_repeats);
     let enc = match st.tokenizer.encode(prompt, false) {
         Ok(e) => e,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"type":"error","error":{"type":"invalid_request_error","message":format!("{e}")}}))).into_response(),
@@ -883,6 +887,9 @@ pub(crate) async fn anthropic_messages(
                                     }
                                 }
                                 grammar::StreamDelta::ToolCall(tc) => {
+                                    if blocked_sig.as_deref() == Some(canonical_tool_sig(&tc.name, &tc.arguments).as_str()) {
+                                        continue;
+                                    }
                                     if think_open {
                                         let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
                                         block_idx += 1;
@@ -923,6 +930,9 @@ pub(crate) async fn anthropic_messages(
                     GenEvent::Done { finish_reason, pred_n, .. } => {
                         for d in parser.finish(&tok) {
                             if let grammar::StreamDelta::ToolCall(tc) = d {
+                                if blocked_sig.as_deref() == Some(canonical_tool_sig(&tc.name, &tc.arguments).as_str()) {
+                                    continue;
+                                }
                                 if think_open {
                                     let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
                                     block_idx += 1;
@@ -977,6 +987,9 @@ pub(crate) async fn anthropic_messages(
         };
     let pred_n = out_ids.len();
     let mut parsed = grammar::parse_inkling_tokens(&out_ids, &st.tokenizer, enable_thinking, &allowed_tools, &call_prefix);
+    if let Some(ref bsig) = blocked_sig {
+        parsed.tool_calls.retain(|tc| canonical_tool_sig(&tc.name, &tc.arguments) != *bsig);
+    }
     if !stop_seqs.is_empty() && parsed.tool_calls.is_empty() {
         for ss in &stop_seqs {
             if let Some(pos) = parsed.content.find(ss.as_str()) {
