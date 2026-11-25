@@ -174,6 +174,7 @@ struct ActiveSlot {
     next_tok: i32,
     max_tokens: usize,
     emitted: usize,
+    last_emits: usize,
     #[allow(dead_code)]
     enable_thinking: bool,
     grammar: Option<grammar::JsonGrammarState>,
@@ -965,7 +966,7 @@ fn ngram_bucket_len(avail: usize) -> usize {
     else { 0 }
 }
 
-fn ngram_lookup_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<i32>> {
+fn ngram_lookup_draft_ex(history: &[i32], anchor: i32, max_k: usize) -> Option<(Vec<i32>, usize)> {
     let n = history.len();
     if n < 16 || max_k < 8 {
         return None;
@@ -1009,10 +1010,14 @@ fn ngram_lookup_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<
             let mut out = Vec::with_capacity(take);
             out.push(anchor);
             out.extend_from_slice(&history[(pos + 1)..(pos + take)]);
-            return Some(out);
+            return Some((out, best_len));
         }
     }
     None
+}
+
+fn ngram_lookup_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<i32>> {
+    ngram_lookup_draft_ex(history, anchor, max_k).map(|(v, _)| v)
 }
 
 fn sync_kv_metrics(engine: &InklingEngine, metrics: &metrics::Metrics) {
@@ -1103,7 +1108,7 @@ fn run_scheduler(
                             } else {
                                 let now = Instant::now();
                                 active.push(ActiveSlot {
-                                    seq, next_tok: first_tok, max_tokens: job.max_tokens, emitted: 1,
+                                    seq, next_tok: first_tok, max_tokens: job.max_tokens, emitted: 1, last_emits: 0,
                                     enable_thinking: job.enable_thinking, grammar: gram, sampling,
                                     started_at: now, last_tok_at: now, tx: job.tx,
                                 });
@@ -1249,6 +1254,7 @@ fn run_scheduler(
                         next_tok: last_tok,
                         max_tokens: pf.job.max_tokens,
                         emitted: 1,
+                        last_emits: 0,
                         enable_thinking: pf.job.enable_thinking,
                         grammar: gram,
                         sampling,
@@ -1419,17 +1425,24 @@ fn run_scheduler(
             let max_user_k = (engine.multi_verify_cap / n_u).min(128);
             let mut ng_drafts: Option<Vec<Vec<i32>>> = None;
             if n_u >= 2 && max_user_k >= 8 {
-                let mut cands: Vec<Option<Vec<i32>>> = Vec::with_capacity(n_u);
+                let mut cands: Vec<Option<(Vec<i32>, usize)>> = Vec::with_capacity(n_u);
                 let mut hit_count = 0usize;
                 let mut max_hit_len = 0usize;
                 for a in &active {
                     let rem_kv = engine.max_ctx.saturating_sub(engine.seq_pos[a.seq] as usize);
-                    if let Some(ng) = ngram_lookup_draft(&engine.seq_tokens[a.seq], a.next_tok, max_user_k.min(rem_kv)) {
-                        if ng.len() >= 8 {
+                    if let Some((ng, mlen)) = ngram_lookup_draft_ex(&engine.seq_tokens[a.seq], a.next_tok, max_user_k.min(rem_kv)) {
+                        let req_mlen = if a.last_emits > 0 && a.last_emits <= 16 { 6 } else { 5 };
+                        if ng.len() >= 8 && mlen >= req_mlen {
                             hit_count += 1;
                             max_hit_len = max_hit_len.max(ng.len());
+                            cands.push(Some((ng, mlen)));
+                        } else if ng.len() >= 8 && a.last_emits == 0 {
+                            hit_count += 1;
+                            max_hit_len = max_hit_len.max(ng.len());
+                            cands.push(Some((ng, mlen)));
+                        } else {
+                            cands.push(None);
                         }
-                        cands.push(Some(ng));
                     } else {
                         cands.push(None);
                     }
@@ -1444,7 +1457,7 @@ fn run_scheduler(
                         if let Some(ref d) = drafter {
                             for (idx, c) in cands.iter().enumerate() {
                                 let su = active[idx].seq;
-                                if !matches!(c, Some(ng) if ng.len() >= min_strong_ng)
+                                if !matches!(c, Some((ng, _)) if ng.len() >= min_strong_ng)
                                     && su < d.max_seqs()
                                     && d.seq_ctx_len(su) == engine.seq_pos[su]
                                 {
@@ -1588,6 +1601,7 @@ fn run_scheduler(
                                     }
                                     if !finished_set[mi] {
                                         slot.next_tok = last_tok;
+                                        slot.last_emits = cu_outs[u].len();
                                     }
                                 }
                                 let mut keep = Vec::with_capacity(active.len());
@@ -1620,7 +1634,7 @@ fn run_scheduler(
                         let mut padded: Vec<Vec<i32>> = Vec::with_capacity(n_u);
                         for (idx, c) in cands.into_iter().enumerate() {
                             let mut v = match c {
-                                Some(ng) if ng.len() >= min_strong_ng => ng,
+                                Some((ng, _)) if ng.len() >= min_strong_ng => ng,
                                 _ => {
                                     if miss_cursor < miss_idx.len() && miss_idx[miss_cursor] == idx {
                                         let dv = std::mem::take(&mut miss_drafts[miss_cursor]);
@@ -1753,6 +1767,7 @@ fn run_scheduler(
                         }
                         let mut keep = Vec::with_capacity(active.len());
                         for (mut slot, toks_out) in active.into_iter().zip(all_outs.into_iter()) {
+                            let round_emits = toks_out.len();
                             let mut finished = false;
                             let mut last_tok = slot.next_tok;
                             for nxt in toks_out {
@@ -1786,6 +1801,7 @@ fn run_scheduler(
                             }
                             if !finished {
                                 slot.next_tok = last_tok;
+                                slot.last_emits = round_emits;
                                 keep.push(slot);
                             }
                         }
