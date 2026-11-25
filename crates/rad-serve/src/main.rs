@@ -1012,7 +1012,12 @@ fn run_scheduler(
             metrics.requests_queued.store(0, Ordering::Relaxed);
             metrics.requests_prefilling.store(0, Ordering::Relaxed);
             match rx.blocking_recv() {
-                Some(job) => pending.push_back(job),
+                Some(job) => {
+                    pending.push_back(job);
+                    if max_seqs > 1 {
+                        std::thread::sleep(std::time::Duration::from_millis(8));
+                    }
+                }
                 None => break,
             }
         }
@@ -1385,8 +1390,7 @@ fn run_scheduler(
                             }
                         }
                         if hit_count * 2 >= n_u {
-                            let raw_bk = ngram_bucket_len(max_hit_len);
-                            let bk = if hit_count < n_u { raw_bk.min(64) } else { raw_bk };
+                            let bk = ngram_bucket_len(max_hit_len);
                             if bk >= 8 {
                                 let mut padded: Vec<Vec<i32>> = Vec::with_capacity(n_u);
                                 for (idx, c) in cands.into_iter().enumerate() {
@@ -1416,7 +1420,7 @@ fn run_scheduler(
                     } else if n_u == 1 {
                         spec_k
                     } else {
-                        4usize
+                        spec_k.min(max_user_k).max(4)
                     };
                     let any_sampling = active.iter().any(|a| !a.sampling.is_greedy());
                     let seq_ids: Vec<i32> = active.iter().map(|a| a.seq as i32).collect();
@@ -3121,7 +3125,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
 
         for &b in &[4usize, 8usize, 16usize] {
             if b <= d.max_seqs() {
-                let mk = 4usize;
+                let mk = if b * d.spec_k() <= engine.multi_verify_cap { d.spec_k() } else { 4usize };
                 let code_p = format_prompt(
                     &[ChatMessage { role: "user".into(), content: json!("Show me a Python implementation of quicksort and mergesort."), tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }],
                     false,
