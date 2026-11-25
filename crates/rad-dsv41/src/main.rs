@@ -82,7 +82,7 @@ fn run_bench_exl3(model_dir: &PathBuf, comm: &mut Tp2Comm) -> Result<()> {
             let dt = t0.elapsed().as_secs_f64() / iters as f64;
             let gb_s = (trel_len as f64) / dt / 1e9;
             println!(
-                "  [{prefix:24s} {bits}b K={k:5} N={n:6} M={m}] {:7.1} us  {:5.1} GB/s",
+                "  [{prefix:24} {bits}b K={k:5} N={n:6} M={m}] {:7.1} us  {:5.1} GB/s",
                 dt * 1e6,
                 gb_s
             );
