@@ -67,7 +67,7 @@ extern "C" __global__ void gemm_q4_0_wmma64_k(const uint8_t* __restrict__ W,
         struct {
             uint4 wq[4][128];
             float dw[4][128];
-            int2 xq[4][4][64];
+            int2 xq[4][4][66];
             float xd[4][64];
             int32_t xs[4][64];
         } kloop;
@@ -384,7 +384,7 @@ extern "C" __global__ void qkvrg_gemm_q4_wmma64_k(const uint8_t* __restrict__ wq
         struct {
             uint4 wq[4][128];
             float dw[4][128];
-            int2 xq[4][4][64];
+            int2 xq[4][4][66];
             float xd[4][64];
             int32_t xs[4][64];
         } kloop;
@@ -1097,7 +1097,7 @@ extern "C" __global__ void moe_gu_q4_0_wmma_q8_k(const uint8_t* __restrict__ W,
             uint4 wu[4][64];
             float dg[4][64];
             float du[4][64];
-            int2 xq[4][4][64];
+            int2 xq[4][4][66];
             float xd[4][64];
             int32_t xs[4][64];
         } t;
@@ -1210,6 +1210,9 @@ extern "C" __global__ void moe_gu_q4_0_wmma_q8_k(const uint8_t* __restrict__ W,
             }
             __syncthreads();
         }
+        constexpr float kLog2e = 1.4426950408889634f;
+        float inv_beta = 1.0f / beta;
+        float inv_lb = (lb > 0.0f) ? (1.0f / lb) : 0.0f;
         if (n0 + col < nt) {
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
@@ -1219,9 +1222,9 @@ extern "C" __global__ void moe_gu_q4_0_wmma_q8_k(const uint8_t* __restrict__ W,
                 if (r < n_ff) {
                     float g = ag0[i] * sc;
                     float u = au0[i] * sc;
-                    float sg = 1.0f / (1.0f + expf(-g));
-                    float act = beta * tanhf(g / beta) * sg;
-                    float up = (lb > 0.0f) ? (lb * tanhf(u / lb)) : u;
+                    float sg = 1.0f / (1.0f + exp2f(-g * kLog2e));
+                    float act = beta * tanhf(g * inv_beta) * sg;
+                    float up = (lb > 0.0f) ? (lb * tanhf(u * inv_lb)) : u;
                     v = act * up;
                 }
                 sm.act[n0 + col][lr] = v;
@@ -1236,9 +1239,9 @@ extern "C" __global__ void moe_gu_q4_0_wmma_q8_k(const uint8_t* __restrict__ W,
                 if (r < n_ff) {
                     float g = ag1[i] * sc;
                     float u = au1[i] * sc;
-                    float sg = 1.0f / (1.0f + expf(-g));
-                    float act = beta * tanhf(g / beta) * sg;
-                    float up = (lb > 0.0f) ? (lb * tanhf(u / lb)) : u;
+                    float sg = 1.0f / (1.0f + exp2f(-g * kLog2e));
+                    float act = beta * tanhf(g * inv_beta) * sg;
+                    float up = (lb > 0.0f) ? (lb * tanhf(u * inv_lb)) : u;
                     v = act * up;
                 }
                 sm.act[n1 + col][lr] = v;
@@ -1308,7 +1311,7 @@ extern "C" __global__ void moe_dn_q4_0_wmma_k(const uint8_t* __restrict__ W,
         struct {
             uint4 wq[4][128];
             float dw[4][128];
-            int2 aq[4][4][64];
+            int2 aq[4][4][66];
             float ad[4][64];
             int32_t as[4][64];
         } kloop;

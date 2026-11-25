@@ -8,11 +8,11 @@ RAD natively runs **Inkling-2-Mini** (26B MoE, 48 looped visits, hybrid SWA + fu
 
 ## Highlights
 
-- **Single-R9700 Speed Records:** **`1,196.5 tok/s`** peak decode (`>1,000 tok/s` across `2K–64K`, **`881.6 tok/s`** @ 128K, **`674.4 tok/s`** @ 256K), **`1,074.8 tok/s`** live `/v1/chat/completions` SSE (`1,073.4 tok/s` at `temp=0.2`), **`3,815.1 agg tok/s`** multi-user (`3,042.8 agg tok/s` / **`322.9 tok/s/user`** live 8-user HTTP SSE at `temp=0.2`, `3,601.3` / `450.2/user` at `B=8`, `2,840.7` / `710.2/user` at `B=4`), and **`4,218.6 tok/s`** `pp2048` prefill (**`2,046.4 tok/s`** @ 256K, **`5.51×`** `llama.cpp`) with **`1.84 s`** cold load at 256K.
-- **RDNA4 (`gfx1201`) Custom HIP Kernels:** Hand-written Wave32 WMMA `Q4_0_SOA × Q8_1` GEMM/MoE, Split-KV WMMA FlashAttention-2, INT8 full-attention KV cache, and HIP graph capture (`B=1`, `K=8..128` verify, and multi-user Flash verify).
-- **Native Speculative Decoding:** Zero-copy [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) + DSpark + hybrid `K=128` longest-prefix lookup (single-user & multi-user, greedy & GPU top-64 sampled).
-- **Agentic & Multimodal Ready:** Native Inkling-2-Mini tool calling, multi-turn prefix caching (`98.9–99.5%` hit rate even across reformatted tool-call JSON via verbatim `tool_call_id` replay, `21–82 ms` cached TTFT/E2E), JSON grammar constraints, and built-in GPU Vision (`mmproj-F16.gguf`).
-- **Production OpenAI Server & Multi-GPU:** Continuous batching (`B<=128`), Paged KV, chunked prefill, `--gpus 0,1` data-parallel serving with prefix-aware routing, Prometheus `/metrics`, API auth, and `/v1/chat/completions` + `/v1/responses` (HTTP, SSE, WebSocket) on port **`6733`**.
+- **Single-R9700 Speed Records:** **`1,224.9 tok/s`** peak single-user decode (`>1,000 tok/s` across `2K–64K`, **`881.6 tok/s`** @ 128K, **`674.4 tok/s`** @ 256K), **`1,074.8 tok/s`** live `/v1/chat/completions` SSE (`1,073.4 tok/s` at `temp=0.2`), **`4,058.5 agg tok/s`** multi-user (`253.7/user` at `B=16`, `3,745.1` / `468.1/user` at `B=8`, `2,923.5` / `730.9/user` at `B=4`, `788.8` / `98.6/user` pure DFlash 2 at `B=8`), and **`4,363.0 tok/s`** `pp2048` prefill (**`2,046.4 tok/s`** @ 256K, **`5.70×`** `llama.cpp`) with **`1.84 s`** cold load at 256K.
+- **RDNA4 (`gfx1201`) Custom HIP Kernels:** Hand-written Wave32 WMMA `Q4_0_SOA × Q8_1` GEMM/MoE with bank-conflict-free LDS tiling & coalesced epilogues, Split-KV WMMA FlashAttention-2 (single & multi-user), INT8 full-attention KV cache, and HIP graph capture (`B=1`, `K=8..128` verify, and multi-user Flash verify).
+- **Native Speculative Decoding:** Zero-copy [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) + DSpark + hybrid `K=128` longest-prefix lookup (single-user & multi-user, **100.00% bit-exact** parity vs no-spec at `temp=0.0`, greedy & GPU top-64 sampled).
+- **Agentic & Multimodal Ready:** Native Inkling-2-Mini tool calling, multi-turn prefix caching (`98.9–100.0%` hit rate up to 249K context & across reformatted tool-call JSON via verbatim `tool_call_id` replay, `21–82 ms` cached TTFT/E2E), JSON grammar constraints, and built-in GPU Vision (`mmproj-F16.gguf`).
+- **Full OpenAI, Anthropic, vLLM, SGLang & llama.cpp API Server:** Continuous batching (`B<=128`), Paged KV, chunked prefill, 64 MB body limit, `--gpus 0,1` data-parallel serving with prefix-aware routing, Prometheus `/metrics`, API auth, `/v1/chat/completions`, `/v1/completions` (SSE), `/v1/responses` (HTTP/SSE/WS), `/v1/messages` + `/v1/messages/count_tokens` (Anthropic SSE), `/v1/models`, `/tokenize`, `/detokenize`, `/props`, `/slots`, `/version`, `/health`, `/ping`, `/ready`, `/live` on port **`6733`**.
 
 ---
 
@@ -27,11 +27,11 @@ Measured end-to-end on the **same AMD Radeon AI PRO R9700 (32 GB, ~\$1,250)**, *
 | Engine / Hardware | Decode (`tok/s`) | `pp2048` Prefill (`tok/s`) | Notes |
 | --- | --- | --- | --- |
 | **Stock `llama.cpp` (R9700 + DSpark)** | `70.5 tok/s` | `765.5 tok/s` | `-fa on -ctk q8_0 -ctv q8_0 --spec-type draft-dspark` |
-| **RAD (R9700, No-Spec `hipGraph`)** | **`110.8 ± 0.7 tok/s`** (`1.57×`) | **`4,218.6 ± 2.1 tok/s`** (**`5.51×`**) | `tg128 @ d=2048 = 101.9 tok/s`; `pp512 = 3,417.0 ± 4.6 tok/s` |
-| **Unsloth RTX PRO 6000 Blackwell** | `125.0 tok/s` *(claimed)* | — | 96 GB workstation GPU (~\$8,500) |
-| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`4,218.6 tok/s`** (**`5.51×`**) | `verify=23.7 ms`, `avg_emit=4.27` |
-| **RAD (R9700 + DFlash 2 `K=8`, Pure Gen)** | **`302.2 tok/s`** (**`4.29×`**) | **`4,160.1 ± 1.3 tok/s`** (**`5.43×`**) | **2.42× vs. RTX PRO 6000 Blackwell**, `Math=271.4 tok/s`, `2K Pure Gen=244.7 tok/s`, `Prose=110.9 tok/s` |
-| **RAD (Hybrid DFlash 2 + `K=128`, 2K–256K)** | **`1,196.5 tok/s`** (**`16.97×`**) | **`4,035.4 tok/s`** (**`5.27×`**) | **9.57× vs. RTX PRO 6000 Blackwell**; **`>1,000 tok/s` across 2K–64K**, **`881.6 tok/s`** at 128K, **`674.4 tok/s`** at 256K |
+| **RAD (R9700, No-Spec `hipGraph`)** | **`110.8 ± 0.7 tok/s`** (`1.57×`) | **`4,363.0 ± 1.0 tok/s`** (**`5.70×`**) | `tg128 @ d=2048 = 101.9 tok/s`; `pp512 = 3,526.3 ± 2.9 tok/s` |
+| **Unsloth RTX PRO 6000 Blackwell** | `125.0 tok/s` *(claimed)* | - | 96 GB workstation GPU (~\$8,500) |
+| **RAD (R9700 + DSpark `K=6`)** | **`148.2 tok/s`** (`2.10×`) | **`4,363.0 tok/s`** (**`5.70×`**) | `verify=23.7 ms`, `avg_emit=4.27` |
+| **RAD (R9700 + DFlash 2 `K=8`, Pure Gen)** | **`302.2 tok/s`** (**`4.29×`**) | **`4,302.4 ± 2.8 tok/s`** (**`5.62×`**) | **2.42× vs. RTX PRO 6000 Blackwell**, `Math=271.4 tok/s`, `2K Pure Gen=244.7 tok/s`, `Prose=110.9 tok/s` |
+| **RAD (Hybrid DFlash 2 + `K=128`, 2K–256K)** | **`1,224.9 tok/s`** (**`17.37×`**) | **`4,161.2 tok/s`** (**`5.44×`**) | **9.80× vs. RTX PRO 6000 Blackwell**; **`>1,000 tok/s` across 2K–64K**, **`881.6 tok/s`** at 128K, **`674.4 tok/s`** at 256K |
 
 ### Long-Context Decode & Prefill (`2K → 256K`, Single 32 GB R9700)
 
@@ -41,9 +41,9 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 
 | Context Depth | Prompt Tokens | Prefill (`tok/s`) | Prefill Time | Decode (`tok/s`) | Avg Emit / Round |
 | --- | --- | --- | --- | --- | --- |
-| **2K** | 1,984 | **4,035.4 tok/s** | 0.49 s | **1,135.6 tok/s** | 86.8 |
-| **4K** | 4,074 | **4,034.8 tok/s** | 1.01 s | **1,196.5 tok/s** | 104.0 |
-| **8K** | 8,064 | **3,959.0 tok/s** | 2.04 s | **1,124.4 tok/s** | 86.8 |
+| **2K** | 1,984 | **4,156.1 tok/s** | 0.48 s | **1,160.2 tok/s** | 86.8 |
+| **4K** | 4,074 | **4,161.2 tok/s** | 0.98 s | **1,224.9 tok/s** | 104.0 |
+| **8K** | 8,064 | **3,977.5 tok/s** | 1.84 s | **1,147.3 tok/s** | 86.8 |
 | **16K** | 16,234 | **3,826.6 tok/s** | 4.24 s | **1,088.7 tok/s** | 86.8 |
 | **32K** | 32,764 | **3,621.3 tok/s** | 9.05 s | **1,029.5 tok/s** | 96.5 |
 | **64K** | 65,444 | **3,255.7 tok/s** | 20.10 s | **1,009.2 tok/s** | 104.0 |
@@ -61,13 +61,13 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **8-User Concurrent Burst TTFT (`B=8`, live SSE)** | **107.2 ms avg** | `106.5–107.7 ms` across all 8 users (`3.2×` faster via batched multi-user prefill) |
 | **Prefix-Cached TTFT (`1,645 tok`, `1,639` cached)** | **21.2 ms** | Prefix-cache affinity hit + GQA 3:1 Split-KV FlashAttention |
 | **Multi-User Decode (`B=4`, Batched DFlash 2 `K=8`)** | **538.1 agg tok/s** | **`134.5 tok/s/user`** (`ITL 7.4 ms`, 32-tok `exp2f` SWA + single-launch `grid.z` WMMA) |
-| **Multi-User Decode (`B=4`, Hybrid DFlash 2 + `K=128`)** | **2,846.2 agg tok/s** | **`711.6 tok/s/user`** (`ITL 1.4 ms`, coalesced WMMA epilogue + 32-tok `exp2f` Q8KV FlashAttention) |
+| **Multi-User Decode (`B=4`, Hybrid DFlash 2 + `K=128`)** | **2,923.5 agg tok/s** | **`730.9 tok/s/user`** (`ITL 1.4 ms`, bank-free WMMA + coalesced epilogue + 32-tok `exp2f` Q8KV FlashAttention) |
 | **Multi-User Decode (`B=8`, no-spec)** | **643.6 agg tok/s** | **`80.4 tok/s/user`** (`ITL 12.4 ms`, `hipGraph` + GQA-3:1 INT8 KV + `loop_ctrl_down_nt_k<8>`) |
-| **Multi-User Decode (`B=8`, Batched DFlash 2 `K=8`)** | **748.8 agg tok/s** | **`93.6 tok/s/user`** (`ITL 10.7 ms`; 32-tok `exp2f` SWA + `grid.z` WMMA FlashAttention) |
-| **Multi-User Decode (`B=8`, Hybrid DFlash 2 + `K=128`)** | **3,644.0 agg tok/s** | **`455.5 tok/s/user`** (`ITL 2.2 ms`, coalesced WMMA epilogue + L2 grid tiling + `1,024`-tok verify) |
+| **Multi-User Decode (`B=8`, Batched DFlash 2 `K=8`)** | **788.8 agg tok/s** | **`98.6 tok/s/user`** (`ITL 10.1 ms`; Split-KV multi-user `K<=16` Q8KV + 32-tok `exp2f` SWA FlashAttention) |
+| **Multi-User Decode (`B=8`, Hybrid DFlash 2 + `K=128`)** | **3,745.1 agg tok/s** | **`468.1 tok/s/user`** (`ITL 2.1 ms`, bank-free WMMA + coalesced epilogue + L2 grid tiling + `1,024`-tok verify) |
 | **Multi-User Decode (`B=16`, no-spec)** | **926.3 agg tok/s** | **`57.9 tok/s/user`** (`ITL 17.3 ms`, unrolled `nt == 8` MoE + GQA-3:1 INT8 KV) |
 | **Multi-User Decode (`B=16`, Batched DFlash 2 `K=8`)** | **1,174.4 agg tok/s** | **`73.4 tok/s/user`** (`ITL 13.6 ms`, 32-tok `exp2f` SWA + `grid.z` WMMA FlashAttention) |
-| **Multi-User Decode (`B=16`, Hybrid DFlash 2 + `K=64`)** | **3,880.7 agg tok/s** | **`242.5 tok/s/user`** (`ITL 4.1 ms`, coalesced WMMA epilogue + L2 grid tiling, **92.4% of `pp2048` compute**) |
+| **Multi-User Decode (`B=16`, Hybrid DFlash 2 + `K=64`)** | **4,058.5 agg tok/s** | **`253.7 tok/s/user`** (`ITL 3.9 ms`, bank-free WMMA + coalesced epilogue + L2 grid tiling, **93.0% of `pp2048` compute**) |
 | **Multi-User Decode (`B=32`, no-spec)** | **1,277.8 agg tok/s** | **`39.9 tok/s/user`** (`ITL 25.0 ms`; +47% via `blockIdx.z` hot-expert splitting & `fused_rg B<=64`) |
 | **Multi-User Decode (`B=64`, no-spec)** | **1,162.2 agg tok/s** | `18.2 tok/s/user` (8-warp `128×64` LDS WMMA MoE) |
 | **Multi-User Decode (`B=128`, no-spec)** | **1,856.0 agg tok/s** | **`14.5 tok/s/user`** (fused WMMA MoE-to-`Q8_1` + `float4` slot reduction) |
@@ -107,7 +107,7 @@ RAD/
 │   └── rad_multiuser.svg      Multi-user throughput scaling chart
 └── scripts/
     ├── test_serve.py          End-to-end HTTP, SSE, batch, and WebSocket test suite
-    ├── test_e2e_realworld.py          Real-world 8-test multi-user SSE, tool-call prefix cache, grammar & disconnect suite
+    ├── test_e2e_realworld.py          Real-world 10-test multi-user SSE, Anthropic/OpenAI/compat API, prefix cache & grammar suite
     ├── test_e2e_longctx_agent.py      Real-world 7-turn 256K long-context agentic project-building E2E test
     ├── test_e2e_multiuser_longctx.py  Multi-user B=8 17.5K long-context multi-turn prefix-cache & SSE E2E test
     └── test_accuracy_spec_parity.py   DFlash 2 Hybrid vs No-Spec bit-exact token-parity & accuracy verification

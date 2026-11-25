@@ -345,6 +345,8 @@ struct TokenizeRequest {
     prompt: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -406,6 +408,37 @@ struct CompletionRequest {
     max_tokens: Option<usize>,
     #[serde(default)]
     stream: Option<bool>,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    stop: Option<StopInput>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicMessagesRequest {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    system: Option<serde_json::Value>,
+    messages: Vec<serde_json::Value>,
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    stop_sequences: Option<Vec<String>>,
+    #[serde(default)]
+    thinking: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -2089,6 +2122,52 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<Health> {
     })
 }
 
+async fn version_endpoint() -> Json<serde_json::Value> {
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "engine": "rad"
+    }))
+}
+
+async fn ping_endpoint() -> Json<serde_json::Value> {
+    Json(json!({"status": "ok"}))
+}
+
+async fn props_endpoint(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !check_auth_keys(&headers, &st.api_keys) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
+    }
+    Json(json!({
+        "default_generation_settings": {
+            "n_ctx": st.max_ctx,
+            "model": "inkling-2-mini"
+        },
+        "total_slots": st.workers.len(),
+        "speculative_decoding": st.spec_enabled,
+        "spec_mode": st.spec_mode,
+        "vision_enabled": st.vision_enabled,
+        "kv_block_size": st.kv_block_size,
+        "prefill_chunk_size": st.prefill_chunk_size,
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+    .into_response()
+}
+
+async fn slots_endpoint(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !check_auth_keys(&headers, &st.api_keys) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
+    }
+    Json(json!({
+        "active": st.metrics.requests_active.load(Ordering::Relaxed),
+        "prefilling": st.metrics.requests_prefilling.load(Ordering::Relaxed),
+        "queued": st.metrics.requests_queued.load(Ordering::Relaxed),
+        "kv_blocks_used": st.metrics.kv_blocks_used.load(Ordering::Relaxed),
+        "kv_blocks_total": st.metrics.kv_blocks_total.load(Ordering::Relaxed),
+        "kv_blocks_shared": st.metrics.kv_blocks_shared.load(Ordering::Relaxed)
+    }))
+    .into_response()
+}
+
 async fn tokenize_endpoint(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2097,7 +2176,7 @@ async fn tokenize_endpoint(
     if !check_auth_keys(&headers, &st.api_keys) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
     }
-    let text = req.prompt.or(req.text).unwrap_or_default();
+    let text = req.prompt.or(req.text).or(req.content).unwrap_or_default();
     match st.tokenizer.encode(text, false) {
         Ok(enc) => {
             let ids = enc.get_ids();
@@ -2116,7 +2195,7 @@ async fn detokenize_endpoint(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
     }
     match st.tokenizer.decode(&req.tokens, false) {
-        Ok(text) => Json(json!({"text": text})).into_response(),
+        Ok(text) => Json(json!({"text": text, "content": text})).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e}")}))).into_response(),
     }
 }
@@ -2523,14 +2602,98 @@ async fn completions(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response();
     }
     let model_id = req.model.unwrap_or_else(|| "inkling-2-mini".into());
-    let max_tokens = req.max_tokens.unwrap_or(256).min(8192);
-    let _stream = req.stream.unwrap_or(false);
+    let max_tokens = req.max_tokens.unwrap_or(256).min(16384);
+    let stream = req.stream.unwrap_or(false);
+    let include_usage = req.stream_options.and_then(|s| s.include_usage).unwrap_or(false);
+    let stop_seqs = req.stop.map(|s| s.into_vec()).unwrap_or_default();
+    let mut sampling = grammar::SamplingParams::greedy();
+    if let Some(t) = req.temperature { sampling.temperature = t.max(0.0); }
+    if let Some(p) = req.top_p { sampling.top_p = p.clamp(0.0, 1.0); }
     let prompts: Vec<String> = match req.prompt {
         PromptInput::Single(s) => vec![s],
         PromptInput::Batch(v) => v,
     };
     let created = now_unix();
     let req_id = next_id("cmpl");
+
+    if stream && prompts.len() == 1 {
+        let enc = match st.tokenizer.encode(prompts[0].clone(), false) {
+            Ok(e) => e,
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e}")}))).into_response(),
+        };
+        let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
+        if prompt_ids.len() >= st.max_ctx {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("prompt has {} tokens which exceeds max_ctx {}", prompt_ids.len(), st.max_ctx)}))).into_response();
+        }
+        let max_tokens = max_tokens.min(st.max_ctx.saturating_sub(prompt_ids.len() + 1).max(1));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let in_flight = match st.dispatch(GenJob { prompt_ids, images: Vec::new(), max_tokens, enable_thinking: false, json_grammar: false, sampling, tx }) {
+            Ok(g) => InFlightGuard(g),
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"scheduler closed"}))).into_response(),
+        };
+        let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+        let tok = st.tokenizer.clone();
+        tokio::spawn(async move {
+            let _guard = in_flight;
+            let mut prompt_n = 0usize;
+            let mut cached_n = 0usize;
+            let mut out_ids: Vec<u32> = Vec::new();
+            let mut prev_str = String::new();
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    GenEvent::Prefill { prompt_n: pn, cached_n: cn, .. } => {
+                        prompt_n = pn;
+                        cached_n = cn;
+                    }
+                    GenEvent::Token(t) => {
+                        out_ids.push(t);
+                        let cur = tok.decode(&out_ids, true).unwrap_or_default();
+                        if cur.len() > prev_str.len() && cur.is_char_boundary(prev_str.len()) {
+                            let delta = &cur[prev_str.len()..];
+                            if !stop_seqs.is_empty() && stop_seqs.iter().any(|s| cur.contains(s.as_str())) {
+                                let _ = sse_tx.send(Ok(Event::default().data(json!({
+                                    "id": req_id, "object": "text_completion", "created": created, "model": model_id,
+                                    "choices": [{"index": 0, "text": "", "finish_reason": "stop"}]
+                                }).to_string())));
+                                let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+                                break;
+                            }
+                            let _ = sse_tx.send(Ok(Event::default().data(json!({
+                                "id": req_id, "object": "text_completion", "created": created, "model": model_id,
+                                "choices": [{"index": 0, "text": delta, "finish_reason": serde_json::Value::Null}]
+                            }).to_string())));
+                            prev_str = cur;
+                        }
+                    }
+                    GenEvent::Done { finish_reason, pred_n, .. } => {
+                        let mut chunk = json!({
+                            "id": req_id, "object": "text_completion", "created": created, "model": model_id,
+                            "choices": [{"index": 0, "text": "", "finish_reason": finish_reason}]
+                        });
+                        if include_usage {
+                            chunk["usage"] = json!({
+                                "prompt_tokens": prompt_n,
+                                "completion_tokens": pred_n,
+                                "total_tokens": prompt_n + pred_n,
+                                "prompt_tokens_details": {"cached_tokens": cached_n}
+                            });
+                        }
+                        let _ = sse_tx.send(Ok(Event::default().data(chunk.to_string())));
+                        let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+                        break;
+                    }
+                    GenEvent::Error(e) => {
+                        let _ = sse_tx.send(Ok(Event::default().data(json!({"error": e}).to_string())));
+                        let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+                        break;
+                    }
+                }
+            }
+        });
+        return Sse::new(UnboundedReceiverStream::new(sse_rx))
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
 
     let mut handles = Vec::with_capacity(prompts.len());
     for pr in prompts {
@@ -2541,7 +2704,7 @@ async fn completions(
         let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
         let st_c = st.clone();
         handles.push(tokio::spawn(async move {
-            collect_job(&st_c, prompt_ids, Vec::new(), max_tokens, false, false, grammar::SamplingParams::greedy()).await
+            collect_job(&st_c, prompt_ids, Vec::new(), max_tokens, false, false, sampling).await
         }));
     }
 
@@ -2585,6 +2748,387 @@ async fn completions(
             "total_predicted_n": total_pred,
             "wall_decode_ms": max_dec_ms,
             "aggregate_tokens_per_second": if max_dec_ms > 0.0 { total_pred as f64 / (max_dec_ms / 1000.0) } else { 0.0 }
+        }
+    }))
+    .into_response()
+}
+
+fn convert_anthropic_request(
+    req: &AnthropicMessagesRequest,
+) -> (Vec<ChatMessage>, Option<Vec<serde_json::Value>>, bool) {
+    let mut msgs: Vec<ChatMessage> = Vec::new();
+    if let Some(ref sys) = req.system {
+        let sys_txt = match sys {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if !sys_txt.is_empty() {
+            msgs.push(ChatMessage {
+                role: "system".into(),
+                content: json!(sys_txt),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            });
+        }
+    }
+    for m in &req.messages {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
+        let content = m.get("content").cloned().unwrap_or(serde_json::Value::Null);
+        if let Some(arr) = content.as_array() {
+            let mut text_parts: Vec<String> = Vec::new();
+            let mut tcs: Vec<serde_json::Value> = Vec::new();
+            let mut tool_results: Vec<(String, String)> = Vec::new();
+            let mut thinking_parts: Vec<String> = Vec::new();
+            for blk in arr {
+                let btype = blk.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match btype {
+                    "text" => {
+                        if let Some(t) = blk.get("text").and_then(|v| v.as_str()) {
+                            text_parts.push(t.to_string());
+                        }
+                    }
+                    "thinking" => {
+                        if let Some(t) = blk.get("thinking").and_then(|v| v.as_str()) {
+                            thinking_parts.push(t.to_string());
+                        }
+                    }
+                    "tool_use" => {
+                        let id = blk.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let name = blk.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let input = blk.get("input").cloned().unwrap_or_else(|| json!({}));
+                        let args_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+                        tcs.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": args_str}
+                        }));
+                    }
+                    "tool_result" => {
+                        let tid = blk.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let body = match blk.get("content") {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(serde_json::Value::Array(sub)) => sub
+                                .iter()
+                                .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                            Some(v) => v.to_string(),
+                            None => String::new(),
+                        };
+                        tool_results.push((tid, body));
+                    }
+                    _ => {}
+                }
+            }
+            if !tool_results.is_empty() {
+                for (tid, body) in tool_results {
+                    msgs.push(ChatMessage {
+                        role: "tool".into(),
+                        content: json!(body),
+                        tool_calls: None,
+                        tool_call_id: Some(tid),
+                        name: None,
+                        reasoning_content: None,
+                    });
+                }
+                if !text_parts.is_empty() {
+                    msgs.push(ChatMessage {
+                        role,
+                        content: json!(text_parts.join("\n")),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                    });
+                }
+            } else {
+                msgs.push(ChatMessage {
+                    role,
+                    content: if text_parts.is_empty() { serde_json::Value::Null } else { json!(text_parts.join("\n")) },
+                    tool_calls: if tcs.is_empty() { None } else { Some(tcs) },
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: if thinking_parts.is_empty() { None } else { Some(thinking_parts.join("\n")) },
+                });
+            }
+        } else {
+            msgs.push(ChatMessage {
+                role,
+                content,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            });
+        }
+    }
+    let oai_tools = req.tools.as_ref().map(|ts| {
+        ts.iter()
+            .map(|t| {
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                let params = t.get("input_schema").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}}));
+                json!({"type": "function", "function": {"name": name, "description": desc, "parameters": params}})
+            })
+            .collect::<Vec<_>>()
+    });
+    let enable_thinking = req
+        .thinking
+        .as_ref()
+        .and_then(|t| t.get("type"))
+        .and_then(|v| v.as_str())
+        .map(|s| s == "enabled")
+        .unwrap_or(false);
+    (msgs, oai_tools, enable_thinking)
+}
+
+async fn anthropic_count_tokens(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<AnthropicMessagesRequest>,
+) -> Response {
+    if !check_auth_keys(&headers, &st.api_keys) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"type":"error","error":{"type":"authentication_error","message":"unauthorized"}}))).into_response();
+    }
+    let (msgs, oai_tools, enable_thinking) = convert_anthropic_request(&req);
+    let (prompt, _, _) = format_prompt_with_tools(&msgs, oai_tools.as_deref(), enable_thinking);
+    match st.tokenizer.encode(prompt, false) {
+        Ok(enc) => Json(json!({"input_tokens": enc.get_ids().len()})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"type":"error","error":{"type":"invalid_request_error","message":format!("{e}")}}))).into_response(),
+    }
+}
+
+async fn anthropic_messages(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<AnthropicMessagesRequest>,
+) -> Response {
+    if !check_auth_keys(&headers, &st.api_keys) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"type":"error","error":{"type":"authentication_error","message":"unauthorized"}}))).into_response();
+    }
+    let model_id = req.model.clone().unwrap_or_else(|| "inkling-2-mini".into());
+    let max_tokens = req.max_tokens.unwrap_or(4096).min(16384);
+    let stream = req.stream.unwrap_or(false);
+    let stop_seqs = req.stop_sequences.clone().unwrap_or_default();
+    let mut sampling = grammar::SamplingParams::greedy();
+    if let Some(t) = req.temperature { sampling.temperature = t.max(0.0); }
+    if let Some(p) = req.top_p { sampling.top_p = p.clamp(0.0, 1.0); }
+    let (msgs, oai_tools, enable_thinking) = convert_anthropic_request(&req);
+    let (prompt, images, allowed_tools) = format_prompt_with_tools(&msgs, oai_tools.as_deref(), enable_thinking);
+    let enc = match st.tokenizer.encode(prompt, false) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"type":"error","error":{"type":"invalid_request_error","message":format!("{e}")}}))).into_response(),
+    };
+    let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
+    if prompt_ids.len() >= st.max_ctx {
+        return (StatusCode::BAD_REQUEST, Json(json!({"type":"error","error":{"type":"invalid_request_error","message":format!("prompt has {} tokens which exceeds max_ctx {}", prompt_ids.len(), st.max_ctx)}}))).into_response();
+    }
+    let max_tokens = max_tokens.min(st.max_ctx.saturating_sub(prompt_ids.len() + 1).max(1));
+    let msg_id = next_id("msg");
+    let call_prefix = next_id("toolu");
+
+    if stream {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let in_flight = match st.dispatch(GenJob { prompt_ids, images, max_tokens, enable_thinking, json_grammar: false, sampling, tx }) {
+            Ok(g) => InFlightGuard(g),
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"type":"error","error":{"type":"api_error","message":"scheduler closed"}}))).into_response(),
+        };
+        let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+        let tok = st.tokenizer.clone();
+        tokio::spawn(async move {
+            let _guard = in_flight;
+            let mut parser = grammar::InklingStreamParser::new(enable_thinking, call_prefix, allowed_tools);
+            let mut block_idx = 0usize;
+            let mut text_open = false;
+            let mut think_open = false;
+            let mut saw_tool = false;
+            let mut started_msg = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    GenEvent::Prefill { prompt_n, cached_n, .. } => {
+                        started_msg = true;
+                        let _ = sse_tx.send(Ok(Event::default().event("message_start").data(json!({
+                            "type": "message_start",
+                            "message": {
+                                "id": msg_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "model": model_id,
+                                "content": [],
+                                "stop_reason": serde_json::Value::Null,
+                                "stop_sequence": serde_json::Value::Null,
+                                "usage": {
+                                    "input_tokens": prompt_n.saturating_sub(cached_n),
+                                    "cache_read_input_tokens": cached_n,
+                                    "output_tokens": 0
+                                }
+                            }
+                        }).to_string())));
+                    }
+                    GenEvent::Token(t) => {
+                        if !started_msg {
+                            started_msg = true;
+                            let _ = sse_tx.send(Ok(Event::default().event("message_start").data(json!({
+                                "type": "message_start",
+                                "message": {"id": msg_id, "type": "message", "role": "assistant", "model": model_id, "content": [], "stop_reason": serde_json::Value::Null, "usage": {"input_tokens": 0, "output_tokens": 0}}
+                            }).to_string())));
+                        }
+                        for d in parser.push_token(t, &tok) {
+                            match d {
+                                grammar::StreamDelta::Reasoning(delta) => {
+                                    if !think_open {
+                                        think_open = true;
+                                        let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(json!({
+                                            "type": "content_block_start", "index": block_idx, "content_block": {"type": "thinking", "thinking": ""}
+                                        }).to_string())));
+                                    }
+                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(json!({
+                                        "type": "content_block_delta", "index": block_idx, "delta": {"type": "thinking_delta", "thinking": delta}
+                                    }).to_string())));
+                                }
+                                grammar::StreamDelta::Text(delta) => {
+                                    if think_open {
+                                        let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
+                                        block_idx += 1;
+                                        think_open = false;
+                                    }
+                                    if !text_open {
+                                        text_open = true;
+                                        let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(json!({
+                                            "type": "content_block_start", "index": block_idx, "content_block": {"type": "text", "text": ""}
+                                        }).to_string())));
+                                    }
+                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(json!({
+                                        "type": "content_block_delta", "index": block_idx, "delta": {"type": "text_delta", "text": delta}
+                                    }).to_string())));
+                                }
+                                grammar::StreamDelta::ToolCall(tc) => {
+                                    if think_open {
+                                        let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
+                                        block_idx += 1;
+                                        think_open = false;
+                                    }
+                                    if text_open {
+                                        let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
+                                        block_idx += 1;
+                                        text_open = false;
+                                    }
+                                    saw_tool = true;
+                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(json!({
+                                        "type": "content_block_start", "index": block_idx,
+                                        "content_block": {"type": "tool_use", "id": tc.id, "name": tc.name, "input": {}}
+                                    }).to_string())));
+                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(json!({
+                                        "type": "content_block_delta", "index": block_idx,
+                                        "delta": {"type": "input_json_delta", "partial_json": tc.arguments}
+                                    }).to_string())));
+                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
+                                    block_idx += 1;
+                                }
+                            }
+                        }
+                    }
+                    GenEvent::Done { finish_reason, pred_n, .. } => {
+                        for d in parser.finish(&tok) {
+                            if let grammar::StreamDelta::ToolCall(tc) = d {
+                                if think_open {
+                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
+                                    block_idx += 1;
+                                    think_open = false;
+                                }
+                                if text_open {
+                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
+                                    block_idx += 1;
+                                    text_open = false;
+                                }
+                                saw_tool = true;
+                                let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(json!({
+                                    "type": "content_block_start", "index": block_idx,
+                                    "content_block": {"type": "tool_use", "id": tc.id, "name": tc.name, "input": {}}
+                                }).to_string())));
+                                let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(json!({
+                                    "type": "content_block_delta", "index": block_idx,
+                                    "delta": {"type": "input_json_delta", "partial_json": tc.arguments}
+                                }).to_string())));
+                                let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
+                                block_idx += 1;
+                            }
+                        }
+                        if think_open || text_open {
+                            let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
+                        }
+                        let stop_reason = if saw_tool { "tool_use" } else if finish_reason == "length" { "max_tokens" } else { "end_turn" };
+                        let _ = sse_tx.send(Ok(Event::default().event("message_delta").data(json!({
+                            "type": "message_delta",
+                            "delta": {"stop_reason": stop_reason, "stop_sequence": serde_json::Value::Null},
+                            "usage": {"output_tokens": pred_n}
+                        }).to_string())));
+                        let _ = sse_tx.send(Ok(Event::default().event("message_stop").data(json!({"type": "message_stop"}).to_string())));
+                        break;
+                    }
+                    GenEvent::Error(e) => {
+                        let _ = sse_tx.send(Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"api_error","message":e}}).to_string())));
+                        break;
+                    }
+                }
+            }
+        });
+        return Sse::new(UnboundedReceiverStream::new(sse_rx))
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+
+    let (out_ids, prompt_n, cached_n, _pp_ms, _dec_ms, finish_reason) =
+        match collect_job(&st, prompt_ids, images, max_tokens, enable_thinking, false, sampling).await {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"type":"error","error":{"type":"api_error","message":e}}))).into_response(),
+        };
+    let pred_n = out_ids.len();
+    let mut parsed = grammar::parse_inkling_tokens(&out_ids, &st.tokenizer, enable_thinking, &allowed_tools, &call_prefix);
+    if !stop_seqs.is_empty() && parsed.tool_calls.is_empty() {
+        for ss in &stop_seqs {
+            if let Some(pos) = parsed.content.find(ss.as_str()) {
+                parsed.content.truncate(pos);
+            }
+        }
+    }
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    if let Some(r) = parsed.reasoning {
+        blocks.push(json!({"type": "thinking", "thinking": r}));
+    }
+    if !parsed.content.is_empty() || parsed.tool_calls.is_empty() {
+        blocks.push(json!({"type": "text", "text": parsed.content}));
+    }
+    for tc in &parsed.tool_calls {
+        let input_val: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
+        blocks.push(json!({"type": "tool_use", "id": tc.id, "name": tc.name, "input": input_val}));
+    }
+    let stop_reason = if !parsed.tool_calls.is_empty() {
+        "tool_use"
+    } else if finish_reason == "length" {
+        "max_tokens"
+    } else {
+        "end_turn"
+    };
+    Json(json!({
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model_id,
+        "content": blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": serde_json::Value::Null,
+        "usage": {
+            "input_tokens": prompt_n.saturating_sub(cached_n),
+            "cache_read_input_tokens": cached_n,
+            "output_tokens": pred_n
         }
     }))
     .into_response()
@@ -3976,14 +4520,25 @@ async fn main() -> anyhow::Result<()> {
     });
     let app = Router::new()
         .route("/health", get(health))
+        .route("/ping", get(ping_endpoint))
+        .route("/ready", get(ping_endpoint))
+        .route("/live", get(ping_endpoint))
+        .route("/version", get(version_endpoint))
+        .route("/props", get(props_endpoint))
+        .route("/slots", get(slots_endpoint))
         .route("/metrics", get(metrics_endpoint))
+        .route("/models", get(models))
         .route("/v1/models", get(models))
         .route("/v1/models/:id", get(model_by_id))
+        .route("/tokenize", post(tokenize_endpoint))
+        .route("/detokenize", post(detokenize_endpoint))
         .route("/v1/tokenize", post(tokenize_endpoint))
         .route("/v1/detokenize", post(detokenize_endpoint))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/responses", post(responses_http).get(responses_ws))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(middleware::from_fn(cors_and_req_id))
         .with_state(state);

@@ -327,6 +327,93 @@ def test_responses_api_prefix_cache(base_url, headers):
     print(f"[PASS] responses_api_prefix_cache: T2={pct2:.1f}% ({c2}/{in2})")
 
 
+def test_anthropic_messages_api(base_url, headers):
+    cnt = post_json(
+        f"{base_url}/v1/messages/count_tokens",
+        {"model": "inkling-2-mini", "messages": [{"role": "user", "content": "Hello from Claude Code"}]},
+        headers,
+    )
+    assert cnt.get("input_tokens", 0) > 0, f"bad count_tokens: {cnt}"
+    res = post_json(
+        f"{base_url}/v1/messages",
+        {
+            "model": "inkling-2-mini",
+            "max_tokens": 32,
+            "system": "Be concise.",
+            "messages": [{"role": "user", "content": "Reply with exactly PONG."}],
+            "temperature": 0.0,
+        },
+        headers,
+    )
+    assert res.get("type") == "message" and res.get("role") == "assistant", f"bad /v1/messages: {res}"
+    txt = "".join(b.get("text", "") for b in res.get("content", []) if b.get("type") == "text")
+    assert "PONG" in txt.upper(), f"unexpected /v1/messages text: {txt}"
+
+    data = json.dumps(
+        {
+            "model": "inkling-2-mini",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "temperature": 0.0,
+            "stream": True,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(f"{base_url}/v1/messages", data=data, headers=headers, method="POST")
+    saw_start = False
+    saw_delta = False
+    saw_stop = False
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line == "event: message_start":
+                saw_start = True
+            elif line == "event: content_block_delta":
+                saw_delta = True
+            elif line == "event: message_stop":
+                saw_stop = True
+    assert saw_start and saw_delta and saw_stop, f"incomplete Anthropic SSE: {saw_start},{saw_delta},{saw_stop}"
+    print(f"[PASS] anthropic_messages_api: count={cnt['input_tokens']} text={txt.strip()!r} sse=ok")
+
+
+def test_compat_endpoints_and_completions_sse(base_url, headers):
+    for ep in ["/version", "/ping", "/ready", "/live", "/props", "/slots", "/models"]:
+        req = urllib.request.Request(f"{base_url}{ep}", headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            assert resp.status == 200, f"{ep} status={resp.status}"
+            json.loads(resp.read().decode("utf-8"))
+    tok = post_json(f"{base_url}/tokenize", {"content": "hello world"}, headers)
+    assert tok.get("count", 0) >= 2
+    detok = post_json(f"{base_url}/detokenize", {"tokens": tok["tokens"]}, headers)
+    assert "hello" in detok.get("text", "").lower() and detok.get("content") == detok.get("text")
+
+    data = json.dumps(
+        {
+            "model": "inkling-2-mini",
+            "prompt": "def add(a, b):\n    return ",
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(f"{base_url}/v1/completions", data=data, headers=headers, method="POST")
+    chunks = 0
+    saw_done = False
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line.startswith("data:"):
+                body = line[5:].strip()
+                if body == "[DONE]":
+                    saw_done = True
+                    break
+                obj = json.loads(body)
+                if obj.get("object") == "text_completion":
+                    chunks += 1
+    assert saw_done and chunks >= 1, f"bad /v1/completions SSE: chunks={chunks} done={saw_done}"
+    print(f"[PASS] compat_endpoints_and_completions_sse: 7 GET + tokenize/detokenize + completions SSE ({chunks} chunks)")
+
+
 def test_metrics_endpoint(base_url, headers):
     req = urllib.request.Request(f"{base_url}/metrics", headers=headers)
     with urllib.request.urlopen(req, timeout=15) as resp:
@@ -350,13 +437,15 @@ def main():
     headers = make_headers(args.api_key)
     test_tool_call_reformatted_prefix_cache(args.url, headers)
     test_responses_api_prefix_cache(args.url, headers)
+    test_anthropic_messages_api(args.url, headers)
+    test_compat_endpoints_and_completions_sse(args.url, headers)
     test_json_grammar(args.url, headers)
     test_midstream_disconnect_resilience(args.url, headers)
     test_8user_burst_ttft(args.url, headers, args.users)
     test_multiuser_sse_pure_gen(args.url, headers, args.users)
     test_multiuser_sse_hybrid(args.url, headers, args.users)
     test_metrics_endpoint(args.url, headers)
-    print("ALL 8 REAL-WORLD E2E TESTS PASSED!")
+    print("ALL 10 REAL-WORLD E2E TESTS PASSED!")
 
 
 if __name__ == "__main__":
