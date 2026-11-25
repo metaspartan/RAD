@@ -1,10 +1,13 @@
 mod config;
 mod cuda_ops;
+mod engine;
 mod safetensors;
+mod weights;
 
 use anyhow::Result;
 use clap::Parser;
 use config::DeepseekV41Config;
+use engine::Dsv41Engine;
 use rad_cuda::comm::Tp2Comm;
 use rad_cuda::{CudaBuf, CudaFail};
 use safetensors::SafetensorsIndex;
@@ -18,6 +21,12 @@ struct Cli {
     model: PathBuf,
     #[arg(long, default_value_t = false)]
     bench_exl3: bool,
+    #[arg(long, default_value_t = false)]
+    bench_layer: bool,
+    #[arg(long, default_value_t = 1)]
+    max_layers: usize,
+    #[arg(long, default_value_t = 2048)]
+    max_ctx: usize,
     #[arg(long, default_value_t = 0)]
     rank: usize,
     #[arg(long)]
@@ -57,51 +66,66 @@ fn run_bench_exl3(model_dir: &PathBuf, comm: &mut Tp2Comm) -> Result<()> {
         let mut d_svh = CudaBuf::new(svh.len()).map_err(CudaFail)?;
         d_svh.copy_from(svh, None).map_err(CudaFail)?;
 
-        let d_x = CudaBuf::new(k * 2 * 5).map_err(CudaFail)?;
-        let d_xrot = CudaBuf::new(k * 2 * 5).map_err(CudaFail)?;
-        let d_z = CudaBuf::new(n * 4 * 5).map_err(CudaFail)?;
-        let d_y = CudaBuf::new(n * 2 * 5).map_err(CudaFail)?;
+        let d_x = CudaBuf::new(k * 2 * 16).map_err(CudaFail)?;
+        let d_xrot = CudaBuf::new(k * 2 * 16).map_err(CudaFail)?;
+        let d_z = CudaBuf::new(n * 4 * 16).map_err(CudaFail)?;
+        let d_y = CudaBuf::new(n * 2 * 16).map_err(CudaFail)?;
 
-        for m in [1i32, 5i32] {
+        for m in [1i32, 5i32, 16i32] {
             for _ in 0..10 {
                 unsafe {
                     cuda_ops::rad_cuda_wht128_pre_mul_f16(d_x.ptr, d_suh.ptr, d_xrot.ptr, m, k as i32, scale, std::ptr::null_mut());
-                    cuda_ops::rad_cuda_exl3_gemv_f16(d_xrot.ptr, d_trel.ptr, d_svh.ptr, d_z.ptr, d_y.ptr, m, k as i32, n as i32, bits as i32, scale, 0, std::ptr::null_mut());
+                    cuda_ops::rad_cuda_exl3_mma_f16(d_xrot.ptr, d_trel.ptr, d_svh.ptr, d_z.ptr, d_y.ptr, m, k as i32, n as i32, bits as i32, scale, 0, std::ptr::null_mut());
                 }
             }
             rad_cuda::sync_device().map_err(CudaFail)?;
             let t0 = Instant::now();
-            let iters = 200;
+            let iters = 100;
             for _ in 0..iters {
                 unsafe {
                     cuda_ops::rad_cuda_wht128_pre_mul_f16(d_x.ptr, d_suh.ptr, d_xrot.ptr, m, k as i32, scale, std::ptr::null_mut());
-                    cuda_ops::rad_cuda_exl3_gemv_f16(d_xrot.ptr, d_trel.ptr, d_svh.ptr, d_z.ptr, d_y.ptr, m, k as i32, n as i32, bits as i32, scale, 0, std::ptr::null_mut());
+                    cuda_ops::rad_cuda_exl3_mma_f16(d_xrot.ptr, d_trel.ptr, d_svh.ptr, d_z.ptr, d_y.ptr, m, k as i32, n as i32, bits as i32, scale, 0, std::ptr::null_mut());
                 }
             }
             rad_cuda::sync_device().map_err(CudaFail)?;
             let dt = t0.elapsed().as_secs_f64() / iters as f64;
             let gb_s = (trel_len as f64) / dt / 1e9;
             println!(
-                "  [{prefix:24} {bits}b K={k:5} N={n:6} M={m}] {:7.1} us  {:5.1} GB/s",
+                "  [{prefix:24} {bits}b K={k:5} N={n:6} M={m:2}] {:7.1} us  {:5.1} GB/s",
                 dt * 1e6,
                 gb_s
             );
         }
     }
+    Ok(())
+}
 
-    if comm.world_size() == 2 {
-        let mut buf = vec![1.0f32; cfg.text_config.hidden_size];
-        for _ in 0..20 {
-            comm.all_reduce_sum_f32(&mut buf)?;
-        }
-        let t0 = Instant::now();
-        let iters = 500;
-        for _ in 0..iters {
-            comm.all_reduce_sum_f32(&mut buf)?;
-        }
-        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
-        println!("  [ConnectX-7 TP=2 AllReduce 5120xf32] {:.1} us/call", us);
+fn run_bench_layer(model_dir: &PathBuf, max_ctx: usize, max_layers: usize, comm: &mut Tp2Comm) -> Result<()> {
+    let t_load = Instant::now();
+    let mut eng = Dsv41Engine::load(model_dir, max_ctx, comm.rank, comm.world_size(), Some(max_layers))?;
+    println!(
+        "loaded {} layer(s) (rank={}/{}) in {:.2}s",
+        eng.layers.len(),
+        eng.rank,
+        eng.world,
+        t_load.elapsed().as_secs_f64()
+    );
+    let mut tok = eng.cfg.bos_token_id;
+    for _ in 0..5 {
+        tok = eng.step_decode(tok, comm)?;
     }
+    let t0 = Instant::now();
+    let steps = 20;
+    for _ in 0..steps {
+        tok = eng.step_decode(tok, comm)?;
+    }
+    let dt_ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+    println!(
+        "step_decode ({} layer + head): {:.2} ms/step, last_tok={}",
+        eng.layers.len(),
+        dt_ms,
+        tok
+    );
     Ok(())
 }
 
@@ -114,6 +138,9 @@ fn main() -> Result<()> {
     };
     if cli.bench_exl3 {
         run_bench_exl3(&cli.model, &mut comm)?;
+    }
+    if cli.bench_layer {
+        run_bench_layer(&cli.model, cli.max_ctx, cli.max_layers, &mut comm)?;
     }
     Ok(())
 }

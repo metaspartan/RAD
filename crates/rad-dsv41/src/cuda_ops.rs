@@ -139,4 +139,47 @@ extern "C" {
         scale: f32,
         stream: CudaStream,
     );
+
+    pub fn rad_cuda_moe_route_sqrtsoftplus(
+        x: *const c_void,
+        gate_w: *const c_void,
+        gate_bias: *const c_void,
+        raw_scores: *mut c_void,
+        sel_scores: *mut c_void,
+        topk_ids: *mut c_void,
+        topk_weights: *mut c_void,
+        n_experts: i32,
+        d: i32,
+        top_k: i32,
+        scaling_factor: f32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_mhc_pre_and_coeff(
+        streams: *const c_void,
+        hc_fn: *const c_void,
+        hc_base: *const c_void,
+        hc_scale: *const c_void,
+        h_coeff: *mut c_void,
+        branch_in: *mut c_void,
+        d: i32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_argmax_f16(
+        logits: *const c_void,
+        blk_vals: *mut c_void,
+        blk_ids: *mut c_void,
+        out_val: *mut c_void,
+        out_id: *mut c_void,
+        n: i32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_add_f16(
+        dst: *mut c_void,
+        src: *const c_void,
+        n: i32,
+        stream: CudaStream,
+    );
 }
