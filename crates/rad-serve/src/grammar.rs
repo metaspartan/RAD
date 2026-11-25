@@ -413,14 +413,22 @@ pub fn parse_single_tool_call(
     }
     let fb = fallback_name.trim();
     let try_parse = |json_str: &str, cand_name: &str| -> Option<ParsedToolCall> {
-        let val = serde_json::from_str::<Value>(json_str).ok()?;
+        let parsed = serde_json::from_str::<Value>(json_str).ok()?;
+        let val = if let Some(arr) = parsed.as_array() {
+            arr.first()?.clone()
+        } else {
+            parsed
+        };
         if !val.is_object() {
             return None;
         }
-        let name = val
+        let mut name = val
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or(cand_name);
+        if name.is_empty() && allowed_tools.len() == 1 {
+            name = allowed_tools[0].as_str();
+        }
         if name.is_empty() || (!allowed_tools.is_empty() && !allowed_tools.iter().any(|a| a == name)) {
             return None;
         }
@@ -581,11 +589,23 @@ pub fn parse_tool_calls(text: &str, allowed_tools: &[String]) -> Option<Vec<Valu
     };
     let mut out = Vec::new();
     for (idx, item) in items.iter().enumerate() {
-        let name = item.get("name").and_then(|v| v.as_str())?;
+        let name = match item.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None if allowed_tools.len() == 1 && item.is_object() => allowed_tools[0].as_str(),
+            None => return None,
+        };
         if !allowed_tools.is_empty() && !allowed_tools.iter().any(|a| a == name) {
             continue;
         }
-        let args_str = extract_args_str(item);
+        let args_str = if item.get("arguments").is_some() || item.get("args").is_some() {
+            extract_args_str(item)
+        } else if let Some(obj) = item.as_object() {
+            let mut cleaned = obj.clone();
+            cleaned.remove("name");
+            serde_json::to_string(&Value::Object(cleaned)).unwrap_or_else(|_| "{}".into())
+        } else {
+            extract_args_str(item)
+        };
         out.push(serde_json::json!({
             "id": format!("call_rad_{idx}"),
             "type": "function",
@@ -855,6 +875,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tc3.arguments, r#"{"command":"git log -1"}"#);
+
+        let tc4 = parse_single_tool_call(
+            r#"[{"command":"ls -la"}]"#,
+            "",
+            &allowed,
+            "c4".into(),
+        )
+        .unwrap();
+        assert_eq!(tc4.name, "exec");
+        assert_eq!(tc4.arguments, r#"{"command":"ls -la"}"#);
 
         assert!(parse_single_tool_call("not valid json at all", "exec", &allowed, "c3".into()).is_none());
     }
