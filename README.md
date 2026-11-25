@@ -195,8 +195,8 @@ python3 scripts/test_serve.py
 - **Debian / Ubuntu (`.deb`):**
   Download `rad_<version>_amd64.deb` from GitHub Releases or build locally:
   ```bash
-  bash packaging/deb/build_deb.sh 0.15.0
-  sudo dpkg -i dist/rad_0.15.0_amd64.deb
+  bash packaging/deb/build_deb.sh 0.16.0
+  sudo dpkg -i dist/rad_0.16.0_amd64.deb
   ```
 - **Homebrew (Linuxbrew):**
   ```bash

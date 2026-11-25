@@ -610,9 +610,11 @@ pub enum StreamMode {
 pub struct InklingStreamParser {
     pub mode: StreamMode,
     thinking_ids: Vec<u32>,
-    thinking_len: usize,
+    thinking_win: usize,
+    thinking_prefix_len: usize,
     text_ids: Vec<u32>,
-    text_len: usize,
+    text_win: usize,
+    text_prefix_len: usize,
     header_ids: Vec<u32>,
     tool_ids: Vec<u32>,
     tool_name_hint: String,
@@ -627,14 +629,36 @@ pub enum StreamDelta {
     ToolCall(ParsedToolCall),
 }
 
+fn decode_incremental_delta(ids: &[u32], win_start: &mut usize, prefix_len: &mut usize, tok: &Tokenizer) -> Option<String> {
+    let slice = &ids[*win_start..];
+    let decoded = tok.decode(slice, true).ok()?;
+    if decoded.ends_with('\u{FFFD}') {
+        return None;
+    }
+    if decoded.len() <= *prefix_len {
+        return None;
+    }
+    let delta = decoded[*prefix_len..].to_string();
+    if slice.len() >= 4 {
+        let keep = ids.len() - 1;
+        *win_start = keep;
+        *prefix_len = tok.decode(&ids[keep..], true).map(|s| s.len()).unwrap_or(0);
+    } else {
+        *prefix_len = decoded.len();
+    }
+    Some(delta)
+}
+
 impl InklingStreamParser {
     pub fn new(initial_thinking: bool, call_prefix: String, allowed_tools: Vec<String>) -> Self {
         Self {
             mode: if initial_thinking { StreamMode::Thinking } else { StreamMode::Text },
             thinking_ids: Vec::new(),
-            thinking_len: 0,
+            thinking_win: 0,
+            thinking_prefix_len: 0,
             text_ids: Vec::new(),
-            text_len: 0,
+            text_win: 0,
+            text_prefix_len: 0,
             header_ids: Vec::new(),
             tool_ids: Vec::new(),
             tool_name_hint: String::new(),
@@ -711,19 +735,13 @@ impl InklingStreamParser {
             _ => match self.mode {
                 StreamMode::Thinking => {
                     self.thinking_ids.push(t);
-                    let d = tok.decode(&self.thinking_ids, true).unwrap_or_default();
-                    if d.len() > self.thinking_len {
-                        let s = d[self.thinking_len..].to_string();
-                        self.thinking_len = d.len();
+                    if let Some(s) = decode_incremental_delta(&self.thinking_ids, &mut self.thinking_win, &mut self.thinking_prefix_len, tok) {
                         out.push(StreamDelta::Reasoning(s));
                     }
                 }
                 StreamMode::Text => {
                     self.text_ids.push(t);
-                    let d = tok.decode(&self.text_ids, true).unwrap_or_default();
-                    if d.len() > self.text_len {
-                        let s = d[self.text_len..].to_string();
-                        self.text_len = d.len();
+                    if let Some(s) = decode_incremental_delta(&self.text_ids, &mut self.text_win, &mut self.text_prefix_len, tok) {
                         out.push(StreamDelta::Text(s));
                     }
                 }

@@ -1950,7 +1950,7 @@ extern "C" int ink_attn_b8_flash_q8_q8kv(hipStream_t s, const float* Q, const fl
     float* sbuf = nullptr;
     (void)hipGetSymbolAddress((void**)&sbuf, HIP_SYMBOL(g_q8kv_b8_split_buf));
     if (B > 16 && B <= 64 && n_head == n_head_kv * 3 && dh == 128) {
-        int nthreads = (B <= 32) ? 192 : ((B <= 48) ? 288 : 384);
+        int nthreads = (B <= 48) ? 288 : 384;
         attn_b48_gqa3_flash_split_q8kv_k<<<dim3(n_head_kv, n_splits), dim3(nthreads), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, d_pos0, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B, n_splits);
     } else {
         attn_b8_gqa3_flash_split_q8kv_k<<<dim3(n_head_kv, n_splits, (B + 15) / 16), dim3(192), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, d_pos0, sbuf, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B, n_splits);
