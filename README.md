@@ -75,7 +75,7 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **Multi-Turn Agentic E2E (`exec` + `write_file` + `read_file`)** | **98.9–99.5% prefix cache** | Verbatim `tool_call_id` replay survives client JSON reformatting (`77.3 ms` T2 E2E), stop-token speculative rewind |
 | **256K Long-Context Agentic Project E2E (7 turns, live SSE)** | **100.0% cache @ 249K** | Builds & tests multi-file Python project across `443 -> 43K -> 92K -> 182K -> 249K` tok (**`235.6 ms` TTFT**, **`96.2 tok/s`** decode @ 249K, exact Turn-1 recall) |
 | **Live SSE API (8-User Concurrent, Hybrid `K=128`, `temp=0.2`)** | **3,042.8 agg tok/s** | **`322.9 tok/s/user`** avg (**`2,199.7 agg tok/s`** full decode span, up to **`380.3 tok/s/user`**, edit-bridge catch-up + fused rewind + 64-tok lookup) |
-| **Live SSE API (8-User Independent File Edits, `B=8`)** | **2,156.0 agg tok/s** | `9,295` tokens across 8 distinct edits in `4.31 s` (**`266–295 tok/s/user`**, all 8 users finishing within `0.30 s`) |
+| **Live SSE API (8-User Independent File Edits, `B=8`)** | **2,303.1 agg tok/s** | `9,295` tokens across 8 distinct edits in `4.04 s` (**`284–319 tok/s/user`**, avg `291 tok/s/user`, all 8 users finishing within `0.33 s`) |
 
 ---
 
