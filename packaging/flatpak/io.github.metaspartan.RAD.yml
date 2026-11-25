@@ -16,10 +16,10 @@ modules:
     build-options:
       append-path: /usr/lib/sdk/rust-stable/bin
     build-commands:
-      - RAD_ARCH=gfx1201 bash kernels/build.sh
+      - RAD_ARCH=gfx1201 bash kernels/rocm/build.sh
       - cargo build --release --bin rad
       - install -Dm755 target/release/rad /app/bin/rad
-      - install -Dm755 kernels/librad_ops.so /app/lib/librad_ops.so
+      - install -Dm755 kernels/rocm/librad_ops.so /app/lib/librad_ops.so
     sources:
       - type: git
         url: https://github.com/metaspartan/RAD.git

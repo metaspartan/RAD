@@ -55,9 +55,9 @@ def stream_sse(url, payload, headers, timeout=300):
 
 def load_context_block(repo_root, target_chars):
     files = [
-        "crates/rad-core/src/model.rs",
-        "crates/rad-serve/src/main.rs",
-        "kernels/rad_q8kv.hip",
+        "crates/rad-core/src/model/mod.rs",
+        "crates/rad-serve/src/scheduler.rs",
+        "kernels/rocm/rad_q8kv_attn.hip",
     ]
     buf = []
     for rf in files:

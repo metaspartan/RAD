@@ -128,12 +128,12 @@ def stream_chat(url, payload, headers, timeout=600):
 
 def load_corpus_chunks(repo_root):
     rel_files = [
-        "crates/rad-core/src/model.rs",
-        "kernels/rad_wmma.hip",
-        "crates/rad-serve/src/main.rs",
-        "kernels/rad_batch.hip",
-        "kernels/rad_q8kv.hip",
-        "kernels/rad_sudot4.hip",
+        "crates/rad-core/src/model/mod.rs",
+        "kernels/rocm/rad_wmma_gemm.hip",
+        "crates/rad-serve/src/scheduler.rs",
+        "kernels/rocm/rad_batch.hip",
+        "kernels/rocm/rad_q8kv_attn.hip",
+        "kernels/rocm/rad_sudot4_gemm.hip",
         "crates/rad-core/src/dflash2.rs",
     ]
     pieces = []

@@ -38,13 +38,13 @@ jobs:
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Build HIP kernels and RAD binary
         run: |
-          RAD_ARCH=gfx1201 bash kernels/build.sh
+          RAD_ARCH=gfx1201 bash kernels/rocm/build.sh
           cargo build --release --bin rad
       - name: Create release tarball
         run: |
           mkdir -p dist/rad-${{ steps.ver.outputs.version }}-linux-x86_64-rocm/lib
           cp target/release/rad dist/rad-${{ steps.ver.outputs.version }}-linux-x86_64-rocm/
-          cp kernels/librad_ops.so dist/rad-${{ steps.ver.outputs.version }}-linux-x86_64-rocm/lib/
+          cp kernels/rocm/librad_ops.so dist/rad-${{ steps.ver.outputs.version }}-linux-x86_64-rocm/lib/
           cp LICENSE README.md dist/rad-${{ steps.ver.outputs.version }}-linux-x86_64-rocm/
           tar -C dist -czf dist/rad-${{ steps.ver.outputs.version }}-linux-x86_64-rocm.tar.gz rad-${{ steps.ver.outputs.version }}-linux-x86_64-rocm
           sha256sum dist/rad-${{ steps.ver.outputs.version }}-linux-x86_64-rocm.tar.gz > dist/SHA256SUMS.txt

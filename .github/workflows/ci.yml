@@ -30,7 +30,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Build HIP kernels
-        run: RAD_ARCH=gfx1201 bash kernels/build.sh
+        run: RAD_ARCH=gfx1201 bash kernels/rocm/build.sh
       - name: Build RAD release binary
         run: cargo build --release --bin rad
       - name: Smoke test CLI help

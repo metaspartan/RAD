@@ -97,28 +97,32 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 RAD/
 ├── Cargo.toml                 Workspace manifest
 ├── kernels/
-│   ├── build.sh               Builds librad_ops.so via hipcc
-│   ├── rad_ops.hip            Core decode, RMSNorm, shortconv, attention, loop-ctrl kernels
-│   ├── rad_batch.hip          Batched prefill & multi-user kernels
-│   ├── rad_dspark.hip         DSpark speculative drafter kernels
-│   ├── rad_dflash2.hip        DFlash 2 grouped dynamic conv, top-16 & path selector kernels
-│   ├── rad_vision.hip         ViT FP16 GEMM, LayerNorm, GELU, LayerScale, bidirectional attn & 2x2 merge
-│   ├── rad_sudot4.hip         Q4_0_SOA / Q8_1 / NVFP4 sudot4 & fused B=1 kernels
-│   ├── rad_wmma.hip           RDNA4 Wave32 WMMA INT8 GEMM, MoE, & FP16 FlashAttention-2
-│   └── rad_q8kv.hip           INT8 KV cache, GQA-3:1 prefill & Q48-shared Split-64 WMMA FlashAttention
+│   ├── build.sh               Backend kernel build dispatcher
+│   └── rocm/                  ROCm/HIP kernels (gfx1201, all modules < 2K LOC)
+│       ├── build.sh           Builds kernels/rocm/librad_ops.so via hipcc
+│       ├── rad_ops*.hip       Core decode, RMSNorm, shortconv, attention, loop-ctrl kernels
+│       ├── rad_batch*.hip     Batched prefill, router & multi-user kernels
+│       ├── rad_sudot4*.hip    Q4_0_SOA / Q8_1 / NVFP4 sudot4, MoE & fused B=1 kernels
+│       ├── rad_wmma*.hip      RDNA4 Wave32 WMMA INT8 GEMM, MoE & FP16 FlashAttention-2
+│       ├── rad_q8kv*.hip      INT8 KV cache store & GQA-3:1 Split-KV WMMA FlashAttention
+│       ├── rad_dflash2.hip    DFlash 2 grouped dynamic conv, top-16 & path selector kernels
+│       ├── rad_dspark.hip     DSpark speculative drafter kernels
+│       └── rad_vision.hip     ViT FP16 GEMM, LayerNorm, GELU, LayerScale, bidirectional attn & 2x2 merge
 ├── crates/
 │   ├── rad-gguf/              Zero-copy mmap GGUF reader
 │   ├── rad-hip/               Minimal ROCm/HIP FFI, RAII DevBuf, P2P & CapturedGraph
-│   ├── rad-core/              InklingEngine, DFlash 2 & DSpark, Paged KV, MultiGpuComm, TpShardPlan, VisionEncoder
-│   └── rad-serve/             `rad` CLI + Axum HTTP/SSE/WebSocket server, grammar, sampling, metrics
+│   ├── rad-core/              InklingEngine (model/{mod,decode,multi,profile}), DFlash 2 & DSpark, Paged KV, VisionEncoder
+│   └── rad-serve/             `rad` CLI + Axum server (main, types, prompt, scheduler, handlers, grammar, metrics, bench)
 ├── assets/
 │   ├── rad_benchmark.svg      Single-user decode & prefill comparison chart
 │   ├── rad_longctx.svg        Long-context 2K–256K decode & prefill scaling chart
-│   └── rad_multiuser.svg      Multi-user throughput scaling chart
+│   ├── rad_multiuser.svg      Multi-user throughput scaling chart
+│   ├── rad_multiuser_x.mp4    Live recorded 8-user concurrent SSE demo video
+│   └── rad_promo_x.mp4        Live recorded single-user SSE code-edit demo video
 └── scripts/
     ├── test_serve.py          End-to-end HTTP, SSE, batch, and WebSocket test suite
     ├── test_e2e_realworld.py          Real-world 10-test multi-user SSE, Anthropic/OpenAI/compat API, prefix cache & grammar suite
-    ├── test_e2e_edge_cases.py         7-test production edge-case suite (401 auth, ctx overflow, max_tokens=0/1, stop seqs, UTF-8/emoji, Anthropic tool cache)
+    ├── test_e2e_edge_cases.py         11-test production edge-case suite (401 auth, ctx overflow, SSE cancel, streaming stops, top_k/min_p, mixed TTFT)
     ├── test_e2e_longctx_agent.py      Real-world 7-turn 256K long-context agentic project-building E2E test
     ├── test_e2e_multiuser_longctx.py  Multi-user B=8 17.5K long-context multi-turn prefix-cache & SSE E2E test
     └── test_accuracy_spec_parity.py   DFlash 2 Hybrid vs No-Spec bit-exact token-parity & accuracy verification
@@ -147,12 +151,12 @@ huggingface-cli download incoai/Inkling-2-Mini-DFlash2 \
 ### 1. Build HIP Kernels
 
 ```bash
-RAD_ARCH=gfx1201 bash kernels/build.sh
+RAD_ARCH=gfx1201 bash kernels/rocm/build.sh
 ```
 
 ### 2. Build RAD
 
-`crates/rad-core/build.rs` and `crates/rad-serve/build.rs` automatically link `kernels/librad_ops.so` with `-Wl,-rpath`, so no manual `RUSTFLAGS` or `LD_LIBRARY_PATH` is required:
+`crates/rad-core/build.rs` and `crates/rad-serve/build.rs` automatically link `kernels/rocm/librad_ops.so` with `-Wl,-rpath`, so no manual `RUSTFLAGS` or `LD_LIBRARY_PATH` is required:
 
 ```bash
 cargo build --release

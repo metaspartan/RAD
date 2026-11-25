@@ -8,9 +8,9 @@ class Rad < Formula
   depends_on "rust" => :build
 
   def install
-    system "bash", "kernels/build.sh"
+    system "bash", "kernels/rocm/build.sh"
     system "cargo", "build", "--release", "--bin", "rad"
-    lib.install "kernels/librad_ops.so"
+    lib.install "kernels/rocm/librad_ops.so"
     bin.install "target/release/rad"
   end
 

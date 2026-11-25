@@ -1068,9 +1068,50 @@ mod tests {
         let mut p = SamplingParams {
             temperature: 0.0,
             top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
             repetition_penalty: 1.2,
             seed: 42,
         };
         assert_eq!(sample_from_logits(&logits, &[0], &mut p), 1);
+    }
+
+    #[test]
+    fn sampling_top_k_and_min_p_filters() {
+        let logits = vec![10.0f32, 9.9f32, 2.0f32, 1.0f32];
+        let mut p_k1 = SamplingParams {
+            temperature: 0.8,
+            top_p: 1.0,
+            top_k: 1,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            seed: 12345,
+        };
+        for _ in 0..16 {
+            assert_eq!(sample_from_logits(&logits, &[], &mut p_k1), 0);
+        }
+        let mut p_minp = SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.5,
+            repetition_penalty: 1.0,
+            seed: 99,
+        };
+        for _ in 0..32 {
+            let tok = sample_from_logits(&logits, &[], &mut p_minp);
+            assert!(tok == 0 || tok == 1);
+        }
+        let vals = [10.0f32, 9.9f32, 2.0f32, 1.0f32];
+        let ids = [100i32, 200, 300, 400];
+        let mut p_tk = SamplingParams {
+            temperature: 0.8,
+            top_p: 1.0,
+            top_k: 1,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            seed: 7,
+        };
+        assert_eq!(sample_from_topk(&vals, &ids, &[], &mut p_tk), 100);
     }
 }
