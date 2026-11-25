@@ -82,15 +82,15 @@ __global__ void moe_weighted_sum_f16_k(
 __global__ void embed_to_mhc_f16_k(
     const __nv_bfloat16* __restrict__ table,
     const int* __restrict__ tok_ids,
-    half* __restrict__ streams,
+    float* __restrict__ streams,
     int D
 ) {
     int mr = blockIdx.y;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < D) {
         int tid = tok_ids[mr];
-        half v = __float2half(__bfloat162float(table[(size_t)tid * D + i]));
-        half* sr = streams + (size_t)mr * 4 * D;
+        float v = __bfloat162float(table[(size_t)tid * D + i]);
+        float* sr = streams + (size_t)mr * 4 * D;
         sr[0 * D + i] = v;
         sr[1 * D + i] = v;
         sr[2 * D + i] = v;
@@ -98,22 +98,50 @@ __global__ void embed_to_mhc_f16_k(
     }
 }
 
+__global__ void rms_norm_f32_bf16w_f16_k(
+    const float* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w,
+    half* __restrict__ y,
+    int D,
+    float eps
+) {
+    int row = blockIdx.x;
+    int t = threadIdx.x;
+    const float* xr = x + (size_t)row * D;
+    half* yr = y + (size_t)row * D;
+    float ss = 0.0f;
+    for (int i = t; i < D; i += blockDim.x) {
+        float v = xr[i];
+        ss += v * v;
+    }
+    __shared__ float sm[32];
+    int lane = t & 31;
+    int warp = t >> 5;
+    for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, m);
+    if (lane == 0) sm[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < (blockDim.x >> 5)) ? sm[lane] : 0.0f;
+        for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+        if (lane == 0) sm[0] = rsqrtf(v / (float)D + eps);
+    }
+    __syncthreads();
+    float inv = sm[0];
+    for (int i = t; i < D; i += blockDim.x) {
+        yr[i] = __float2half(xr[i] * inv * __bfloat162float(w[i]));
+    }
+}
+
 __global__ void mhc_collapse_mean_f16_k(
-    const half* __restrict__ streams,
-    half* __restrict__ out,
+    const float* __restrict__ streams,
+    float* __restrict__ out,
     int D
 ) {
     int mr = blockIdx.y;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < D) {
-        const half* sr = streams + (size_t)mr * 4 * D;
-        float acc = 0.25f * (
-            __half2float(sr[0 * D + i]) +
-            __half2float(sr[1 * D + i]) +
-            __half2float(sr[2 * D + i]) +
-            __half2float(sr[3 * D + i])
-        );
-        out[(size_t)mr * D + i] = __float2half(acc);
+        const float* sr = streams + (size_t)mr * 4 * D;
+        out[(size_t)mr * D + i] = 0.25f * (sr[0 * D + i] + sr[1 * D + i] + sr[2 * D + i] + sr[3 * D + i]);
     }
 }
 
@@ -175,7 +203,7 @@ __global__ void rope_yarn_f16_k(
 }
 
 __global__ void mhc_sinkhorn_mix_f16_k(
-    half* __restrict__ streams,
+    float* __restrict__ streams,
     const half* __restrict__ branch_out,
     const float* __restrict__ h_coeff,
     int D,
@@ -220,18 +248,17 @@ __global__ void mhc_sinkhorn_mix_f16_k(
     __syncthreads();
     int i = blockIdx.x * blockDim.x + t;
     if (i < D) {
-        half* sr = streams + (size_t)mr * 4 * D;
-        float x0 = __half2float(sr[0 * D + i]);
-        float x1 = __half2float(sr[1 * D + i]);
-        float x2 = __half2float(sr[2 * D + i]);
-        float x3 = __half2float(sr[3 * D + i]);
+        float* sr = streams + (size_t)mr * 4 * D;
+        float x0 = sr[0 * D + i];
+        float x1 = sr[1 * D + i];
+        float x2 = sr[2 * D + i];
+        float x3 = sr[3 * D + i];
         float b = __half2float(branch_out[(size_t)mr * D + i]);
         #pragma unroll
         for (int r = 0; r < 4; ++r) {
-            float nr = s_res[r * 4 + 0] * x0 + s_res[r * 4 + 1] * x1 +
-                       s_res[r * 4 + 2] * x2 + s_res[r * 4 + 3] * x3 +
-                       s_post[r] * b;
-            sr[r * D + i] = __float2half(nr);
+            sr[r * D + i] = s_res[r * 4 + 0] * x0 + s_res[r * 4 + 1] * x1 +
+                            s_res[r * 4 + 2] * x2 + s_res[r * 4 + 3] * x3 +
+                            s_post[r] * b;
         }
     }
 }
@@ -373,7 +400,7 @@ void rad_cuda_moe_weighted_sum_f16(
 void rad_cuda_embed_to_mhc_f16(
     const __nv_bfloat16* table,
     const int* tok_ids,
-    half* streams,
+    float* streams,
     int M,
     int D,
     cudaStream_t stream
@@ -382,9 +409,21 @@ void rad_cuda_embed_to_mhc_f16(
     embed_to_mhc_f16_k<<<grid, 256, 0, stream>>>(table, tok_ids, streams, D);
 }
 
+void rad_cuda_rms_norm_f32_bf16w_f16(
+    const float* x,
+    const __nv_bfloat16* w,
+    half* y,
+    int M,
+    int D,
+    float eps,
+    cudaStream_t stream
+) {
+    rms_norm_f32_bf16w_f16_k<<<M, 256, 0, stream>>>(x, w, y, D, eps);
+}
+
 void rad_cuda_mhc_collapse_mean_f16(
-    const half* streams,
-    half* out,
+    const float* streams,
+    float* out,
     int M,
     int D,
     cudaStream_t stream
@@ -427,7 +466,7 @@ void rad_cuda_rope_yarn_f16(
 }
 
 void rad_cuda_mhc_sinkhorn_mix_f16(
-    half* streams,
+    float* streams,
     const half* branch_out,
     const float* h_coeff,
     int M,

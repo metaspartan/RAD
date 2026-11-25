@@ -130,8 +130,8 @@ impl Dsv41Engine {
             head,
             layers,
             kv_caches,
-            d_streams: CudaBuf::new(MAX_BATCH * 4 * d * 2).map_err(CudaFail)?,
-            d_branch_in: CudaBuf::new(MAX_BATCH * d * 2).map_err(CudaFail)?,
+            d_streams: CudaBuf::new(MAX_BATCH * 4 * d * 4).map_err(CudaFail)?,
+            d_branch_in: CudaBuf::new(MAX_BATCH * d * 4).map_err(CudaFail)?,
             d_normed: CudaBuf::new(MAX_BATCH * d * 2).map_err(CudaFail)?,
             d_xrot: CudaBuf::new(MAX_BATCH * (n_heads_local * tc.head_dim).max(d) * 2).map_err(CudaFail)?,
             d_z_scratch: CudaBuf::new(z_elems * 4).map_err(CudaFail)?,
@@ -245,7 +245,7 @@ impl Dsv41Engine {
                     tc.hc_eps,
                     stream,
                 );
-                cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_branch_in.ptr, lw.attn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
+                cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.attn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
                 self.exl3_proj(self.d_normed.ptr, &lw.wq_a, self.d_q_lora.ptr, mi, 0, stream);
                 cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_q_lora.ptr, lw.q_norm.ptr, self.d_q_normed.ptr, mi, tc.q_lora_rank as i32, tc.rms_norm_eps, stream);
                 self.exl3_proj(self.d_q_normed.ptr, &lw.wq_b, self.d_q.ptr, mi, 0, stream);
@@ -358,7 +358,7 @@ impl Dsv41Engine {
                     tc.hc_eps,
                     stream,
                 );
-                cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_branch_in.ptr, lw.ffn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
+                cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.ffn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
                 cuda_ops::rad_cuda_moe_route_sqrtsoftplus(
                     self.d_normed.ptr,
                     lw.gate_w.ptr,
@@ -501,7 +501,7 @@ impl Dsv41Engine {
         let stream: CudaStream = std::ptr::null_mut();
         unsafe {
             cuda_ops::rad_cuda_mhc_collapse_mean_f16(self.d_streams.ptr, self.d_branch_in.ptr, m as i32, d as i32, stream);
-            cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_branch_in.ptr, self.final_norm.ptr, self.d_normed.ptr, m as i32, d as i32, tc.rms_norm_eps, stream);
+            cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, self.final_norm.ptr, self.d_normed.ptr, m as i32, d as i32, tc.rms_norm_eps, stream);
             self.exl3_proj(self.d_normed.ptr, &self.head, self.d_logits.ptr, m as i32, 0, stream);
             cuda_ops::rad_cuda_argmax_f16(
                 self.d_logits.ptr,

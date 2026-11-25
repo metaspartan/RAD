@@ -57,6 +57,16 @@ extern "C" {
         stream: CudaStream,
     );
 
+    pub fn rad_cuda_rms_norm_f32_bf16w_f16(
+        x: *const c_void,
+        w: *const c_void,
+        y: *mut c_void,
+        m: i32,
+        d: i32,
+        eps: f32,
+        stream: CudaStream,
+    );
+
     pub fn rad_cuda_clamped_swiglu_f16(
         gate: *const c_void,
         up: *const c_void,

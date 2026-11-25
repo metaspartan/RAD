@@ -91,7 +91,7 @@ __global__ void moe_topk_select_k(
 }
 
 __global__ void mhc_coeff_proj_k(
-    const half* __restrict__ streams,
+    const float* __restrict__ streams,
     const float* __restrict__ hc_fn,
     const float* __restrict__ hc_base,
     const float* __restrict__ hc_scale,
@@ -103,12 +103,12 @@ __global__ void mhc_coeff_proj_k(
     int mr = blockIdx.y;
     if (c >= 24) return;
     int t = threadIdx.x;
-    const half* sr = streams + (size_t)mr * D4;
+    const float* sr = streams + (size_t)mr * D4;
     const float* row = hc_fn + (size_t)c * D4;
     float dot = 0.0f;
     float ss = 0.0f;
     for (int i = t; i < D4; i += blockDim.x) {
-        float x = __half2float(sr[i]);
+        float x = sr[i];
         ss = fmaf(x, x, ss);
         dot = fmaf(x, row[i], dot);
     }
@@ -141,9 +141,9 @@ __global__ void mhc_coeff_proj_k(
 }
 
 __global__ void mhc_pre_mix_f16_k(
-    const half* __restrict__ streams,
+    const float* __restrict__ streams,
     const float* __restrict__ h_coeff,
-    half* __restrict__ branch_in,
+    float* __restrict__ branch_in,
     int D,
     float eps
 ) {
@@ -155,12 +155,11 @@ __global__ void mhc_pre_mix_f16_k(
     __syncthreads();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < D) {
-        const half* sr = streams + (size_t)mr * 4 * D;
-        float acc = s_pre[0] * __half2float(sr[0 * D + i]) +
-                    s_pre[1] * __half2float(sr[1 * D + i]) +
-                    s_pre[2] * __half2float(sr[2 * D + i]) +
-                    s_pre[3] * __half2float(sr[3 * D + i]);
-        branch_in[(size_t)mr * D + i] = __float2half(acc);
+        const float* sr = streams + (size_t)mr * 4 * D;
+        branch_in[(size_t)mr * D + i] = s_pre[0] * sr[0 * D + i] +
+                                        s_pre[1] * sr[1 * D + i] +
+                                        s_pre[2] * sr[2 * D + i] +
+                                        s_pre[3] * sr[3 * D + i];
     }
 }
 
@@ -258,12 +257,12 @@ void rad_cuda_moe_route_sqrtsoftplus(
 }
 
 void rad_cuda_mhc_pre_and_coeff(
-    const half* streams,
+    const float* streams,
     const float* hc_fn,
     const float* hc_base,
     const float* hc_scale,
     float* h_coeff,
-    half* branch_in,
+    float* branch_in,
     int M,
     int D,
     float eps,
