@@ -58,29 +58,36 @@ pub(crate) fn canonical_tool_sig(name: &str, raw_args: &str) -> String {
 pub(crate) fn detect_repeated_tool_loop(messages: &[ChatMessage]) -> (usize, Option<String>) {
     let mut recent_sigs: Vec<String> = Vec::new();
     for m in messages.iter().rev() {
-        if m.role == "assistant" {
-            if let Some(ref tcs) = m.tool_calls {
-                if !tcs.is_empty() {
-                    let mut parts = Vec::new();
-                    for tc in tcs {
-                        let fn_obj = tc.get("function").unwrap_or(tc);
-                        let name = fn_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let args = fn_obj
-                            .get("arguments")
-                            .or_else(|| fn_obj.get("args"))
-                            .map(|v| match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => serde_json::to_string(other).unwrap_or_default(),
-                            })
-                            .unwrap_or_default();
-                        parts.push(canonical_tool_sig(name, &args));
-                    }
-                    recent_sigs.push(parts.join("|"));
-                    if recent_sigs.len() >= 6 {
-                        break;
+        match m.role.as_str() {
+            "tool" => continue,
+            "assistant" => {
+                if let Some(ref tcs) = m.tool_calls {
+                    if !tcs.is_empty() {
+                        let mut parts = Vec::new();
+                        for tc in tcs {
+                            let fn_obj = tc.get("function").unwrap_or(tc);
+                            let name = fn_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            let args = fn_obj
+                                .get("arguments")
+                                .or_else(|| fn_obj.get("args"))
+                                .map(|v| match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    other => serde_json::to_string(other).unwrap_or_default(),
+                                })
+                                .unwrap_or_default();
+                            parts.push(canonical_tool_sig(name, &args));
+                        }
+                        recent_sigs.push(parts.join("|"));
+                        if recent_sigs.len() >= 6 {
+                            break;
+                        }
+                        continue;
                     }
                 }
+                break;
             }
+            "user" => break,
+            _ => continue,
         }
     }
     if recent_sigs.len() < 2 {
@@ -104,15 +111,15 @@ pub(crate) fn apply_tool_loop_guard(
         return;
     }
     if repeat_count == 1 {
-        sampling.temperature = sampling.temperature.max(0.6);
-        sampling.repetition_penalty = sampling.repetition_penalty.max(1.22);
+        sampling.temperature = sampling.temperature.max(0.5);
+        sampling.repetition_penalty = sampling.repetition_penalty.max(1.08);
         let nudge = "<|message_system|><|content_text|>You already ran that exact tool call and received its output above. Do NOT repeat the same command again. Take a different action or answer the user directly.<|end_message|>";
         if let Some(pos) = prompt.rfind("<|message_model|>") {
             prompt.insert_str(pos, nudge);
         }
     } else {
-        sampling.temperature = sampling.temperature.max(0.75);
-        sampling.repetition_penalty = sampling.repetition_penalty.max(1.32);
+        sampling.temperature = sampling.temperature.max(0.6);
+        sampling.repetition_penalty = sampling.repetition_penalty.max(1.12);
         let nudge = "<|message_system|><|content_text|>STOP: You have repeated the exact same tool call multiple times in a row. That identical tool call is now blocked. Do NOT run it again. Either run a completely different command to make progress or reply directly to the user in plain text now.<|end_message|>";
         if let Some(pos) = prompt.rfind("<|message_model|>") {
             prompt.insert_str(pos, nudge);
@@ -621,8 +628,30 @@ mod tests {
         let mut prompt = String::from("<|begin_of_text|><|message_model|><|content_text|>");
         let mut samp = grammar::SamplingParams::greedy();
         apply_tool_loop_guard(&mut prompt, &mut samp, cnt3);
-        assert!(samp.temperature >= 0.75);
-        assert!(samp.repetition_penalty >= 1.32);
+        assert!(samp.temperature >= 0.6);
+        assert!(samp.repetition_penalty >= 1.12 && samp.repetition_penalty <= 1.15);
         assert!(prompt.contains("blocked"));
+
+        let mut after_plain = msgs3.clone();
+        after_plain.push(ChatMessage {
+            role: "assistant".into(),
+            content: json!("Here is the final story."),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        });
+        assert_eq!(detect_repeated_tool_loop(&after_plain), (0, None));
+
+        let mut after_user = msgs3;
+        after_user.push(ChatMessage {
+            role: "user".into(),
+            content: json!("Continue with chapter 2."),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        });
+        assert_eq!(detect_repeated_tool_loop(&after_user), (0, None));
     }
 }

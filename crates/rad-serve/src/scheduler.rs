@@ -206,6 +206,27 @@ pub(crate) fn ngram_lookup_draft(history: &[i32], anchor: i32, max_k: usize) -> 
     ngram_lookup_draft_ex(history, anchor, max_k).map(|(v, _)| v)
 }
 
+pub(crate) fn detect_degenerate_cycle(seq_tokens: &[i32], emitted: usize) -> bool {
+    let gen_n = emitted.min(seq_tokens.len());
+    if gen_n < 48 {
+        return false;
+    }
+    let tail = &seq_tokens[seq_tokens.len() - gen_n..];
+    for p in 1..=8usize {
+        let min_reps = if p == 1 { 48 } else if p <= 4 { 24 } else { 16 };
+        let need = p * min_reps;
+        if gen_n < need {
+            continue;
+        }
+        let win = &tail[gen_n - need..];
+        let pat = &win[need - p..];
+        if win.chunks_exact(p).all(|c| c == pat) {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn sync_kv_metrics(engine: &InklingEngine, metrics: &metrics::Metrics) {
     let st = engine.paged_kv.stats();
     metrics.kv_blocks_total.store(st.total_blocks as u64, Ordering::Relaxed);
@@ -436,7 +457,7 @@ pub(crate) fn run_scheduler(
                                     if let Some((ref tk_vals, ref tk_ids)) = topk_opt {
                                         let off = (u * k_pad + alen - 1) * 64;
                                         let seq_len = engine.seq_tokens[su].len();
-                                        let recent = &engine.seq_tokens[su][seq_len.saturating_sub(512)..];
+                                        let recent = &engine.seq_tokens[su][seq_len.saturating_sub(128)..];
                                         last_tok = grammar::sample_from_topk(&tk_vals[off..off + 64], &tk_ids[off..off + 64], recent, &mut sampling);
                                     }
                                 }
@@ -502,7 +523,7 @@ pub(crate) fn run_scheduler(
                         } else if !sampling.is_greedy() {
                             if let Ok((tk_vals, tk_ids)) = engine.read_batch_topk64(1) {
                                 let seq_len = engine.seq_tokens[pf.seq].len();
-                                let recent = &engine.seq_tokens[pf.seq][seq_len.saturating_sub(512)..];
+                                let recent = &engine.seq_tokens[pf.seq][seq_len.saturating_sub(128)..];
                                 last_tok = grammar::sample_from_topk(&tk_vals[..64], &tk_ids[..64], recent, &mut sampling);
                             }
                         }
@@ -613,7 +634,7 @@ pub(crate) fn run_scheduler(
                             } else {
                                 let (tk_vals, tk_ids) = engine.read_batch_topk64(dk)?;
                                 let seq_len = engine.seq_tokens[seq].len();
-                                let mut recent: Vec<i32> = engine.seq_tokens[seq][seq_len.saturating_sub(512)..].to_vec();
+                                let mut recent: Vec<i32> = engine.seq_tokens[seq][seq_len.saturating_sub(128)..].to_vec();
                                 for j in 0..acc_lim {
                                     recent.push(draft[j]);
                                     let off = j * 64;
@@ -701,6 +722,16 @@ pub(crate) fn run_scheduler(
                                     finished = true;
                                     break;
                                 }
+                            }
+                            if !finished && detect_degenerate_cycle(&engine.seq_tokens[slot.seq], slot.emitted) {
+                                let dec_ms = slot.started_at.elapsed().as_secs_f64() * 1000.0;
+                                let _ = slot.tx.send(GenEvent::Done {
+                                    finish_reason: "stop",
+                                    pred_n: slot.emitted,
+                                    dec_ms,
+                                });
+                                free[slot.seq] = true;
+                                finished = true;
                             }
                             if !finished {
                                 slot.next_tok = last_tok;
@@ -798,7 +829,7 @@ pub(crate) fn run_scheduler(
                                     let mut last_pred = preds[u][0];
                                     if let (Some((ref tk_vals, ref tk_ids)), true) = (&topk_opt, !active[mi].sampling.is_greedy()) {
                                         let seq_len = engine.seq_tokens[su].len();
-                                        let mut recent: Vec<i32> = engine.seq_tokens[su][seq_len.saturating_sub(512)..].to_vec();
+                                        let mut recent: Vec<i32> = engine.seq_tokens[su][seq_len.saturating_sub(128)..].to_vec();
                                         for j in 0..acc_lim {
                                             recent.push(drafts[u][j]);
                                             let off = (u * cu_k + j) * 64;
@@ -994,7 +1025,7 @@ pub(crate) fn run_scheduler(
                         let mut last_pred = preds[u][0];
                         if let (Some((ref tk_vals, ref tk_ids)), true) = (&topk_opt, !active[u].sampling.is_greedy()) {
                             let seq_len = engine.seq_tokens[su].len();
-                            let mut recent: Vec<i32> = engine.seq_tokens[su][seq_len.saturating_sub(512)..].to_vec();
+                            let mut recent: Vec<i32> = engine.seq_tokens[su][seq_len.saturating_sub(128)..].to_vec();
                             for j in 0..acc_lim {
                                 recent.push(drafts[u][j]);
                                 let off = (u * multi_k + j) * 64;
@@ -1146,7 +1177,7 @@ pub(crate) fn run_scheduler(
                         if let Some((ref tk_vals, ref tk_ids)) = topk_opt {
                             let off = u * 64;
                             let seq_len = engine.seq_tokens[slot.seq].len();
-                            let recent = &engine.seq_tokens[slot.seq][seq_len.saturating_sub(512)..];
+                            let recent = &engine.seq_tokens[slot.seq][seq_len.saturating_sub(128)..];
                             nxt = grammar::sample_from_topk(&tk_vals[off..off + 64], &tk_ids[off..off + 64], recent, &mut slot.sampling);
                         } else if let Ok(logits) = engine.read_batch_logits(u) {
                             nxt = grammar::sample_from_logits(&logits, &engine.seq_tokens[slot.seq], &mut slot.sampling);
@@ -1266,5 +1297,17 @@ mod tests {
         let (draft, mlen) = res.unwrap();
         assert_eq!(mlen, 5);
         assert_eq!(&draft[..4], &[60, 70, 80, 90]);
+    }
+
+    #[test]
+    fn degenerate_cycle_catches_whitespace_loop_without_false_positives() {
+        let normal: Vec<i32> = (0..120).collect();
+        assert!(!detect_degenerate_cycle(&normal, 120));
+        let mut ws_loop = vec![10, 20, 30];
+        for _ in 0..30 {
+            ws_loop.extend_from_slice(&[220, 198, 220]);
+        }
+        assert!(detect_degenerate_cycle(&ws_loop, 90));
+        assert!(!detect_degenerate_cycle(&ws_loop, 20));
     }
 }
