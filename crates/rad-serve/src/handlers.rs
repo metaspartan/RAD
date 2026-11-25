@@ -262,7 +262,7 @@ pub(crate) async fn chat_completions(
         }
     }
 
-    let enc = match st.tokenizer.encode(prompt, false) {
+    let enc = match st.tokenizer.encode(prompt.clone(), false) {
         Ok(e) => e,
         Err(e) => {
             st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
@@ -270,6 +270,25 @@ pub(crate) async fn chat_completions(
         }
     };
     let prompt_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
+    if std::env::var_os("RAD_TRACE_REQ").is_some() {
+        let tail = prompt.chars().rev().take(240).collect::<String>().chars().rev().collect::<String>();
+        eprintln!(
+            "RAD_TRACE msgs={} tools={} pt={} temp={} top_p={} top_k={} min_p={} rep={} think={} stream={} loop={} blocked={} tail={:?}",
+            req.messages.len(),
+            req.tools.as_ref().map(|v| v.len()).unwrap_or(0),
+            prompt_ids.len(),
+            sampling.temperature,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+            sampling.repetition_penalty,
+            initial_thinking,
+            stream,
+            loop_repeats,
+            blocked_sigs.len(),
+            tail
+        );
+    }
     if prompt_ids.len() >= st.max_ctx {
         st.metrics.requests_err.fetch_add(1, Ordering::Relaxed);
         return (
