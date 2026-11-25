@@ -392,6 +392,82 @@ def test_mixed_concurrent_prefill_decode_ttft(base_url, headers):
     print(f"[PASS] mixed_concurrent_prefill_decode_ttft: short_e2e={short_ms:.1f} ms reply={reply.strip()!r}")
 
 
+def test_tool_loop_breaker_and_post_loop_prose(base_url, headers):
+    cmd = "python -c \"print('ok')\""
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "exec",
+            "description": "Run shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }]
+    msgs = [{"role": "user", "content": "Write Chapter 2 of the dragon fantasy story."}]
+    for i in range(3):
+        msgs.append({
+            "role": "assistant",
+            "content": "Let me test python first.",
+            "tool_calls": [{
+                "id": f"call_loop_{i}",
+                "type": "function",
+                "function": {"name": "exec", "arguments": json.dumps({"command": cmd})},
+            }],
+        })
+        msgs.append({"role": "tool", "tool_call_id": f"call_loop_{i}", "name": "exec", "content": "ok"})
+
+    st1, d1 = post_json(
+        f"{base_url}/v1/chat/completions",
+        {
+            "model": "inkling-2-mini",
+            "messages": msgs,
+            "tools": tools,
+            "max_tokens": 128,
+            "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        headers,
+    )
+    assert st1 == 200, f"loop-break request failed: {st1} {d1}"
+    m1 = d1["choices"][0]["message"]
+    tcs1 = m1.get("tool_calls") or []
+    dup = any(
+        tc["function"]["name"] == "exec" and json.loads(tc["function"]["arguments"]).get("command") == cmd
+        for tc in tcs1
+    )
+    assert not dup, f"duplicate tool call was not blocked: {tcs1}"
+
+    msgs_post = list(msgs)
+    msgs_post.append({
+        "role": "assistant",
+        "content": "I will deliver Chapter 2 directly in plain text below.",
+    })
+    msgs_post.append({
+        "role": "user",
+        "content": "Great, please write the opening two paragraphs of Chapter 2 now.",
+    })
+    st2, d2 = post_json(
+        f"{base_url}/v1/chat/completions",
+        {
+            "model": "inkling-2-mini",
+            "messages": msgs_post,
+            "tools": tools,
+            "max_tokens": 192,
+            "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        headers,
+    )
+    assert st2 == 200, f"post-loop prose failed: {st2} {d2}"
+    c2 = (d2["choices"][0]["message"].get("content") or "").strip()
+    assert len(c2) >= 60, f"post-loop prose too short or degenerate: {c2!r}"
+    assert "\r\n\n  \r\n\n  \r\n\n" not in c2, f"degenerate whitespace loop detected: {c2!r}"
+    print(f"[PASS] tool_loop_breaker_and_post_loop_prose: dup_blocked=True prose_len={len(c2)}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8088")
@@ -409,7 +485,8 @@ def main():
     test_streaming_stop_sequences(args.url, headers)
     test_sampling_top_k_min_p_seed(args.url, headers)
     test_mixed_concurrent_prefill_decode_ttft(args.url, headers)
-    print("ALL 11 EDGE-CASE E2E TESTS PASSED!")
+    test_tool_loop_breaker_and_post_loop_prose(args.url, headers)
+    print("ALL 12 EDGE-CASE E2E TESTS PASSED!")
 
 
 if __name__ == "__main__":

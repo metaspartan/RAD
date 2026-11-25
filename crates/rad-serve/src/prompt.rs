@@ -632,19 +632,21 @@ mod tests {
         assert!(samp.repetition_penalty >= 1.12 && samp.repetition_penalty <= 1.15);
         assert!(prompt.contains("blocked"));
 
-        let mut after_plain = msgs3.clone();
-        after_plain.push(ChatMessage {
-            role: "assistant".into(),
-            content: json!("Here is the final story."),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-            reasoning_content: None,
-        });
+        let mut after_plain = vec![
+            make_turn(r#"{"command": "ls -la"}"#),
+            make_turn(r#"{"command":"ls -la"}"#),
+            make_turn(r#"{"command": "ls -la"}"#),
+            ChatMessage {
+                role: "assistant".into(),
+                content: json!("Here is the final story."),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+        ];
         assert_eq!(detect_repeated_tool_loop(&after_plain), (0, None));
-
-        let mut after_user = msgs3;
-        after_user.push(ChatMessage {
+        after_plain.push(ChatMessage {
             role: "user".into(),
             content: json!("Continue with chapter 2."),
             tool_calls: None,
@@ -652,6 +654,6 @@ mod tests {
             name: None,
             reasoning_content: None,
         });
-        assert_eq!(detect_repeated_tool_loop(&after_user), (0, None));
+        assert_eq!(detect_repeated_tool_loop(&after_plain), (0, None));
     }
 }
