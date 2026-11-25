@@ -13,7 +13,7 @@ use engine::Dsv41Engine;
 use rad_cuda::comm::Tp2Comm;
 use rad_cuda::{CudaBuf, CudaFail};
 use safetensors::SafetensorsIndex;
-use server::{build_router, ServeEvent, ServeJob, ServerState};
+use server::{build_router, format_dsv41_prompt, ServeEvent, ServeJob, ServerState};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,6 +29,10 @@ struct Cli {
     bench_exl3: bool,
     #[arg(long, default_value_t = false)]
     bench_layer: bool,
+    #[arg(long)]
+    prompt: Option<String>,
+    #[arg(long, default_value_t = 64)]
+    gen_tokens: usize,
     #[arg(long, default_value_t = false)]
     serve: bool,
     #[arg(long, default_value = "0.0.0.0")]
@@ -118,9 +122,38 @@ fn run_bench_exl3(model_dir: &PathBuf, comm: &mut Tp2Comm) -> Result<()> {
     Ok(())
 }
 
+fn worker_loop(eng: &mut Dsv41Engine, comm: &mut Tp2Comm) -> Result<()> {
+    let mut toks = Vec::new();
+    loop {
+        let mut cmd = 0u32;
+        if comm.broadcast_u32(&mut cmd).is_err() {
+            break;
+        }
+        match cmd {
+            0 => eng.pos = 0,
+            1 => {
+                comm.broadcast_i32_vec(&mut toks)?;
+                eng.step_batch_no_head(&toks, comm)?;
+            }
+            2 => {
+                comm.broadcast_i32_vec(&mut toks)?;
+                let _ = eng.step_batch(&toks, comm)?;
+            }
+            3 => {
+                let mut pval = 0u32;
+                comm.broadcast_u32(&mut pval)?;
+                eng.pos = pval as usize;
+            }
+            99 => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn run_bench_layer(model_dir: &PathBuf, max_ctx: usize, max_layers: usize, comm: &mut Tp2Comm) -> Result<()> {
     let t_load = Instant::now();
-    let mut eng = Dsv41Engine::load(model_dir, max_ctx, comm.rank, comm.world_size(), Some(max_layers))?;
+    let mut eng = Dsv41Engine::load(model_dir, max_ctx, comm, Some(max_layers))?;
     println!(
         "loaded {} layer(s) (rank={}/{}) in {:.2}s",
         eng.layers.len(),
@@ -128,31 +161,99 @@ fn run_bench_layer(model_dir: &PathBuf, max_ctx: usize, max_layers: usize, comm:
         eng.world,
         t_load.elapsed().as_secs_f64()
     );
+    if comm.rank != 0 {
+        return worker_loop(&mut eng, comm);
+    }
     let mut tok = eng.cfg.bos_token_id;
     for _ in 0..5 {
+        let mut one = vec![tok];
+        let mut cmd = 2u32;
+        comm.broadcast_u32(&mut cmd)?;
+        comm.broadcast_i32_vec(&mut one)?;
         tok = eng.step_decode(tok, comm)?;
     }
     let t0 = Instant::now();
     let steps = 20;
     for _ in 0..steps {
+        let mut one = vec![tok];
+        let mut cmd = 2u32;
+        comm.broadcast_u32(&mut cmd)?;
+        comm.broadcast_i32_vec(&mut one)?;
         tok = eng.step_decode(tok, comm)?;
     }
     let dt_ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
     println!(
-        "step_decode ({} layer + head): {:.2} ms/step, last_tok={}",
+        "step_decode ({} layer + head): {:.2} ms/step ({:.1} tok/s), last_tok={}",
         eng.layers.len(),
         dt_ms,
+        1000.0 / dt_ms,
         tok
     );
+    let mut quit = 99u32;
+    let _ = comm.broadcast_u32(&mut quit);
+    Ok(())
+}
+
+fn run_prompt(cli: &Cli, prompt_text: &str, comm: &mut Tp2Comm) -> Result<()> {
+    let t_load = Instant::now();
+    let mut eng = Dsv41Engine::load(&cli.model, cli.max_ctx, comm, Some(cli.max_layers))?;
+    println!(
+        "loaded {} layer(s) (rank={}/{}) in {:.2}s",
+        eng.layers.len(),
+        eng.rank,
+        eng.world,
+        t_load.elapsed().as_secs_f64()
+    );
+    if comm.rank != 0 {
+        return worker_loop(&mut eng, comm);
+    }
+    let tok = Tokenizer::from_file(cli.model.join("tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
+    let formatted = format_dsv41_prompt(&[serde_json::json!({"role": "user", "content": prompt_text})], None);
+    let enc = tok.encode(formatted, false).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let p_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
+    let t_pre = Instant::now();
+    let mut next_tok = eng.prefill_tokens(&p_ids, comm)?;
+    let ttft_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
+
+    let mut history = p_ids.clone();
+    let mut gen: Vec<u32> = Vec::new();
+    let t_dec = Instant::now();
+    while gen.len() < cli.gen_tokens && next_tok != eng.cfg.eos_token_id {
+        gen.push(next_tok as u32);
+        history.push(next_tok);
+        let accepted = eng.step_speculative(&history, next_tok, comm)?;
+        let last = *accepted.last().unwrap_or(&eng.cfg.eos_token_id);
+        for &a in &accepted[..accepted.len().saturating_sub(1)] {
+            if a == eng.cfg.eos_token_id || gen.len() >= cli.gen_tokens {
+                break;
+            }
+            gen.push(a as u32);
+            history.push(a);
+        }
+        next_tok = last;
+    }
+    let dec_s = t_dec.elapsed().as_secs_f64();
+    let text = tok.decode(&gen, false).unwrap_or_default();
+    println!(
+        "prefill={} toks in {:.1} ms ({:.1} tok/s) | decode={} toks in {:.2}s ({:.1} tok/s)",
+        p_ids.len(),
+        ttft_ms,
+        p_ids.len() as f64 / (ttft_ms / 1000.0),
+        gen.len(),
+        dec_s,
+        gen.len() as f64 / dec_s.max(1e-6)
+    );
+    println!("--- OUTPUT ---\n{text}\n--------------");
+    let mut quit = 99u32;
+    let _ = comm.broadcast_u32(&mut quit);
     Ok(())
 }
 
 fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
     let t_load = Instant::now();
-    let mut eng = Dsv41Engine::load(&cli.model, cli.max_ctx, comm.rank, comm.world_size(), Some(cli.max_layers))?;
-    let tok_path = cli.model.join("tokenizer.json");
-    let tok = Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
-    let eos = eng.cfg.eos_token_id;
+    let world_size = comm.world_size();
+    let mut eng = Dsv41Engine::load(&cli.model, cli.max_ctx, &mut comm, Some(cli.max_layers))?;
     println!(
         "rad-dsv41 serve ready in {:.2}s (rank={}/{}, layers={}, ctx={}, port={})",
         t_load.elapsed().as_secs_f64(),
@@ -164,19 +265,12 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
     );
 
     if comm.rank != 0 {
-        loop {
-            let mut cmd = 0u32;
-            if comm.broadcast_u32(&mut cmd).is_err() {
-                break;
-            }
-            if cmd == 0 {
-                eng.pos = 0;
-            } else {
-                let _ = eng.step_decode((cmd - 1) as i32, &mut comm);
-            }
-        }
-        return Ok(());
+        return worker_loop(&mut eng, &mut comm);
     }
+
+    let tok_path = cli.model.join("tokenizer.json");
+    let tok = Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
+    let eos = eng.cfg.eos_token_id;
 
     let mut api_keys = Vec::new();
     if let Some(ref k) = cli.api_key {
@@ -195,40 +289,36 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
     let (job_tx, mut job_rx) = mpsc::unbounded_channel::<ServeJob>();
     std::thread::spawn(move || {
         while let Some(job) = job_rx.blocking_recv() {
-            let enc = match tok.encode(job.prompt, true) {
+            let enc = match tok.encode(job.prompt, false) {
                 Ok(e) => e,
                 Err(e) => {
                     let _ = job.tx.send(ServeEvent::Error(format!("{e}")));
                     continue;
                 }
             };
-            let ids = enc.get_ids();
-            let prompt_n = ids.len();
+            let p_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
+            let prompt_n = p_ids.len();
             eng.pos = 0;
             let mut reset_cmd = 0u32;
             let _ = comm.broadcast_u32(&mut reset_cmd);
-            let mut next_tok = eng.cfg.bos_token_id;
-            for &id in ids {
-                let mut tcmd = id + 1;
-                let _ = comm.broadcast_u32(&mut tcmd);
-                match eng.step_decode(id as i32, &mut comm) {
-                    Ok(nt) => next_tok = nt,
-                    Err(e) => {
-                        let _ = job.tx.send(ServeEvent::Error(format!("{e}")));
-                        next_tok = eos;
-                        break;
-                    }
+            let mut next_tok = match eng.prefill_tokens(&p_ids, &mut comm) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = job.tx.send(ServeEvent::Error(format!("{e}")));
+                    continue;
                 }
-            }
+            };
+            let mut history = p_ids;
             let mut gen_ids: Vec<u32> = Vec::new();
             let mut prev_str = String::new();
             let mut finish_reason = "length";
-            for _ in 0..job.max_tokens {
+            while gen_ids.len() < job.max_tokens {
                 if next_tok == eos || job.tx.is_closed() {
                     finish_reason = "stop";
                     break;
                 }
                 gen_ids.push(next_tok as u32);
+                history.push(next_tok);
                 if let Ok(cur) = tok.decode(&gen_ids, true) {
                     if cur.len() > prev_str.len() && cur.is_char_boundary(prev_str.len()) {
                         let delta = cur[prev_str.len()..].to_string();
@@ -239,10 +329,35 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                         }
                     }
                 }
-                let mut tcmd = (next_tok as u32) + 1;
-                let _ = comm.broadcast_u32(&mut tcmd);
-                match eng.step_decode(next_tok, &mut comm) {
-                    Ok(nt) => next_tok = nt,
+                match eng.step_speculative(&history, next_tok, &mut comm) {
+                    Ok(accepted) => {
+                        let last = *accepted.last().unwrap_or(&eos);
+                        let mut stopped = false;
+                        for &a in &accepted[..accepted.len().saturating_sub(1)] {
+                            if a == eos || gen_ids.len() >= job.max_tokens || job.tx.is_closed() {
+                                finish_reason = "stop";
+                                stopped = true;
+                                break;
+                            }
+                            gen_ids.push(a as u32);
+                            history.push(a);
+                            if let Ok(cur) = tok.decode(&gen_ids, true) {
+                                if cur.len() > prev_str.len() && cur.is_char_boundary(prev_str.len()) {
+                                    let delta = cur[prev_str.len()..].to_string();
+                                    prev_str = cur;
+                                    if job.tx.send(ServeEvent::Token(delta)).is_err() {
+                                        finish_reason = "stop";
+                                        stopped = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if stopped {
+                            break;
+                        }
+                        next_tok = last;
+                    }
                     Err(e) => {
                         let _ = job.tx.send(ServeEvent::Error(format!("{e}")));
                         break;
@@ -261,7 +376,7 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
         model_name: cli.name.clone(),
         api_keys,
         max_ctx: cli.max_ctx,
-        world_size: 1,
+        world_size,
         job_tx,
     });
     let app = build_router(state);
@@ -287,6 +402,9 @@ fn main() -> Result<()> {
     }
     if cli.bench_layer {
         run_bench_layer(&cli.model, cli.max_ctx, cli.max_layers, &mut comm)?;
+    }
+    if let Some(ref p) = cli.prompt {
+        run_prompt(&cli, p, &mut comm)?;
     }
     if cli.serve {
         run_serve(&cli, comm)?;

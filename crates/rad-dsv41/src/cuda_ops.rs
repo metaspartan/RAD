@@ -12,30 +12,6 @@ extern "C" {
         stream: CudaStream,
     );
 
-    pub fn rad_cuda_exl3_reconstruct_f16(
-        out: *mut c_void,
-        trellis: *const c_void,
-        k: i32,
-        n: i32,
-        bits: i32,
-        stream: CudaStream,
-    );
-
-    pub fn rad_cuda_exl3_gemv_f16(
-        x_rot: *const c_void,
-        trellis: *const c_void,
-        svh: *const c_void,
-        z_scratch_f32: *mut c_void,
-        y: *mut c_void,
-        m: i32,
-        k: i32,
-        n: i32,
-        bits: i32,
-        wht_scale: f32,
-        add_to_y: i32,
-        stream: CudaStream,
-    );
-
     pub fn rad_cuda_exl3_mma_f16(
         x_rot: *const c_void,
         trellis: *const c_void,
@@ -66,22 +42,8 @@ extern "C" {
         bits: i32,
         wht_scale: f32,
         x_per_expert: i32,
-        stream: CudaStream,
-    );
-
-    pub fn rad_cuda_exl3_moe_gemv_f16(
-        x_in: *const c_void,
-        trellis_ptrs: *const *const c_void,
-        suh_ptrs: *const *const c_void,
-        svh_ptrs: *const *const c_void,
-        expert_ids: *const i32,
-        y_out: *mut c_void,
-        top_k: i32,
-        k: i32,
-        n: i32,
-        bits: i32,
-        wht_scale: f32,
-        x_per_expert: i32,
+        expert_start: i32,
+        n_local_experts: i32,
         stream: CudaStream,
     );
 
@@ -109,28 +71,50 @@ extern "C" {
         weights: *const f32,
         shared_out: *const c_void,
         dst: *mut c_void,
+        m: i32,
         top_k: i32,
         d: i32,
         stream: CudaStream,
     );
 
-    pub fn rad_cuda_embed_bf16_to_f16(
+    pub fn rad_cuda_embed_to_mhc_f16(
         table: *const c_void,
         tok_ids: *const i32,
+        streams: *mut c_void,
+        m: i32,
+        d: i32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_mhc_collapse_mean_f16(
+        streams: *const c_void,
         out: *mut c_void,
         m: i32,
         d: i32,
         stream: CudaStream,
     );
 
+    pub fn rad_cuda_kv_scatter_f16(
+        k_in: *const c_void,
+        v_in: *const c_void,
+        k_cache: *mut c_void,
+        v_cache: *mut c_void,
+        m: i32,
+        start_pos: i32,
+        max_ctx: i32,
+        head_dim: i32,
+        stream: CudaStream,
+    );
+
     pub fn rad_cuda_rope_yarn_f16(
         q: *mut c_void,
         k: *mut c_void,
+        m: i32,
         n_q_heads: i32,
         n_kv_heads: i32,
         head_dim: i32,
         rope_dim: i32,
-        pos: i32,
+        start_pos: i32,
         theta: f32,
         stream: CudaStream,
     );
@@ -139,22 +123,46 @@ extern "C" {
         streams: *mut c_void,
         branch_out: *const c_void,
         h_coeff: *const f32,
+        m: i32,
         d: i32,
         sinkhorn_iters: i32,
         eps: f32,
         stream: CudaStream,
     );
 
-    pub fn rad_cuda_mqa_attn_sink_decode_f16(
+    pub fn rad_cuda_mqa_attn_sink_causal_f16(
         q: *const c_void,
         k_cache: *const c_void,
         v_cache: *const c_void,
         attn_sink: *const f32,
         out: *mut c_void,
+        m: i32,
         n_heads: i32,
-        seq_len: i32,
+        start_pos: i32,
+        max_ctx: i32,
         head_dim: i32,
         scale: f32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_wo_a_gather_group_f16(
+        attn_out: *const c_void,
+        grp_in: *mut c_void,
+        m: i32,
+        n_heads_local: i32,
+        heads_per_grp: i32,
+        head_dim: i32,
+        gi: i32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_wo_a_scatter_group_f16(
+        grp_out: *const c_void,
+        wo_mid: *mut c_void,
+        m: i32,
+        groups_local: i32,
+        o_lora_rank: i32,
+        gi: i32,
         stream: CudaStream,
     );
 
@@ -166,6 +174,7 @@ extern "C" {
         sel_scores: *mut c_void,
         topk_ids: *mut c_void,
         topk_weights: *mut c_void,
+        m: i32,
         n_experts: i32,
         d: i32,
         top_k: i32,
@@ -180,7 +189,9 @@ extern "C" {
         hc_scale: *const c_void,
         h_coeff: *mut c_void,
         branch_in: *mut c_void,
+        m: i32,
         d: i32,
+        eps: f32,
         stream: CudaStream,
     );
 
@@ -190,13 +201,7 @@ extern "C" {
         blk_ids: *mut c_void,
         out_val: *mut c_void,
         out_id: *mut c_void,
-        n: i32,
-        stream: CudaStream,
-    );
-
-    pub fn rad_cuda_add_f16(
-        dst: *mut c_void,
-        src: *const c_void,
+        m: i32,
         n: i32,
         stream: CudaStream,
     );

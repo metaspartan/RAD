@@ -38,6 +38,7 @@ pub enum ServeEvent {
 pub struct ChatReq {
     pub model: Option<String>,
     pub messages: Vec<serde_json::Value>,
+    pub tools: Option<Vec<serde_json::Value>>,
     pub max_tokens: Option<usize>,
     pub max_completion_tokens: Option<usize>,
     pub stream: Option<bool>,
@@ -95,29 +96,93 @@ async fn models(State(st): State<Arc<ServerState>>, headers: HeaderMap) -> Respo
     .into_response()
 }
 
-fn format_dsv41_prompt(messages: &[serde_json::Value]) -> String {
-    let mut out = String::new();
+fn extract_content_str(m: &serde_json::Value) -> String {
+    match m.get("content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut s = String::new();
+            for item in arr {
+                if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                    s.push_str(t);
+                }
+            }
+            s
+        }
+        Some(v) if !v.is_null() => v.to_string(),
+        _ => String::new(),
+    }
+}
+
+pub fn format_dsv41_prompt(messages: &[serde_json::Value], tools: Option<&[serde_json::Value]>) -> String {
+    let mut out = String::from("<｜begin▁of▁sentence｜>");
+    let mut sys_text = String::new();
+    for m in messages {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role == "system" || role == "developer" {
+            let c = extract_content_str(m);
+            if !c.is_empty() {
+                if !sys_text.is_empty() {
+                    sys_text.push('\n');
+                }
+                sys_text.push_str(&c);
+            }
+        }
+    }
+    if let Some(ts) = tools {
+        if !ts.is_empty() {
+            if !sys_text.is_empty() {
+                sys_text.push_str("\n\n");
+            }
+            sys_text.push_str("## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\n### Available Tool Schemas\n\n");
+            for t in ts {
+                let schema = t.get("function").unwrap_or(t);
+                sys_text.push_str(&schema.to_string());
+                sys_text.push('\n');
+            }
+        }
+    }
+    if !sys_text.is_empty() {
+        out.push_str("<｜System｜>");
+        out.push_str(&sys_text);
+    }
+    let mut prev_user = false;
     for m in messages {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
         match role {
-            "system" | "developer" => {
-                out.push_str(content);
-                out.push('\n');
-            }
+            "system" | "developer" => {}
             "user" => {
-                out.push_str("<｜User｜>");
-                out.push_str(content);
+                if !prev_user {
+                    out.push_str("<｜User｜>");
+                    prev_user = true;
+                }
+                out.push_str(&extract_content_str(m));
+            }
+            "tool" => {
+                if !prev_user {
+                    out.push_str("<｜User｜>");
+                    prev_user = true;
+                }
+                out.push_str("<tool_result>");
+                out.push_str(&extract_content_str(m));
+                out.push_str("</tool_result>");
             }
             "assistant" => {
+                prev_user = false;
                 out.push_str("<｜Assistant｜>");
-                out.push_str(content);
+                if let Some(rc) = m.get("reasoning_content").and_then(|v| v.as_str()) {
+                    if !rc.is_empty() {
+                        out.push_str("<think>");
+                        out.push_str(rc);
+                        out.push_str("</think>");
+                    }
+                }
+                out.push_str(&extract_content_str(m));
                 out.push_str("<｜end▁of▁sentence｜>");
             }
             _ => {}
         }
     }
-    out.push_str("<｜Assistant｜>");
+    out.push_str("<｜Assistant｜><think>");
     out
 }
 
@@ -132,7 +197,7 @@ async fn chat_completions(
     let model_id = req.model.unwrap_or_else(|| st.model_name.clone());
     let max_tokens = req.max_tokens.or(req.max_completion_tokens).unwrap_or(2048).min(32768);
     let stream = req.stream.unwrap_or(false);
-    let prompt = format_dsv41_prompt(&req.messages);
+    let prompt = format_dsv41_prompt(&req.messages, req.tools.as_deref());
     let req_id = format!("chatcmpl-rad-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
     let created = now_unix();
 

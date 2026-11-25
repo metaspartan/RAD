@@ -66,27 +66,72 @@ __global__ void moe_weighted_sum_f16_k(
     int top_k,
     int D
 ) {
+    int mr = blockIdx.y;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < D) {
-        float acc = shared_out ? __half2float(shared_out[i]) : 0.0f;
+        float acc = shared_out ? __half2float(shared_out[(size_t)mr * D + i]) : 0.0f;
+        const float* wm = weights + (size_t)mr * top_k;
+        const half* em = expert_outs + (size_t)mr * top_k * D;
         for (int k = 0; k < top_k; ++k) {
-            acc += weights[k] * __half2float(expert_outs[(size_t)k * D + i]);
+            acc += wm[k] * __half2float(em[(size_t)k * D + i]);
         }
-        dst[i] = __float2half(acc);
+        dst[(size_t)mr * D + i] = __float2half(acc);
     }
 }
 
-__global__ void embed_bf16_to_f16_k(
+__global__ void embed_to_mhc_f16_k(
     const __nv_bfloat16* __restrict__ table,
     const int* __restrict__ tok_ids,
+    half* __restrict__ streams,
+    int D
+) {
+    int mr = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < D) {
+        int tid = tok_ids[mr];
+        half v = __float2half(__bfloat162float(table[(size_t)tid * D + i]));
+        half* sr = streams + (size_t)mr * 4 * D;
+        sr[0 * D + i] = v;
+        sr[1 * D + i] = v;
+        sr[2 * D + i] = v;
+        sr[3 * D + i] = v;
+    }
+}
+
+__global__ void mhc_collapse_mean_f16_k(
+    const half* __restrict__ streams,
     half* __restrict__ out,
     int D
 ) {
-    int row = blockIdx.y;
+    int mr = blockIdx.y;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < D) {
-        int tid = tok_ids[row];
-        out[(size_t)row * D + i] = __float2half(__bfloat162float(table[(size_t)tid * D + i]));
+        const half* sr = streams + (size_t)mr * 4 * D;
+        float acc = 0.25f * (
+            __half2float(sr[0 * D + i]) +
+            __half2float(sr[1 * D + i]) +
+            __half2float(sr[2 * D + i]) +
+            __half2float(sr[3 * D + i])
+        );
+        out[(size_t)mr * D + i] = __float2half(acc);
+    }
+}
+
+__global__ void kv_scatter_f16_k(
+    const half* __restrict__ k_in,
+    const half* __restrict__ v_in,
+    half* __restrict__ k_cache,
+    half* __restrict__ v_cache,
+    int start_pos,
+    int max_ctx,
+    int head_dim
+) {
+    int mr = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < head_dim) {
+        int p = (start_pos + mr) % max_ctx;
+        k_cache[(size_t)p * head_dim + i] = k_in[(size_t)mr * head_dim + i];
+        v_cache[(size_t)p * head_dim + i] = v_in[(size_t)mr * head_dim + i];
     }
 }
 
@@ -97,20 +142,22 @@ __global__ void rope_yarn_f16_k(
     int n_kv_heads,
     int head_dim,
     int rope_dim,
-    int pos,
+    int start_pos,
     float theta
 ) {
     int h = blockIdx.x;
+    int mr = blockIdx.y;
     int i = threadIdx.x;
     int half_r = rope_dim >> 1;
     if (i >= half_r) return;
-    float freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
-    float ang = (float)pos * freq;
+    float base_freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
+    float pos_f = (float)(start_pos + mr);
+    float ang = pos_f * base_freq;
     float cs = cosf(ang);
     float sn = sinf(ang);
     int rope_off = head_dim - rope_dim;
     if (h < n_q_heads) {
-        half* p = q + (size_t)h * head_dim + rope_off;
+        half* p = q + ((size_t)mr * n_q_heads + h) * head_dim + rope_off;
         float x0 = __half2float(p[2 * i]);
         float x1 = __half2float(p[2 * i + 1]);
         p[2 * i] = __float2half(x0 * cs - x1 * sn);
@@ -118,7 +165,7 @@ __global__ void rope_yarn_f16_k(
     } else {
         int kh = h - n_q_heads;
         if (kh < n_kv_heads) {
-            half* p = k + (size_t)kh * head_dim + rope_off;
+            half* p = k + ((size_t)mr * n_kv_heads + kh) * head_dim + rope_off;
             float x0 = __half2float(p[2 * i]);
             float x1 = __half2float(p[2 * i + 1]);
             p[2 * i] = __float2half(x0 * cs - x1 * sn);
@@ -135,17 +182,23 @@ __global__ void mhc_sinkhorn_mix_f16_k(
     int sinkhorn_iters,
     float eps
 ) {
+    int mr = blockIdx.y;
     __shared__ float s_post[4];
     __shared__ float s_res[16];
     int t = threadIdx.x;
     if (t == 0) {
+        const float* hc = h_coeff + (size_t)mr * 24;
         for (int i = 0; i < 4; ++i) {
-            s_post[i] = 2.0f / (1.0f + expf(-h_coeff[4 + i]));
+            s_post[i] = 2.0f / (1.0f + expf(-hc[4 + i]));
+        }
+        float max_c = -1e30f;
+        for (int j = 0; j < 16; ++j) {
+            if (hc[8 + j] > max_c) max_c = hc[8 + j];
         }
         float m[4][4];
         for (int r = 0; r < 4; ++r) {
             for (int c = 0; c < 4; ++c) {
-                m[r][c] = expf(h_coeff[8 + r * 4 + c]);
+                m[r][c] = expf(hc[8 + r * 4 + c] - max_c);
             }
         }
         for (int it = 0; it < sinkhorn_iters; ++it) {
@@ -167,34 +220,38 @@ __global__ void mhc_sinkhorn_mix_f16_k(
     __syncthreads();
     int i = blockIdx.x * blockDim.x + t;
     if (i < D) {
-        float x0 = __half2float(streams[0 * D + i]);
-        float x1 = __half2float(streams[1 * D + i]);
-        float x2 = __half2float(streams[2 * D + i]);
-        float x3 = __half2float(streams[3 * D + i]);
-        float b = __half2float(branch_out[i]);
+        half* sr = streams + (size_t)mr * 4 * D;
+        float x0 = __half2float(sr[0 * D + i]);
+        float x1 = __half2float(sr[1 * D + i]);
+        float x2 = __half2float(sr[2 * D + i]);
+        float x3 = __half2float(sr[3 * D + i]);
+        float b = __half2float(branch_out[(size_t)mr * D + i]);
         #pragma unroll
         for (int r = 0; r < 4; ++r) {
             float nr = s_res[r * 4 + 0] * x0 + s_res[r * 4 + 1] * x1 +
                        s_res[r * 4 + 2] * x2 + s_res[r * 4 + 3] * x3 +
                        s_post[r] * b;
-            streams[r * D + i] = __float2half(nr);
+            sr[r * D + i] = __float2half(nr);
         }
     }
 }
 
-__global__ void mqa_attn_sink_decode_f16_k(
+__global__ void mqa_attn_sink_causal_f16_k(
     const half* __restrict__ q,
     const half* __restrict__ k_cache,
     const half* __restrict__ v_cache,
     const float* __restrict__ attn_sink,
     half* __restrict__ out,
-    int seq_len,
+    int n_heads,
+    int start_pos,
+    int max_ctx,
     int head_dim,
     float scale
 ) {
     int h = blockIdx.x;
+    int mr = blockIdx.y;
     int t = threadIdx.x;
-    const half* qh = q + (size_t)h * head_dim;
+    const half* qh = q + ((size_t)mr * n_heads + h) * head_dim;
     extern __shared__ float smem[];
     float* s_q = smem;
     float* s_acc = smem + head_dim;
@@ -203,6 +260,8 @@ __global__ void mqa_attn_sink_decode_f16_k(
         s_acc[d] = 0.0f;
     }
     __syncthreads();
+    int seq_len = start_pos + mr + 1;
+    if (seq_len > max_ctx) seq_len = max_ctx;
     float m_max = attn_sink ? attn_sink[h] : -1e30f;
     float l_sum = attn_sink ? 1.0f : 0.0f;
     for (int p = 0; p < seq_len; ++p) {
@@ -235,9 +294,40 @@ __global__ void mqa_attn_sink_decode_f16_k(
         }
     }
     float inv = 1.0f / fmaxf(l_sum, 1e-20f);
-    half* oh = out + (size_t)h * head_dim;
+    half* oh = out + ((size_t)mr * n_heads + h) * head_dim;
     for (int d = t; d < head_dim; d += blockDim.x) {
         oh[d] = __float2half(s_acc[d] * inv);
+    }
+}
+
+__global__ void wo_a_gather_group_f16_k(
+    const half* __restrict__ attn_out,
+    half* __restrict__ grp_in,
+    int n_heads_local,
+    int heads_per_grp,
+    int head_dim,
+    int gi
+) {
+    int mr = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int grp_dim = heads_per_grp * head_dim;
+    if (idx < grp_dim) {
+        int src_off = ((size_t)mr * n_heads_local + gi * heads_per_grp) * head_dim + idx;
+        grp_in[(size_t)mr * grp_dim + idx] = attn_out[src_off];
+    }
+}
+
+__global__ void wo_a_scatter_group_f16_k(
+    const half* __restrict__ grp_out,
+    half* __restrict__ wo_mid,
+    int groups_local,
+    int o_lora_rank,
+    int gi
+) {
+    int mr = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < o_lora_rank) {
+        wo_mid[((size_t)mr * groups_local + gi) * o_lora_rank + idx] = grp_out[(size_t)mr * o_lora_rank + idx];
     }
 }
 
@@ -271,38 +361,68 @@ void rad_cuda_moe_weighted_sum_f16(
     const float* weights,
     const half* shared_out,
     half* dst,
+    int M,
     int top_k,
     int D,
     cudaStream_t stream
 ) {
-    moe_weighted_sum_f16_k<<<(D + 255) / 256, 256, 0, stream>>>(expert_outs, weights, shared_out, dst, top_k, D);
+    dim3 g((D + 255) / 256, M);
+    moe_weighted_sum_f16_k<<<g, 256, 0, stream>>>(expert_outs, weights, shared_out, dst, top_k, D);
 }
 
-void rad_cuda_embed_bf16_to_f16(
+void rad_cuda_embed_to_mhc_f16(
     const __nv_bfloat16* table,
     const int* tok_ids,
+    half* streams,
+    int M,
+    int D,
+    cudaStream_t stream
+) {
+    dim3 grid((D + 255) / 256, M);
+    embed_to_mhc_f16_k<<<grid, 256, 0, stream>>>(table, tok_ids, streams, D);
+}
+
+void rad_cuda_mhc_collapse_mean_f16(
+    const half* streams,
     half* out,
     int M,
     int D,
     cudaStream_t stream
 ) {
     dim3 grid((D + 255) / 256, M);
-    embed_bf16_to_f16_k<<<grid, 256, 0, stream>>>(table, tok_ids, out, D);
+    mhc_collapse_mean_f16_k<<<grid, 256, 0, stream>>>(streams, out, D);
+}
+
+void rad_cuda_kv_scatter_f16(
+    const half* k_in,
+    const half* v_in,
+    half* k_cache,
+    half* v_cache,
+    int M,
+    int start_pos,
+    int max_ctx,
+    int head_dim,
+    cudaStream_t stream
+) {
+    dim3 grid((head_dim + 255) / 256, M);
+    kv_scatter_f16_k<<<grid, 256, 0, stream>>>(k_in, v_in, k_cache, v_cache, start_pos, max_ctx, head_dim);
 }
 
 void rad_cuda_rope_yarn_f16(
     half* q,
     half* k,
+    int M,
     int n_q_heads,
     int n_kv_heads,
     int head_dim,
     int rope_dim,
-    int pos,
+    int start_pos,
     float theta,
     cudaStream_t stream
 ) {
-    rope_yarn_f16_k<<<n_q_heads + n_kv_heads, rope_dim / 2, 0, stream>>>(
-        q, k, n_q_heads, n_kv_heads, head_dim, rope_dim, pos, theta
+    dim3 grid(n_q_heads + n_kv_heads, M);
+    rope_yarn_f16_k<<<grid, rope_dim / 2, 0, stream>>>(
+        q, k, n_q_heads, n_kv_heads, head_dim, rope_dim, start_pos, theta
     );
 }
 
@@ -310,32 +430,65 @@ void rad_cuda_mhc_sinkhorn_mix_f16(
     half* streams,
     const half* branch_out,
     const float* h_coeff,
+    int M,
     int D,
     int sinkhorn_iters,
     float eps,
     cudaStream_t stream
 ) {
-    mhc_sinkhorn_mix_f16_k<<<(D + 255) / 256, 256, 0, stream>>>(
+    dim3 grid((D + 255) / 256, M);
+    mhc_sinkhorn_mix_f16_k<<<grid, 256, 0, stream>>>(
         streams, branch_out, h_coeff, D, sinkhorn_iters, eps
     );
 }
 
-void rad_cuda_mqa_attn_sink_decode_f16(
+void rad_cuda_mqa_attn_sink_causal_f16(
     const half* q,
     const half* k_cache,
     const half* v_cache,
     const float* attn_sink,
     half* out,
+    int M,
     int n_heads,
-    int seq_len,
+    int start_pos,
+    int max_ctx,
     int head_dim,
     float scale,
     cudaStream_t stream
 ) {
     size_t smem = (size_t)head_dim * 2 * sizeof(float);
-    mqa_attn_sink_decode_f16_k<<<n_heads, 256, smem, stream>>>(
-        q, k_cache, v_cache, attn_sink, out, seq_len, head_dim, scale
+    dim3 grid(n_heads, M);
+    mqa_attn_sink_causal_f16_k<<<grid, 256, smem, stream>>>(
+        q, k_cache, v_cache, attn_sink, out, n_heads, start_pos, max_ctx, head_dim, scale
     );
+}
+
+void rad_cuda_wo_a_gather_group_f16(
+    const half* attn_out,
+    half* grp_in,
+    int M,
+    int n_heads_local,
+    int heads_per_grp,
+    int head_dim,
+    int gi,
+    cudaStream_t stream
+) {
+    int grp_dim = heads_per_grp * head_dim;
+    dim3 grid((grp_dim + 255) / 256, M);
+    wo_a_gather_group_f16_k<<<grid, 256, 0, stream>>>(attn_out, grp_in, n_heads_local, heads_per_grp, head_dim, gi);
+}
+
+void rad_cuda_wo_a_scatter_group_f16(
+    const half* grp_out,
+    half* wo_mid,
+    int M,
+    int groups_local,
+    int o_lora_rank,
+    int gi,
+    cudaStream_t stream
+) {
+    dim3 grid((o_lora_rank + 255) / 256, M);
+    wo_a_scatter_group_f16_k<<<grid, 256, 0, stream>>>(grp_out, wo_mid, groups_local, o_lora_rank, gi);
 }
 
 }

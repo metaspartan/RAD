@@ -25,7 +25,7 @@ impl Tp2Comm {
         } else {
             let mut last_err = None;
             let mut connected = None;
-            for _ in 0..200 {
+            for _ in 0..400 {
                 match TcpStream::connect(addr) {
                     Ok(c) => {
                         connected = Some(c);
@@ -54,27 +54,41 @@ impl Tp2Comm {
         if self.stream.is_some() { 2 } else { 1 }
     }
 
-    pub fn all_reduce_sum_f32(&mut self, data: &mut [f32]) -> std::io::Result<()> {
+    pub fn send_bytes(&mut self, data: &[u8]) -> std::io::Result<()> {
         let Some(ref mut s) = self.stream else {
             return Ok(());
         };
-        let n = data.len();
-        if self.peer_buf.len() < n {
-            self.peer_buf.resize(n, 0.0);
-        }
-        let send_bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, n * 4) };
-        let recv_bytes = unsafe { std::slice::from_raw_parts_mut(self.peer_buf.as_mut_ptr() as *mut u8, n * 4) };
-        if self.rank == 0 {
-            s.write_all(send_bytes)?;
-            s.read_exact(recv_bytes)?;
-        } else {
-            s.read_exact(recv_bytes)?;
-            s.write_all(send_bytes)?;
-        }
-        for i in 0..n {
-            data[i] += self.peer_buf[i];
-        }
+        let len = (data.len() as u64).to_le_bytes();
+        s.write_all(&len)?;
+        s.write_all(data)?;
         Ok(())
+    }
+
+    pub fn recv_bytes(&mut self) -> std::io::Result<Vec<u8>> {
+        let Some(ref mut s) = self.stream else {
+            return Ok(Vec::new());
+        };
+        let mut lbuf = [0u8; 8];
+        s.read_exact(&mut lbuf)?;
+        let len = u64::from_le_bytes(lbuf) as usize;
+        let mut out = vec![0u8; len];
+        s.read_exact(&mut out)?;
+        Ok(out)
+    }
+
+    pub fn send_u64_slice(&mut self, vals: &[u64]) -> std::io::Result<()> {
+        let bytes = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8) };
+        self.send_bytes(bytes)
+    }
+
+    pub fn recv_u64_slice(&mut self) -> std::io::Result<Vec<u64>> {
+        let bytes = self.recv_bytes()?;
+        let n = bytes.len() / 8;
+        let mut out = vec![0u64; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, n * 8);
+        }
+        Ok(out)
     }
 
     pub fn all_reduce_sum_f16(&mut self, data: &mut [u16]) -> std::io::Result<()> {
@@ -102,6 +116,35 @@ impl Tp2Comm {
         Ok(())
     }
 
+    pub fn all_reduce_argmax(&mut self, vals: &mut [f32], ids: &mut [i32]) -> std::io::Result<()> {
+        let Some(ref mut s) = self.stream else {
+            return Ok(());
+        };
+        let m = vals.len();
+        let mut send_buf = vec![0u8; m * 8];
+        let mut recv_buf = vec![0u8; m * 8];
+        for i in 0..m {
+            send_buf[i * 8..i * 8 + 4].copy_from_slice(&vals[i].to_le_bytes());
+            send_buf[i * 8 + 4..i * 8 + 8].copy_from_slice(&ids[i].to_le_bytes());
+        }
+        if self.rank == 0 {
+            s.write_all(&send_buf)?;
+            s.read_exact(&mut recv_buf)?;
+        } else {
+            s.read_exact(&mut recv_buf)?;
+            s.write_all(&send_buf)?;
+        }
+        for i in 0..m {
+            let pv = f32::from_le_bytes(recv_buf[i * 8..i * 8 + 4].try_into().unwrap());
+            let pi = i32::from_le_bytes(recv_buf[i * 8 + 4..i * 8 + 8].try_into().unwrap());
+            if pv > vals[i] {
+                vals[i] = pv;
+                ids[i] = pi;
+            }
+        }
+        Ok(())
+    }
+
     pub fn broadcast_u32(&mut self, val: &mut u32) -> std::io::Result<()> {
         let Some(ref mut s) = self.stream else {
             return Ok(());
@@ -112,6 +155,26 @@ impl Tp2Comm {
         } else {
             s.read_exact(&mut buf)?;
             *val = u32::from_le_bytes(buf);
+        }
+        Ok(())
+    }
+
+    pub fn broadcast_i32_vec(&mut self, data: &mut Vec<i32>) -> std::io::Result<()> {
+        let Some(ref mut s) = self.stream else {
+            return Ok(());
+        };
+        if self.rank == 0 {
+            let len = (data.len() as u32).to_le_bytes();
+            s.write_all(&len)?;
+            let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+            s.write_all(bytes)?;
+        } else {
+            let mut lbuf = [0u8; 4];
+            s.read_exact(&mut lbuf)?;
+            let n = u32::from_le_bytes(lbuf) as usize;
+            data.resize(n, 0);
+            let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+            s.read_exact(bytes)?;
         }
         Ok(())
     }
