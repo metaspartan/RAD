@@ -376,7 +376,6 @@ pub struct InklingEngine {
     rewind_graphs: std::collections::HashMap<(usize, usize), CapturedGraph>,
     multi_graphs: std::collections::HashMap<usize, CapturedGraph>,
     multi_verify_graphs: std::collections::HashMap<(usize, usize), CapturedGraph>,
-    multi_verify_flash_graphs: std::collections::HashMap<(Vec<i32>, usize), CapturedGraph>,
     pub pos: i32,
     pub seq_pos: Vec<i32>,
     pub seq_tokens: Vec<Vec<i32>>,
@@ -691,7 +690,6 @@ impl InklingEngine {
             rewind_graphs: std::collections::HashMap::new(),
             multi_graphs: std::collections::HashMap::new(),
             multi_verify_graphs: std::collections::HashMap::new(),
-            multi_verify_flash_graphs: std::collections::HashMap::new(),
             pos: 0,
             seq_pos: vec![0; max_seqs],
             seq_tokens: vec![Vec::new(); max_seqs],
@@ -2128,40 +2126,17 @@ impl InklingEngine {
         let tok_bytes = unsafe { std::slice::from_raw_parts(flat_toks.as_ptr() as *const u8, total_b * 4) };
         let seq_bytes = unsafe { std::slice::from_raw_parts(flat_seqs.as_ptr() as *const u8, total_b * 4) };
         let pos_bytes = unsafe { std::slice::from_raw_parts(flat_pos.as_ptr() as *const u8, total_b * 4) };
-        if k_len >= 16 {
-            let fkey = (seq_ids.to_vec(), k_len);
-            if !self.multi_verify_flash_graphs.contains_key(&fkey) && self.multi_verify_flash_graphs.len() < 16 {
-                let g = unsafe { CapturedGraph::capture(|s| self.enqueue_forward_ex_emb_m(s, total_b, true, None, k_len, false, Some(seq_ids))) }.map_err(he)?;
-                self.multi_verify_flash_graphs.insert(fkey.clone(), g);
-            }
-            if let Some(g) = self.multi_verify_flash_graphs.get(&fkey) {
-                self.bsc.d_toks.copy_from(tok_bytes, Some(g.stream)).map_err(he)?;
-                self.bsc.d_seq_ids.copy_from(seq_bytes, Some(g.stream)).map_err(he)?;
-                self.bsc.d_positions.copy_from(pos_bytes, Some(g.stream)).map_err(he)?;
-                g.launch().map_err(he)?;
-                g.sync().map_err(he)?;
-            } else {
-                self.bsc.d_toks.copy_from(tok_bytes, Some(self.stream)).map_err(he)?;
-                self.bsc.d_seq_ids.copy_from(seq_bytes, Some(self.stream)).map_err(he)?;
-                self.bsc.d_positions.copy_from(pos_bytes, Some(self.stream)).map_err(he)?;
-                unsafe {
-                    self.enqueue_forward_ex_emb_m(self.stream, total_b, true, None, k_len, false, Some(seq_ids));
-                    rad_hip::hipStreamSynchronize(self.stream);
-                }
-            }
-        } else {
-            let key = (n_users, k_len);
-            if !self.multi_verify_graphs.contains_key(&key) {
-                let g = unsafe { CapturedGraph::capture(|s| self.enqueue_forward_ex(s, total_b, true, None, k_len)) }.map_err(he)?;
-                self.multi_verify_graphs.insert(key, g);
-            }
-            let g = self.multi_verify_graphs.get(&key).unwrap();
-            self.bsc.d_toks.copy_from(tok_bytes, Some(g.stream)).map_err(he)?;
-            self.bsc.d_seq_ids.copy_from(seq_bytes, Some(g.stream)).map_err(he)?;
-            self.bsc.d_positions.copy_from(pos_bytes, Some(g.stream)).map_err(he)?;
-            g.launch().map_err(he)?;
-            g.sync().map_err(he)?;
+        let key = (n_users, k_len);
+        if !self.multi_verify_graphs.contains_key(&key) {
+            let g = unsafe { CapturedGraph::capture(|s| self.enqueue_forward_ex(s, total_b, true, None, k_len)) }.map_err(he)?;
+            self.multi_verify_graphs.insert(key, g);
         }
+        let g = self.multi_verify_graphs.get(&key).unwrap();
+        self.bsc.d_toks.copy_from(tok_bytes, Some(g.stream)).map_err(he)?;
+        self.bsc.d_seq_ids.copy_from(seq_bytes, Some(g.stream)).map_err(he)?;
+        self.bsc.d_positions.copy_from(pos_bytes, Some(g.stream)).map_err(he)?;
+        g.launch().map_err(he)?;
+        g.sync().map_err(he)?;
         let mut out_b = vec![0u8; total_b * 4];
         let rc = unsafe {
             rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, total_b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
@@ -2220,7 +2195,7 @@ impl InklingEngine {
         Ok(())
     }
 
-    unsafe fn enqueue_layer_batch_ex(&self, s: HipStream, il: usize, ip: usize, n_blocks: &mut usize, loop_idx: Option<usize>, b: usize, seq_opt: Option<usize>, multi_k: usize, multi_seqs: Option<&[i32]>) {
+    unsafe fn enqueue_layer_batch_ex(&self, s: HipStream, il: usize, ip: usize, n_blocks: &mut usize, loop_idx: Option<usize>, b: usize, seq_opt: Option<usize>, multi_k: usize, _multi_seqs: Option<&[i32]>) {
         let l = &self.layers[ip];
         let sl = &self.slots[il];
         let e = self.cfg.n_embd as i32;
@@ -2495,44 +2470,17 @@ impl InklingEngine {
                     sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
                 );
             }
-            if multi_k >= 16 {
-                if let Some(mseqs) = multi_seqs {
-                    let xq_row_bytes = (q_dim as usize / 32) * 40;
-                    for (u, &sid) in mseqs.iter().enumerate() {
-                        let seq = sid as usize;
-                        let seq_kv_off = seq * self.cfg.n_head_kv * sl.max_ctx * self.cfg.dh;
-                        let seq_sc_off = seq * self.cfg.n_head_kv * sl.max_ctx;
-                        let tok_off = u * multi_k;
-                        ops::ink_attn_b8_flash_q8_q8kv(
-                            s,
-                            q.add(tok_off * q_dim as usize),
-                            r.add(tok_off * r_dim as usize),
-                            sinks.add(tok_off * self.cfg.n_head),
-                            l.attn_rel_bias.ptr as *const f32,
-                            (sl.k_cache.ptr as *const i8).add(seq_kv_off),
-                            (sl.v_cache.ptr as *const i8).add(seq_kv_off),
-                            (ks.ptr as *const u16).add(seq_sc_off),
-                            (vs.ptr as *const u16).add(seq_sc_off),
-                            gate_out.add(tok_off * q_dim as usize),
-                            (self.bsc.d_positions.ptr as *const i32).add(tok_off),
-                            (self.bsc.xq.ptr as *mut u8).add(tok_off * xq_row_bytes) as *mut core::ffi::c_void,
-                            self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
-                            self.cfg.rel_extent as i32, sl.max_ctx as i32, multi_k as i32,
-                        );
-                    }
-                    attn_already_q8 = true;
-                } else {
-                    ops::ink_attn_multi_gated_q8_q8kv(
-                        s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
-                        sl.k_cache.ptr as *const i8, sl.v_cache.ptr as *const i8,
-                        ks.ptr as *const u16, vs.ptr as *const u16,
-                        gate_out, self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
-                        self.bsc.xq.ptr,
-                        self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
-                        self.cfg.rel_extent as i32, sl.max_ctx as i32, bi,
-                    );
-                    attn_already_q8 = true;
-                }
+            if multi_k >= 16 && self.cfg.n_head == self.cfg.n_head_kv * 3 && self.cfg.dh == 128 {
+                let n_users = (b / multi_k) as i32;
+                ops::ink_attn_multi_gated_flash_q8kv(
+                    s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
+                    sl.k_cache.ptr as *const i8, sl.v_cache.ptr as *const i8,
+                    ks.ptr as *const u16, vs.ptr as *const u16,
+                    gate_out, self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
+                    attn_out,
+                    self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                    self.cfg.rel_extent as i32, sl.max_ctx as i32, n_users, multi_k as i32,
+                );
             } else {
                 ops::ink_attn_multi_gated_q8_q8kv(
                     s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
@@ -2577,40 +2525,17 @@ impl InklingEngine {
                     sl.max_ctx as i32, self.cfg.qk_clip, self.cfg.rel_clip, self.cfg.log_floor, self.cfg.log_alpha,
                 );
             }
-            if multi_k >= 16 {
-                if let Some(mseqs) = multi_seqs {
-                    for (u, &sid) in mseqs.iter().enumerate() {
-                        let seq = sid as usize;
-                        let seq_kv_off = seq * self.cfg.n_head_kv * sl.max_ctx * self.cfg.dh;
-                        let tok_off = u * multi_k;
-                        ops::ink_attn_batch_gated_flash(
-                            s,
-                            q.add(tok_off * q_dim as usize),
-                            r.add(tok_off * r_dim as usize),
-                            sinks.add(tok_off * self.cfg.n_head),
-                            l.attn_rel_bias.ptr as *const f32,
-                            (sl.k_cache.ptr as *const u16).add(seq_kv_off),
-                            (sl.v_cache.ptr as *const u16).add(seq_kv_off),
-                            gate_out.add(tok_off * q_dim as usize),
-                            (self.bsc.d_positions.ptr as *const i32).add(tok_off),
-                            attn_out.add(tok_off * q_dim as usize),
-                            self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
-                            self.cfg.rel_extent as i32, self.cfg.swa_window as i32, if sl.is_swa { 1 } else { 0 },
-                            sl.max_ctx as i32, multi_k as i32,
-                        );
-                    }
-                } else {
-                    ops::ink_attn_multi_gated_q8(
-                        s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
-                        sl.k_cache.ptr as *const u16, sl.v_cache.ptr as *const u16,
-                        gate_out, self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
-                        self.bsc.xq.ptr,
-                        self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
-                        self.cfg.rel_extent as i32, self.cfg.swa_window as i32, if sl.is_swa { 1 } else { 0 },
-                        sl.max_ctx as i32, bi,
-                    );
-                    attn_already_q8 = true;
-                }
+            if multi_k >= 16 && self.cfg.n_head == self.cfg.n_head_kv * 3 && self.cfg.dh == 128 {
+                let n_users = (b / multi_k) as i32;
+                ops::ink_attn_multi_gated_flash(
+                    s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,
+                    sl.k_cache.ptr as *const u16, sl.v_cache.ptr as *const u16,
+                    gate_out, self.bsc.d_seq_ids.ptr as *const i32, self.bsc.d_positions.ptr as *const i32,
+                    attn_out,
+                    self.cfg.n_head as i32, self.cfg.n_head_kv as i32, self.cfg.dh as i32, self.cfg.d_rel as i32,
+                    self.cfg.rel_extent as i32, self.cfg.swa_window as i32, if sl.is_swa { 1 } else { 0 },
+                    sl.max_ctx as i32, n_users, multi_k as i32,
+                );
             } else {
                 ops::ink_attn_multi_gated_q8(
                     s, q, r, sinks, l.attn_rel_bias.ptr as *const f32,

@@ -1699,19 +1699,21 @@ extern "C" __global__ void loop_ctrl_up_wmma_k(const float* __restrict__ cur0,
     }
 }
 
-extern "C" __global__ void attn_batch_gqa3_flash_fp16_k(const float* __restrict__ Q,
-                                                        const float* __restrict__ R,
-                                                        const float* __restrict__ sinks,
-                                                        const float* __restrict__ rel_bias,
-                                                        const __half* __restrict__ k_cache,
-                                                        const __half* __restrict__ v_cache,
-                                                        const float* __restrict__ gate,
-                                                        const int* __restrict__ d_pos0,
-                                                        float* __restrict__ out,
-                                                        int n_head, int n_head_kv,
-                                                        int dh, int d_rel,
-                                                        int rel_extent, int swa_window,
-                                                        int is_swa, int max_ctx, int B) {
+template <bool MULTI>
+__global__ void attn_batch_gqa3_flash_fp16_t(const float* __restrict__ Q,
+                                             const float* __restrict__ R,
+                                             const float* __restrict__ sinks,
+                                             const float* __restrict__ rel_bias,
+                                             const __half* __restrict__ k_cache,
+                                             const __half* __restrict__ v_cache,
+                                             const float* __restrict__ gate,
+                                             const int* __restrict__ d_pos0,
+                                             const int* __restrict__ d_seq_ids,
+                                             float* __restrict__ out,
+                                             int n_head, int n_head_kv,
+                                             int dh, int d_rel,
+                                             int rel_extent, int swa_window,
+                                             int is_swa, int max_ctx, int B) {
     int kv_h = blockIdx.x;
     int bt_blk = (gridDim.y - 1 - blockIdx.y) * 64;
     int tid = threadIdx.x;
@@ -1722,9 +1724,25 @@ extern "C" __global__ void attn_batch_gqa3_flash_fp16_k(const float* __restrict_
     int qsub = wid / 3;
     int g = wid % 3;
     int h = kv_h * 3 + g;
-    int pos0 = *d_pos0;
     int q_dim = n_head * dh;
     int r_dim = n_head * d_rel;
+    int pos0;
+    if constexpr (MULTI) {
+        int tok_off = blockIdx.z * B;
+        int seq = d_seq_ids[tok_off];
+        pos0 = d_pos0[tok_off];
+        Q += (size_t)tok_off * q_dim;
+        R += (size_t)tok_off * r_dim;
+        sinks += (size_t)tok_off * n_head;
+        gate += (size_t)tok_off * q_dim;
+        out += (size_t)tok_off * q_dim;
+        size_t kv_seq_off = (size_t)seq * n_head_kv * max_ctx * dh;
+        k_cache += kv_seq_off;
+        v_cache += kv_seq_off;
+    } else {
+        (void)d_seq_ids;
+        pos0 = *d_pos0;
+    }
 
     int bt_q = bt_blk + qsub * 16 + col;
     bool vq = (bt_q < B);
@@ -2808,10 +2826,15 @@ extern "C" int ink_attn_b8_flash_q8(hipStream_t s, const float* Q, const float* 
 
 extern "C" int ink_attn_batch_gated_flash(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const __half* kc, const __half* vc, const float* gate, const int* d_pos0, float* out, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int swa_window, int is_swa, int max_ctx, int B) {
     if (n_head == n_head_kv * 3 && dh == 128) {
-        attn_batch_gqa3_flash_fp16_k<<<dim3(n_head_kv, (B + 63) / 64), dim3(384), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, out, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B);
+        attn_batch_gqa3_flash_fp16_t<false><<<dim3(n_head_kv, (B + 63) / 64), dim3(384), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, nullptr, out, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B);
         return 0;
     }
     attn_batch_gated_flash_k<<<dim3(n_head, (B + 63) / 64), dim3(128), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, gate, d_pos0, out, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, B);
+    return 0;
+}
+
+extern "C" int ink_attn_multi_gated_flash(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const __half* kc_pool, const __half* vc_pool, const float* gate, const int* d_seq_ids, const int* d_positions, float* out, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int swa_window, int is_swa, int max_ctx, int n_users, int K) {
+    attn_batch_gqa3_flash_fp16_t<true><<<dim3(n_head_kv, (K + 63) / 64, n_users), dim3(384), 0, s>>>(Q, R, sinks, rel_bias, kc_pool, vc_pool, gate, d_positions, d_seq_ids, out, n_head, n_head_kv, dh, d_rel, rel_extent, swa_window, is_swa, max_ctx, K);
     return 0;
 }
 

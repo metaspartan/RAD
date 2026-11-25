@@ -1322,20 +1322,22 @@ extern "C" __global__ void attn_decode_splitkv_reduce_q8kv_k(const float* __rest
     q8kv_store_q8_1(v, lane, out_q8 + h * 4 + wid, smq[wid]);
 }
 
-extern "C" __global__ void attn_batch_gqa3_flash_q8kv_k(const float* __restrict__ Q,
-                                                        const float* __restrict__ R,
-                                                        const float* __restrict__ sinks,
-                                                        const float* __restrict__ rel_bias,
-                                                        const int8_t* __restrict__ k_cache,
-                                                        const int8_t* __restrict__ v_cache,
-                                                        const __half* __restrict__ k_scale,
-                                                        const __half* __restrict__ v_scale,
-                                                        const float* __restrict__ gate,
-                                                        const int* __restrict__ d_pos0,
-                                                        float* __restrict__ out,
-                                                        int n_head, int n_head_kv,
-                                                        int dh, int d_rel,
-                                                        int rel_extent, int max_ctx, int B) {
+template <bool MULTI>
+__global__ void attn_batch_gqa3_flash_q8kv_t(const float* __restrict__ Q,
+                                             const float* __restrict__ R,
+                                             const float* __restrict__ sinks,
+                                             const float* __restrict__ rel_bias,
+                                             const int8_t* __restrict__ k_cache,
+                                             const int8_t* __restrict__ v_cache,
+                                             const __half* __restrict__ k_scale,
+                                             const __half* __restrict__ v_scale,
+                                             const float* __restrict__ gate,
+                                             const int* __restrict__ d_pos0,
+                                             const int* __restrict__ d_seq_ids,
+                                             float* __restrict__ out,
+                                             int n_head, int n_head_kv,
+                                             int dh, int d_rel,
+                                             int rel_extent, int max_ctx, int B) {
     int kv_h = blockIdx.x;
     int qb = blockIdx.y;
     int tid = threadIdx.x;
@@ -1346,9 +1348,27 @@ extern "C" __global__ void attn_batch_gqa3_flash_q8kv_k(const float* __restrict_
     int qsub = wid / 3;
     int g = wid % 3;
     int h = kv_h * 3 + g;
-    int pos0 = *d_pos0;
     int q_dim = n_head * dh;
     int r_dim = n_head * d_rel;
+    int pos0;
+    if constexpr (MULTI) {
+        int tok_off = blockIdx.z * B;
+        int seq = d_seq_ids[tok_off];
+        pos0 = d_pos0[tok_off];
+        Q += (size_t)tok_off * q_dim;
+        R += (size_t)tok_off * r_dim;
+        sinks += (size_t)tok_off * n_head;
+        gate += (size_t)tok_off * q_dim;
+        out += (size_t)tok_off * q_dim;
+        size_t sc_seq_off = (size_t)seq * n_head_kv * max_ctx;
+        k_cache += sc_seq_off * dh;
+        v_cache += sc_seq_off * dh;
+        k_scale += sc_seq_off;
+        v_scale += sc_seq_off;
+    } else {
+        (void)d_seq_ids;
+        pos0 = *d_pos0;
+    }
 
     int q_row = qb * 64 + qsub * 16 + col;
     bool vq = (q_row < B);
@@ -1980,10 +2000,15 @@ extern "C" int ink_attn_decode_gated_q8_q8kv(hipStream_t s, const float* Q, cons
 
 extern "C" int ink_attn_batch_gated_flash_q8kv(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const int8_t* kc, const int8_t* vc, const __half* ks, const __half* vs, const float* gate, const int* d_pos0, float* out, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int max_ctx, int B) {
     if (n_head == n_head_kv * 3 && dh == 128) {
-        attn_batch_gqa3_flash_q8kv_k<<<dim3(n_head_kv, (B + 63) / 64), dim3(384), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, gate, d_pos0, out, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B);
+        attn_batch_gqa3_flash_q8kv_t<false><<<dim3(n_head_kv, (B + 63) / 64), dim3(384), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, gate, d_pos0, nullptr, out, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B);
         return 0;
     }
     attn_batch_gated_flash_q8kv_k<<<dim3(n_head, (B + 63) / 64), dim3(128), 0, s>>>(Q, R, sinks, rel_bias, kc, vc, ks, vs, gate, d_pos0, out, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, B);
+    return 0;
+}
+
+extern "C" int ink_attn_multi_gated_flash_q8kv(hipStream_t s, const float* Q, const float* R, const float* sinks, const float* rel_bias, const int8_t* kc_pool, const int8_t* vc_pool, const __half* ks_pool, const __half* vs_pool, const float* gate, const int* d_seq_ids, const int* d_positions, float* out, int n_head, int n_head_kv, int dh, int d_rel, int rel_extent, int max_ctx, int n_users, int K) {
+    attn_batch_gqa3_flash_q8kv_t<true><<<dim3(n_head_kv, (K + 63) / 64, n_users), dim3(384), 0, s>>>(Q, R, sinks, rel_bias, kc_pool, vc_pool, ks_pool, vs_pool, gate, d_positions, d_seq_ids, out, n_head, n_head_kv, dh, d_rel, rel_extent, max_ctx, K);
     return 0;
 }
 
