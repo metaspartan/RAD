@@ -963,12 +963,12 @@ fn ngram_lookup_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<
         i -= 1;
     }
     if let Some(pos) = best_pos {
-        let cap_k = if best_len >= 6 {
+        let cap_k = if best_len >= 5 {
             max_k
-        } else if best_len >= 4 {
-            max_k.min(32)
+        } else if best_len == 4 {
+            max_k.min(64)
         } else {
-            max_k.min(16)
+            max_k.min(24)
         };
         let take = ngram_bucket_len((n - pos).min(cap_k));
         if take >= min_follow {
@@ -1213,8 +1213,6 @@ fn run_scheduler(
             continue;
         }
 
-        let any_grammar = active.iter().any(|a| a.grammar.is_some() || !a.sampling.is_greedy());
-
         if active.len() == 1 {
             if let Some(ref mut d) = drafter {
                 let seq = active[0].seq;
@@ -1243,6 +1241,9 @@ fn run_scheduler(
                                     let logits = engine.read_batch_logits(j)?;
                                     let pred = vocab_grammar.select_best_token(&logits, g);
                                     last_pred = pred;
+                                    if pred == 200006 || pred == 199999 {
+                                        break;
+                                    }
                                     if j + 1 < dk && pred == draft[j + 1] {
                                         n_acc += 1;
                                     } else {
@@ -1263,6 +1264,9 @@ fn run_scheduler(
                                         &mut slot.sampling,
                                     );
                                     last_pred = pred;
+                                    if pred == 200006 || pred == 199999 {
+                                        break;
+                                    }
                                     if j + 1 < dk && pred == draft[j + 1] {
                                         n_acc += 1;
                                     } else {
@@ -1272,6 +1276,9 @@ fn run_scheduler(
                             }
                         } else {
                             for j in 0..(dk - 1) {
+                                if verified[j] == 200006 || verified[j] == 199999 {
+                                    break;
+                                }
                                 if verified[j] == draft[j + 1] {
                                     n_acc += 1;
                                 } else {
@@ -1351,12 +1358,13 @@ fn run_scheduler(
             }
         }
 
-        if active.len() >= 1 && active.len() <= 16 && !any_grammar {
+        let any_grammar_only = active.iter().any(|a| a.grammar.is_some());
+        if active.len() >= 1 && active.len() <= 16 && !any_grammar_only {
             if let Some(ref mut d) = drafter {
                 let all_ready = active.iter().all(|a| a.seq < d.max_seqs() && d.seq_ctx_len(a.seq) == engine.seq_pos[a.seq]);
                 if all_ready {
                     let n_u = active.len();
-                    let max_user_k = (engine.multi_verify_cap / n_u).min(64);
+                    let max_user_k = (engine.multi_verify_cap / n_u).min(128);
                     let mut ng_drafts: Option<Vec<Vec<i32>>> = None;
                     if n_u >= 2 && max_user_k >= 8 {
                         let mut cands: Vec<Option<Vec<i32>>> = Vec::with_capacity(n_u);
@@ -1399,6 +1407,7 @@ fn run_scheduler(
                     } else {
                         4usize
                     };
+                    let any_sampling = active.iter().any(|a| !a.sampling.is_greedy());
                     let seq_ids: Vec<i32> = active.iter().map(|a| a.seq as i32).collect();
                     let anchors: Vec<i32> = active.iter().map(|a| a.next_tok).collect();
                     let pos_before: Vec<i32> = active.iter().map(|a| engine.seq_pos[a.seq]).collect();
@@ -1409,23 +1418,58 @@ fn run_scheduler(
                             None => d.draft_multi(&seq_ids, &anchors, &engine, multi_k)?,
                         };
                         let preds = engine.verify_multi(&seq_ids, &drafts)?;
+                        let topk_opt = if any_sampling {
+                            Some(engine.read_batch_topk64(n_u * multi_k)?)
+                        } else {
+                            None
+                        };
                         let mut emits = vec![0usize; active.len()];
                         let mut outs = Vec::with_capacity(active.len());
                         for u in 0..active.len() {
+                            let su = seq_ids[u] as usize;
                             let mut n_acc = 1usize;
-                            for j in 0..(multi_k - 1) {
-                                if preds[u][j] == drafts[u][j + 1] {
-                                    n_acc += 1;
-                                } else {
-                                    break;
+                            let mut last_pred = preds[u][0];
+                            if let (Some((ref tk_vals, ref tk_ids)), true) = (&topk_opt, !active[u].sampling.is_greedy()) {
+                                let seq_len = engine.seq_tokens[su].len();
+                                let mut recent: Vec<i32> = engine.seq_tokens[su][seq_len.saturating_sub(128)..].to_vec();
+                                for j in 0..multi_k {
+                                    recent.push(drafts[u][j]);
+                                    let off = (u * multi_k + j) * 64;
+                                    let pred = grammar::sample_from_topk(
+                                        &tk_vals[off..off + 64],
+                                        &tk_ids[off..off + 64],
+                                        &recent,
+                                        &mut active[u].sampling,
+                                    );
+                                    last_pred = pred;
+                                    if pred == 200006 || pred == 199999 {
+                                        break;
+                                    }
+                                    if j + 1 < multi_k && pred == drafts[u][j + 1] {
+                                        n_acc += 1;
+                                    } else {
+                                        break;
+                                    }
                                 }
+                            } else {
+                                for j in 0..(multi_k - 1) {
+                                    if preds[u][j] == 200006 || preds[u][j] == 199999 {
+                                        break;
+                                    }
+                                    if preds[u][j] == drafts[u][j + 1] {
+                                        n_acc += 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                last_pred = preds[u][n_acc - 1];
                             }
                             emits[u] = n_acc;
                             let mut tok_out = Vec::with_capacity(n_acc);
                             for j in 1..n_acc {
                                 tok_out.push(drafts[u][j]);
                             }
-                            tok_out.push(preds[u][n_acc - 1]);
+                            tok_out.push(last_pred);
                             outs.push(tok_out);
                         }
                         engine.rewind_verify_multi(&seq_ids, &emits, multi_k)?;
@@ -3107,7 +3151,7 @@ fn run_bench(opts: &CliOpts, tok_path: &str) -> anyhow::Result<()> {
                 let per_u = agg / b as f64;
                 println!("| Multi-User B={b} ({spec_mode} K={mk}) | {:.1} agg tok/s | {:.1} tok/s/user (ITL {:.1}ms) |", agg, per_u, 1000.0 / per_u);
 
-                let hk_max = (engine.multi_verify_cap / b).min(64);
+                let hk_max = (engine.multi_verify_cap / b).min(128);
                 if hk_max >= 16 {
                     let edit_txt = "pub struct KvCachePool {\n    pub blocks: Vec<KvBlock>,\n    pub free_list: Vec<usize>,\n    pub block_size: usize,\n    pub max_blocks: usize,\n    pub hits: u64,\n    pub misses: u64,\n}\nimpl KvCachePool {\n    pub fn with_capacity(max_blocks: usize, block_size: usize) -> Self {\n        let mut blocks = Vec::with_capacity(max_blocks);\n        let mut free_list = Vec::with_capacity(max_blocks);\n        for i in 0..max_blocks {\n            blocks.push(KvBlock::new(i));\n            free_list.push(max_blocks - 1 - i);\n        }\n        Self { blocks, free_list, block_size, max_blocks, hits: 0, misses: 0 }\n    }\n    pub fn alloc_block(&mut self) -> Option<usize> {\n        let id = self.free_list.pop()?;\n        self.blocks[id].ref_count = 1;\n        self.blocks[id].dirty = true;\n        Some(id)\n    }\n    pub fn free_block(&mut self, id: usize) {\n        if id < self.blocks.len() && self.blocks[id].release() {\n            self.blocks[id].dirty = false;\n            self.free_list.push(id);\n        }\n    }\n    pub fn used_blocks(&self) -> usize {\n        self.max_blocks.saturating_sub(self.free_list.len())\n    }\n    pub fn free_blocks(&self) -> usize {\n        self.free_list.len()\n    }\n    pub fn utilization(&self) -> f64 {\n        if self.max_blocks == 0 { 0.0 } else { self.used_blocks() as f64 / self.max_blocks as f64 }\n    }\n}\n";
                     let hp = format_prompt(

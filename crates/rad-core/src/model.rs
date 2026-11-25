@@ -376,6 +376,7 @@ pub struct InklingEngine {
     rewind_graphs: std::collections::HashMap<(usize, usize), CapturedGraph>,
     multi_graphs: std::collections::HashMap<usize, CapturedGraph>,
     multi_verify_graphs: std::collections::HashMap<(usize, usize), CapturedGraph>,
+    multi_verify_flash_graphs: std::collections::HashMap<(Vec<i32>, usize), CapturedGraph>,
     pub pos: i32,
     pub seq_pos: Vec<i32>,
     pub seq_tokens: Vec<Vec<i32>>,
@@ -598,8 +599,8 @@ impl InklingEngine {
             d_seq_ids: DevBuf::new(mb * 4).map_err(he)?,
             d_positions: DevBuf::new(mb * 4).map_err(he)?,
             d_out_toks: DevBuf::new(mb * 4).map_err(he)?,
-            topk_vals: DevBuf::new(128 * 64 * 4).map_err(he)?,
-            topk_ids: DevBuf::new(128 * 64 * 4).map_err(he)?,
+            topk_vals: DevBuf::new(multi_verify_cap.max(128) * 64 * 4).map_err(he)?,
+            topk_ids: DevBuf::new(multi_verify_cap.max(128) * 64 * 4).map_err(he)?,
             cur: DevBuf::new(mb * e * 4).map_err(he)?,
             ffn_inp: DevBuf::new(mb * e * 4).map_err(he)?,
             prelude: DevBuf::new(mb * e * 4).map_err(he)?,
@@ -686,6 +687,7 @@ impl InklingEngine {
             rewind_graphs: std::collections::HashMap::new(),
             multi_graphs: std::collections::HashMap::new(),
             multi_verify_graphs: std::collections::HashMap::new(),
+            multi_verify_flash_graphs: std::collections::HashMap::new(),
             pos: 0,
             seq_pos: vec![0; max_seqs],
             seq_tokens: vec![Vec::new(); max_seqs],
@@ -2103,7 +2105,7 @@ impl InklingEngine {
         assert_eq!(n_users, draft_tokens.len());
         assert!(n_users >= 1 && n_users <= 16);
         let k_len = draft_tokens[0].len();
-        assert!(k_len >= 1 && k_len <= 64);
+        assert!(k_len >= 1 && k_len <= 128);
         let total_b = n_users * k_len;
         assert!(total_b <= self.multi_verify_cap);
         let mut flat_toks = Vec::with_capacity(total_b);
@@ -2123,12 +2125,25 @@ impl InklingEngine {
         let seq_bytes = unsafe { std::slice::from_raw_parts(flat_seqs.as_ptr() as *const u8, total_b * 4) };
         let pos_bytes = unsafe { std::slice::from_raw_parts(flat_pos.as_ptr() as *const u8, total_b * 4) };
         if k_len >= 16 {
-            self.bsc.d_toks.copy_from(tok_bytes, Some(self.stream)).map_err(he)?;
-            self.bsc.d_seq_ids.copy_from(seq_bytes, Some(self.stream)).map_err(he)?;
-            self.bsc.d_positions.copy_from(pos_bytes, Some(self.stream)).map_err(he)?;
-            unsafe {
-                self.enqueue_forward_ex_emb_m(self.stream, total_b, true, None, k_len, false, Some(seq_ids));
-                rad_hip::hipStreamSynchronize(self.stream);
+            let fkey = (seq_ids.to_vec(), k_len);
+            if !self.multi_verify_flash_graphs.contains_key(&fkey) && self.multi_verify_flash_graphs.len() < 16 {
+                let g = unsafe { CapturedGraph::capture(|s| self.enqueue_forward_ex_emb_m(s, total_b, true, None, k_len, false, Some(seq_ids))) }.map_err(he)?;
+                self.multi_verify_flash_graphs.insert(fkey.clone(), g);
+            }
+            if let Some(g) = self.multi_verify_flash_graphs.get(&fkey) {
+                self.bsc.d_toks.copy_from(tok_bytes, Some(g.stream)).map_err(he)?;
+                self.bsc.d_seq_ids.copy_from(seq_bytes, Some(g.stream)).map_err(he)?;
+                self.bsc.d_positions.copy_from(pos_bytes, Some(g.stream)).map_err(he)?;
+                g.launch().map_err(he)?;
+                g.sync().map_err(he)?;
+            } else {
+                self.bsc.d_toks.copy_from(tok_bytes, Some(self.stream)).map_err(he)?;
+                self.bsc.d_seq_ids.copy_from(seq_bytes, Some(self.stream)).map_err(he)?;
+                self.bsc.d_positions.copy_from(pos_bytes, Some(self.stream)).map_err(he)?;
+                unsafe {
+                    self.enqueue_forward_ex_emb_m(self.stream, total_b, true, None, k_len, false, Some(seq_ids));
+                    rad_hip::hipStreamSynchronize(self.stream);
+                }
             }
         } else {
             let key = (n_users, k_len);
