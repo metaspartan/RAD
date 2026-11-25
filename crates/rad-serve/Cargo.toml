@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 rad-core = { path = "../rad-core" }
 rad-hip = { path = "../rad-hip" }
+rad-http = { path = "../rad-http" }
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"

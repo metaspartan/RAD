@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rad-http",
     "crates/rad-hip",
     "crates/rad-gguf",
     "crates/rad-core",

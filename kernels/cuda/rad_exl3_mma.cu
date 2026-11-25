@@ -685,7 +685,7 @@ extern "C" {
 
 void rad_cuda_moe_init_meta(void) {
     if (!g_moe_meta) {
-        cudaMalloc(&g_moe_meta, 2048 * sizeof(int));
+        cudaMalloc(&g_moe_meta, 4096 * sizeof(int));
     }
 }
 
@@ -711,15 +711,15 @@ void rad_cuda_exl3_moe_mma_f16(
 ) {
     int n_blocks = N / 128;
     int pairs = M * top_k;
-    if (M >= 2 && pairs <= 512 && n_local_experts <= 256) {
+    if (M >= 2 && pairs <= 1024 && n_local_experts <= 256) {
         if (!g_moe_meta) {
-            cudaMalloc(&g_moe_meta, 2048 * sizeof(int));
+            cudaMalloc(&g_moe_meta, 4096 * sizeof(int));
         }
         int* d_sorted = g_moe_meta;
-        int* d_eids = g_moe_meta + 512;
-        int* d_offs = g_moe_meta + 1024;
-        int* d_lens = g_moe_meta + 1536;
-        int* d_ng = g_moe_meta + 2047;
+        int* d_eids = g_moe_meta + 1024;
+        int* d_offs = g_moe_meta + 2048;
+        int* d_lens = g_moe_meta + 3072;
+        int* d_ng = g_moe_meta + 4095;
         if (!reuse_groups) {
             moe_build_groups_k<<<1, 1, 0, stream>>>(
                 expert_ids, pairs, expert_start, n_local_experts,

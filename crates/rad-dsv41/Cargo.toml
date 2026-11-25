@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 rad-cuda = { path = "../rad-cuda" }
+rad-http = { path = "../rad-http" }
 anyhow = "1"
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }

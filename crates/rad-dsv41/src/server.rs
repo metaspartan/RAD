@@ -4,6 +4,11 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+pub use rad_http::RadMetrics;
+use rad_http::{
+    apply_common_layers, check_api_key, extract_content_str, now_unix, parse_reasoning_effort,
+    ping_handler, prometheus_response, unauthorized_response, version_handler, ChatTemplateKwargs,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -19,6 +24,7 @@ pub struct ServerState {
     pub api_keys: Vec<String>,
     pub max_ctx: usize,
     pub world_size: usize,
+    pub metrics: Arc<RadMetrics>,
     pub job_tx: mpsc::UnboundedSender<ServeJob>,
 }
 
@@ -34,12 +40,6 @@ pub enum ServeEvent {
     Error(String),
 }
 
-#[derive(Deserialize, Default)]
-pub struct ChatTemplateKwargs {
-    pub enable_thinking: Option<bool>,
-    pub reasoning_effort: Option<Value>,
-}
-
 #[derive(Deserialize)]
 pub struct ChatReq {
     pub model: Option<String>,
@@ -53,47 +53,6 @@ pub struct ChatReq {
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
-fn parse_reasoning_effort(v: Option<&Value>) -> u32 {
-    match v {
-        Some(Value::Number(n)) => n.as_u64().unwrap_or(50).clamp(1, 100) as u32,
-        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
-            "none" | "minimal" => 10,
-            "low" => 25,
-            "medium" => 50,
-            "high" => 85,
-            "max" => 100,
-            other => other.parse::<u32>().unwrap_or(50).clamp(1, 100),
-        },
-        _ => 50,
-    }
-}
-
-fn check_auth(headers: &HeaderMap, keys: &[String]) -> bool {
-    if keys.is_empty() {
-        return true;
-    }
-    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(tok) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
-            if keys.iter().any(|k| k == tok.trim()) {
-                return true;
-            }
-        }
-    }
-    if let Some(k) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        if keys.iter().any(|ak| ak == k.trim()) {
-            return true;
-        }
-    }
-    false
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 async fn health(State(st): State<Arc<ServerState>>) -> Json<Value> {
     Json(json!({
         "status": "ok",
@@ -104,9 +63,13 @@ async fn health(State(st): State<Arc<ServerState>>) -> Json<Value> {
     }))
 }
 
+async fn metrics(State(st): State<Arc<ServerState>>) -> Response {
+    prometheus_response(st.metrics.render_prometheus(&st.model_name, st.max_ctx))
+}
+
 async fn models(State(st): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &st.api_keys) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+    if !check_api_key(&headers, &st.api_keys) {
+        return unauthorized_response();
     }
     Json(json!({
         "object": "list",
@@ -118,23 +81,6 @@ async fn models(State(st): State<Arc<ServerState>>, headers: HeaderMap) -> Respo
         }]
     }))
     .into_response()
-}
-
-fn extract_content_str(m: &Value) -> String {
-    match m.get("content") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => {
-            let mut s = String::new();
-            for item in arr {
-                if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
-                    s.push_str(t);
-                }
-            }
-            s
-        }
-        Some(v) if !v.is_null() => v.to_string(),
-        _ => String::new(),
-    }
 }
 
 pub fn format_dsv41_prompt(
@@ -324,8 +270,8 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(req): Json<ChatReq>,
 ) -> Response {
-    if !check_auth(&headers, &st.api_keys) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+    if !check_api_key(&headers, &st.api_keys) {
+        return unauthorized_response();
     }
     let model_id = req.model.unwrap_or_else(|| st.model_name.clone());
     let max_tokens = req.max_tokens.or(req.max_completion_tokens).unwrap_or(2048).min(32768);
@@ -347,7 +293,9 @@ async fn chat_completions(
     let created = now_unix();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
+    st.metrics.requests_queued.fetch_add(1, Ordering::Relaxed);
     if st.job_tx.send(ServeJob { prompt, max_tokens, tx }).is_err() {
+        st.metrics.requests_queued.fetch_sub(1, Ordering::Relaxed);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "engine closed"}))).into_response();
     }
 
@@ -519,11 +467,19 @@ async fn chat_completions(
 }
 
 pub fn build_router(state: Arc<ServerState>) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat_completions))
-        .with_state(state)
+    apply_common_layers(
+        Router::new()
+            .route("/health", get(health))
+            .route("/ping", get(ping_handler))
+            .route("/ready", get(ping_handler))
+            .route("/live", get(ping_handler))
+            .route("/version", get(version_handler))
+            .route("/metrics", get(metrics))
+            .route("/models", get(models))
+            .route("/v1/models", get(models))
+            .route("/v1/chat/completions", post(chat_completions)),
+    )
+    .with_state(state)
 }
 
 #[cfg(test)]

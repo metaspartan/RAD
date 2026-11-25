@@ -208,23 +208,7 @@ pub(crate) fn ngram_lookup_draft(history: &[i32], anchor: i32, max_k: usize) -> 
 
 pub(crate) fn detect_degenerate_cycle(seq_tokens: &[i32], emitted: usize) -> bool {
     let gen_n = emitted.min(seq_tokens.len());
-    if gen_n < 48 {
-        return false;
-    }
-    let tail = &seq_tokens[seq_tokens.len() - gen_n..];
-    for p in 1..=8usize {
-        let min_reps = if p == 1 { 48 } else if p <= 4 { 24 } else { 16 };
-        let need = p * min_reps;
-        if gen_n < need {
-            continue;
-        }
-        let win = &tail[gen_n - need..];
-        let pat = &win[need - p..];
-        if win.chunks_exact(p).all(|c| c == pat) {
-            return true;
-        }
-    }
-    false
+    rad_http::detect_degenerate_cycle(&seq_tokens[seq_tokens.len() - gen_n..])
 }
 
 pub(crate) fn sync_kv_metrics(engine: &InklingEngine, metrics: &metrics::Metrics) {

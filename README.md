@@ -105,8 +105,17 @@ First CUDA backend (`rad-cuda` + `rad-dsv41`) running **DeepSeek-V4.1-Flash-1017
 | **MoE Router (`384` experts, `sqrtsoftplus`, `top_k=6`)** | **66 us** (**6.6x** speedup) | Vectorized `half2` logits + parallel 256-thread top-K (`rad_dsv41_router.cu`) |
 | **GPU-Grouped MoE Tensor Core MMA (`M=2..64`)** | **2.04x** prefill / **1.90x** verify | Expert-grouped `mma.sync.aligned.m16n8k16` (`rad_exl3_mma.cu`), **100% bit-exact** `M=1` vs `M=4` parity |
 | **Live 40-Layer TP=2 RDMA TTFT & Prefix Cache** | **73.7 ms** cached / **191.7 ms** cold | Beats `267.2 ms` vLLM baseline; multi-turn KV prefix caching (`lcp`, **47x** cached TTFT speedup) + full-context CSA2 compressed KV (`layers.2, 8, 14, 20`) |
-| **Live 40-Layer TP=2 RDMA Pure Gen (`DSpark MTP` + CUDA Graphs)** | **58.5 tok/s** code (**86.6 tok/s** peak) | `Math=46.3 tok/s`, `Prose=23.7 tok/s`; `M=1/6/64` QKV/WO/FFN CUDA Graphs (`68.2 ms` avg `M=6` verify, `8.5 ms` 3-layer DSpark MTP + Markov head), register-resident `half2` MQA |
-| **Live 40-Layer TP=2 RDMA Hybrid (`K=64` Verbatim Edit)** | **130.6–217+ tok/s** | `acc=64/64` in `275–290 ms` (`217–230 tok/s` copy phase); exact pipelined mHC, transposed Sinkhorn, per-layer 10K/160K YaRN RoPE, `<think>` / `reasoning_effort` & DSML tool calls |
+| **Live 40-Layer TP=2 RDMA Pure Gen (`DSpark MTP` + CUDA Graphs)** | **61.8 tok/s** code (**86.6 tok/s** peak) | `Math=46.3 tok/s`, `Prose=23.7 tok/s`; `M=1/6/64/128` QKV/WO/FFN + 3-layer MTP CUDA Graphs (`68.2 ms` avg `M=6` verify), register-resident `half2` MQA |
+| **Live 40-Layer TP=2 RDMA Hybrid (`K=128` Verbatim Edit)** | **159.0–217+ tok/s** | `M=128` prefill (**21.5%** faster), `acc=64/64` in `275–290 ms`; exact pipelined mHC, transposed Sinkhorn, per-layer 10K/160K YaRN RoPE, `<think>` / `reasoning_effort`, shared `rad-http` Prometheus `/metrics`, & DSML tool calls |
+
+### Supported Models & Weights
+
+| Model | Format / Quants | HuggingFace Weights |
+| --- | --- | --- |
+| **Inkling-2-Mini** (R9700, ROCm/HIP) | GGUF (`Q4_K_XL` / `Q8_0`) + DFlash 2 + Vision | [Inkling-2-Mini-GGUF](https://huggingface.co/incoai/Inkling-2-Mini-GGUF) · [Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) |
+| **DeepSeek-V4.1-Flash-1017 (Regular)** (2x DGX Spark, CUDA) | EXL3 `mul1` 2.90 bpw (39 shards, DSpark MTP included) | [LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) |
+| **DeepSeek-V4.1-Flash-1017 (Abliterated / EAQ v1)** (2x DGX Spark, CUDA) | EXL3 `mul1` 2.90 bpw (39 shards, 4-bit MTP) | `deepseek-ai/DeepSeek-V4.1-Flash-1017` EAQ v1 EXL3 2.90 bpw (`--model <exl3_dir>`) |
+| **DeepSeek-V4.1-Flash-1017 Engram Tables** (Optional) | Native FP8 E4M3 (shards 47 & 48, ~190 GiB) | [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (`--engram-dir <dir>`) |
 
 ---
 

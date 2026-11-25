@@ -14,8 +14,9 @@ use engine::Dsv41Engine;
 use rad_cuda::comm::Tp2Comm;
 use rad_cuda::{CudaBuf, CudaFail};
 use safetensors::SafetensorsIndex;
-use server::{build_router, format_dsv41_prompt, ServeEvent, ServeJob, ServerState};
+use server::{build_router, format_dsv41_prompt, RadMetrics, ServeEvent, ServeJob, ServerState};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tokenizers::Tokenizer;
@@ -313,36 +314,6 @@ fn run_prompt(cli: &Cli, prompt_text: &str, comm: &mut Tp2Comm) -> Result<()> {
     Ok(())
 }
 
-fn detect_degenerate_cycle(tokens: &[u32]) -> bool {
-    let n = tokens.len();
-    if n < 48 {
-        return false;
-    }
-    for p in 1..=64usize {
-        let min_reps = if p == 1 {
-            32
-        } else if p <= 4 {
-            16
-        } else if p <= 8 {
-            10
-        } else if p <= 16 {
-            6
-        } else {
-            4
-        };
-        let need = p * min_reps;
-        if n < need {
-            continue;
-        }
-        let win = &tokens[n - need..];
-        let pat = &win[need - p..];
-        if win.chunks_exact(p).all(|c| c == pat) {
-            return true;
-        }
-    }
-    false
-}
-
 fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
     let t_load = Instant::now();
     let world_size = comm.world_size();
@@ -386,16 +357,21 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
         }
     }
 
+    let metrics = Arc::new(RadMetrics::default());
+    let m_worker = metrics.clone();
     let (job_tx, mut job_rx) = mpsc::unbounded_channel::<ServeJob>();
     std::thread::spawn(move || {
         let mut cached_seq: Vec<i32> = Vec::new();
         while let Some(job) = job_rx.blocking_recv() {
+            m_worker.requests_queued.fetch_sub(1, Ordering::Relaxed);
             if job.tx.is_closed() {
                 continue;
             }
+            m_worker.requests_active.fetch_add(1, Ordering::Relaxed);
             let enc = match tok.encode(job.prompt, false) {
                 Ok(e) => e,
                 Err(e) => {
+                    m_worker.requests_active.fetch_sub(1, Ordering::Relaxed);
                     let _ = job.tx.send(ServeEvent::Error(format!("{e}")));
                     continue;
                 }
@@ -403,6 +379,7 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
             let p_ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
             let prompt_n = p_ids.len();
             if prompt_n >= eng.max_ctx {
+                m_worker.requests_active.fetch_sub(1, Ordering::Relaxed);
                 let _ = job.tx.send(ServeEvent::Error(format!(
                     "prompt length {prompt_n} exceeds max_ctx {}",
                     eng.max_ctx
@@ -414,6 +391,12 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
             while lcp < max_lcp && cached_seq[lcp] == p_ids[lcp] {
                 lcp += 1;
             }
+            m_worker.prompt_tokens.fetch_add(prompt_n as u64, Ordering::Relaxed);
+            m_worker.prefix_cache_queries.fetch_add(1, Ordering::Relaxed);
+            if lcp > 0 {
+                m_worker.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
+                m_worker.cached_prompt_tokens.fetch_add(lcp as u64, Ordering::Relaxed);
+            }
             eng.pos = lcp;
             let mut pcmd = 3u32;
             let _ = comm.broadcast_u32(&mut pcmd);
@@ -421,14 +404,20 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
             let _ = comm.broadcast_u32(&mut pval);
             let mut crow = 0u32;
             let _ = comm.broadcast_u32(&mut crow);
+            let t_pre = Instant::now();
             let mut next_tok = match eng.prefill_tokens(&p_ids[lcp..], &mut comm) {
                 Ok(t) => t,
                 Err(e) => {
                     cached_seq.clear();
+                    m_worker.requests_active.fetch_sub(1, Ordering::Relaxed);
                     let _ = job.tx.send(ServeEvent::Error(format!("{e}")));
                     continue;
                 }
             };
+            m_worker.ttft_us_sum.fetch_add(t_pre.elapsed().as_micros() as u64, Ordering::Relaxed);
+            m_worker.ttft_count.fetch_add(1, Ordering::Relaxed);
+            m_worker.kv_pos.store(eng.pos as u64, Ordering::Relaxed);
+            let t_dec = Instant::now();
             let mut history = p_ids;
             let mut gen_ids: Vec<u32> = Vec::new();
             let mut prev_str = String::new();
@@ -439,6 +428,7 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                     break;
                 }
                 gen_ids.push(next_tok as u32);
+                m_worker.generated_tokens.fetch_add(1, Ordering::Relaxed);
                 if let Ok(cur) = tok.decode(&gen_ids, true) {
                     if cur.len() > prev_str.len() && cur.is_char_boundary(prev_str.len()) {
                         let delta = cur[prev_str.len()..].to_string();
@@ -451,8 +441,16 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                 }
                 let res = eng.step_speculative(&history, next_tok, &mut comm);
                 history.push(next_tok);
+                m_worker.kv_pos.store(eng.pos as u64, Ordering::Relaxed);
                 match res {
                     Ok(accepted) => {
+                        let drafted = eng.last_draft_len.saturating_sub(1);
+                        if drafted > 0 {
+                            let acc_draft = accepted.len().saturating_sub(1);
+                            m_worker.spec_drafted.fetch_add(drafted as u64, Ordering::Relaxed);
+                            m_worker.spec_accepted.fetch_add(acc_draft as u64, Ordering::Relaxed);
+                            m_worker.spec_rounds.fetch_add(1, Ordering::Relaxed);
+                        }
                         let last = *accepted.last().unwrap_or(&eos);
                         let mut stopped = false;
                         for &a in &accepted[..accepted.len().saturating_sub(1)] {
@@ -462,6 +460,7 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                                 break;
                             }
                             gen_ids.push(a as u32);
+                            m_worker.generated_tokens.fetch_add(1, Ordering::Relaxed);
                             history.push(a);
                             if let Ok(cur) = tok.decode(&gen_ids, true) {
                                 if cur.len() > prev_str.len() && cur.is_char_boundary(prev_str.len()) {
@@ -475,7 +474,7 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                                 }
                             }
                         }
-                        if stopped || detect_degenerate_cycle(&gen_ids) {
+                        if stopped || rad_http::detect_degenerate_cycle(&gen_ids) {
                             finish_reason = "stop";
                             break;
                         }
@@ -487,6 +486,14 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                     }
                 }
             }
+            if gen_ids.len() > 1 {
+                m_worker.decode_us_sum.fetch_add(t_dec.elapsed().as_micros() as u64, Ordering::Relaxed);
+                m_worker.decode_count.fetch_add(1, Ordering::Relaxed);
+                m_worker.req_gen_tokens_sum.fetch_add(gen_ids.len() as u64, Ordering::Relaxed);
+                m_worker.req_gen_tokens_count.fetch_add(1, Ordering::Relaxed);
+            }
+            m_worker.requests_completed.fetch_add(1, Ordering::Relaxed);
+            m_worker.requests_active.fetch_sub(1, Ordering::Relaxed);
             cached_seq = history;
             let _ = job.tx.send(ServeEvent::Done {
                 prompt_n,
@@ -501,6 +508,7 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
         api_keys,
         max_ctx: cli.max_ctx,
         world_size,
+        metrics,
         job_tx,
     });
     let app = build_router(state);
