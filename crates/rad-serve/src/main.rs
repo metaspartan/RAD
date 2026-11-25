@@ -372,6 +372,10 @@ struct ChatRequest {
     #[serde(default)]
     top_p: Option<f32>,
     #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
     repetition_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
@@ -415,6 +419,10 @@ struct CompletionRequest {
     #[serde(default)]
     top_p: Option<f32>,
     #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
     stop: Option<StopInput>,
 }
 
@@ -435,6 +443,10 @@ struct AnthropicMessagesRequest {
     temperature: Option<f32>,
     #[serde(default)]
     top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    min_p: Option<f32>,
     #[serde(default)]
     stop_sequences: Option<Vec<String>>,
     #[serde(default)]
@@ -644,18 +656,25 @@ fn format_prompt_with_tools(
                     }
                 }
                 let has_tcs = m.tool_calls.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
-                let first_inline_tc = m
+                let first_cached_tc = m
                     .tool_calls
                     .as_ref()
                     .and_then(|v| v.first())
                     .and_then(|tc| tc.get("id"))
                     .and_then(|v| v.as_str())
-                    .and_then(grammar::lookup_raw_tool_call)
-                    .filter(|r| r.inline_after_text);
-                if first_inline_tc.is_none() && (!txt.is_empty() || !has_tcs || !enable_thinking) {
-                    s.push_str("<|message_model|><|content_text|>");
-                    s.push_str(&txt);
-                    s.push_str("<|end_message|>");
+                    .and_then(grammar::lookup_raw_tool_call);
+                let first_inline_tc = first_cached_tc.as_ref().filter(|r| r.inline_after_text);
+                if first_inline_tc.is_none() {
+                    let eff_txt = if txt.is_empty() {
+                        first_cached_tc.as_ref().map(|r| r.raw_prefix_text.as_str()).unwrap_or("")
+                    } else {
+                        txt.as_str()
+                    };
+                    if !eff_txt.is_empty() || !has_tcs || !enable_thinking {
+                        s.push_str("<|message_model|><|content_text|>");
+                        s.push_str(eff_txt);
+                        s.push_str("<|end_message|>");
+                    }
                 }
                 if let Some(ref tcs) = m.tool_calls {
                     for (tc_idx, tc) in tcs.iter().enumerate() {
@@ -2311,21 +2330,17 @@ async fn chat_completions(
     let extra_pen = req.presence_penalty.unwrap_or(0.0).max(req.frequency_penalty.unwrap_or(0.0)).clamp(0.0, 2.0);
     let eff_rep = req.repetition_penalty.unwrap_or_else(|| if extra_pen > 1e-4 { 1.0 + 0.15 * extra_pen } else { 1.0 });
     let loop_detected = detect_repeated_tool_loop(&req.messages);
-    let mut sampling = grammar::SamplingParams::greedy();
+    let mut sampling = grammar::SamplingParams {
+        temperature: req.temperature.unwrap_or(0.0).max(0.0),
+        top_p: req.top_p.unwrap_or(0.95).clamp(0.0, 1.0),
+        top_k: req.top_k.unwrap_or(0),
+        min_p: req.min_p.unwrap_or(0.0).clamp(0.0, 1.0),
+        repetition_penalty: eff_rep,
+        seed: base_seed,
+    };
     if loop_detected {
-        sampling = grammar::SamplingParams {
-            temperature: req.temperature.unwrap_or(0.7).max(0.5),
-            top_p: req.top_p.unwrap_or(0.95),
-            repetition_penalty: eff_rep.max(1.15),
-            seed: base_seed,
-        };
-    } else if (eff_rep - 1.0).abs() > 1e-4 {
-        sampling = grammar::SamplingParams {
-            temperature: req.temperature.unwrap_or(0.0),
-            top_p: req.top_p.unwrap_or(0.95),
-            repetition_penalty: eff_rep,
-            seed: base_seed,
-        };
+        sampling.temperature = sampling.temperature.max(0.5);
+        sampling.repetition_penalty = sampling.repetition_penalty.max(1.15);
     }
 
     let (mut prompt, images, allowed_tools) = format_prompt_with_tools(&req.messages, req.tools.as_deref(), initial_thinking);
@@ -2397,17 +2412,39 @@ async fn chat_completions(
             let mut tc_index = 0usize;
             let mut prompt_n_sse = 0usize;
             let mut cached_n_sse = 0usize;
+            let mut text_acc = String::new();
+            let mut pred_n_sse = 0usize;
             while let Some(ev) = rx.recv().await {
+                if sse_tx.is_closed() {
+                    break;
+                }
                 match ev {
                     GenEvent::Prefill { prompt_n, cached_n, .. } => {
                         prompt_n_sse = prompt_n;
                         cached_n_sse = cached_n;
                     }
                     GenEvent::Token(t) => {
+                        pred_n_sse += 1;
                         let deltas = parser.push_token(t, &tok);
+                        let mut hit_stop = false;
                         for d in deltas {
                             let d_obj = match d {
-                                grammar::StreamDelta::Text(s) => {
+                                grammar::StreamDelta::Text(mut s) => {
+                                    if !stop_seqs.is_empty() {
+                                        let prev_len = text_acc.len();
+                                        text_acc.push_str(&s);
+                                        if let Some(pos) = stop_seqs.iter().filter(|st| !st.is_empty()).filter_map(|st| text_acc.find(st.as_str())).min() {
+                                            hit_stop = true;
+                                            if pos > prev_len {
+                                                s = text_acc[prev_len..pos].to_string();
+                                            } else {
+                                                s.clear();
+                                            }
+                                        }
+                                    }
+                                    if s.is_empty() && hit_stop {
+                                        break;
+                                    }
                                     if !sent_role {
                                         sent_role = true;
                                         json!({"role": "assistant", "content": s})
@@ -2450,7 +2487,40 @@ async fn chat_completions(
                                 "model": model_id,
                                 "choices": [{"index": 0, "delta": d_obj, "finish_reason": null}]
                             });
-                            let _ = sse_tx.send(Ok(Event::default().data(chunk.to_string())));
+                            if sse_tx.send(Ok(Event::default().data(chunk.to_string()))).is_err() {
+                                return;
+                            }
+                            if hit_stop {
+                                break;
+                            }
+                        }
+                        if hit_stop {
+                            let done_chunk = json!({
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                            });
+                            let _ = sse_tx.send(Ok(Event::default().data(done_chunk.to_string())));
+                            if include_usage {
+                                let usage_chunk = json!({
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [],
+                                    "usage": {
+                                        "prompt_tokens": prompt_n_sse,
+                                        "completion_tokens": pred_n_sse,
+                                        "total_tokens": prompt_n_sse + pred_n_sse,
+                                        "prompt_tokens_details": {"cached_tokens": cached_n_sse}
+                                    }
+                                });
+                                let _ = sse_tx.send(Ok(Event::default().data(usage_chunk.to_string())));
+                            }
+                            let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+                            break;
                         }
                     }
                     GenEvent::Done { finish_reason, pred_n, .. } => {
@@ -2609,6 +2679,8 @@ async fn completions(
     let mut sampling = grammar::SamplingParams::greedy();
     if let Some(t) = req.temperature { sampling.temperature = t.max(0.0); }
     if let Some(p) = req.top_p { sampling.top_p = p.clamp(0.0, 1.0); }
+    if let Some(k) = req.top_k { sampling.top_k = k; }
+    if let Some(mp) = req.min_p { sampling.min_p = mp.clamp(0.0, 1.0); }
     let prompts: Vec<String> = match req.prompt {
         PromptInput::Single(s) => vec![s],
         PromptInput::Batch(v) => v,
@@ -2640,6 +2712,9 @@ async fn completions(
             let mut out_ids: Vec<u32> = Vec::new();
             let mut prev_str = String::new();
             while let Some(ev) = rx.recv().await {
+                if sse_tx.is_closed() {
+                    break;
+                }
                 match ev {
                     GenEvent::Prefill { prompt_n: pn, cached_n: cn, .. } => {
                         prompt_n = pn;
@@ -2658,10 +2733,12 @@ async fn completions(
                                 let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
                                 break;
                             }
-                            let _ = sse_tx.send(Ok(Event::default().data(json!({
+                            if sse_tx.send(Ok(Event::default().data(json!({
                                 "id": req_id, "object": "text_completion", "created": created, "model": model_id,
                                 "choices": [{"index": 0, "text": delta, "finish_reason": serde_json::Value::Null}]
-                            }).to_string())));
+                            }).to_string()))).is_err() {
+                                break;
+                            }
                             prev_str = cur;
                         }
                     }
@@ -2920,6 +2997,8 @@ async fn anthropic_messages(
     let mut sampling = grammar::SamplingParams::greedy();
     if let Some(t) = req.temperature { sampling.temperature = t.max(0.0); }
     if let Some(p) = req.top_p { sampling.top_p = p.clamp(0.0, 1.0); }
+    if let Some(k) = req.top_k { sampling.top_k = k; }
+    if let Some(mp) = req.min_p { sampling.min_p = mp.clamp(0.0, 1.0); }
     let (msgs, oai_tools, enable_thinking) = convert_anthropic_request(&req);
     let (prompt, images, allowed_tools) = format_prompt_with_tools(&msgs, oai_tools.as_deref(), enable_thinking);
     let enc = match st.tokenizer.encode(prompt, false) {
@@ -2950,11 +3029,16 @@ async fn anthropic_messages(
             let mut think_open = false;
             let mut saw_tool = false;
             let mut started_msg = false;
+            let mut text_acc = String::new();
+            let mut pred_n_anth = 0usize;
             while let Some(ev) = rx.recv().await {
+                if sse_tx.is_closed() {
+                    break;
+                }
                 match ev {
                     GenEvent::Prefill { prompt_n, cached_n, .. } => {
                         started_msg = true;
-                        let _ = sse_tx.send(Ok(Event::default().event("message_start").data(json!({
+                        if sse_tx.send(Ok(Event::default().event("message_start").data(json!({
                             "type": "message_start",
                             "message": {
                                 "id": msg_id,
@@ -2970,44 +3054,67 @@ async fn anthropic_messages(
                                     "output_tokens": 0
                                 }
                             }
-                        }).to_string())));
+                        }).to_string()))).is_err() {
+                            break;
+                        }
                     }
                     GenEvent::Token(t) => {
+                        pred_n_anth += 1;
                         if !started_msg {
                             started_msg = true;
-                            let _ = sse_tx.send(Ok(Event::default().event("message_start").data(json!({
+                            if sse_tx.send(Ok(Event::default().event("message_start").data(json!({
                                 "type": "message_start",
                                 "message": {"id": msg_id, "type": "message", "role": "assistant", "model": model_id, "content": [], "stop_reason": serde_json::Value::Null, "usage": {"input_tokens": 0, "output_tokens": 0}}
-                            }).to_string())));
+                            }).to_string()))).is_err() {
+                                break;
+                            }
                         }
+                        let mut hit_stop_seq: Option<String> = None;
                         for d in parser.push_token(t, &tok) {
                             match d {
                                 grammar::StreamDelta::Reasoning(delta) => {
                                     if !think_open {
                                         think_open = true;
-                                        let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(json!({
+                                        if sse_tx.send(Ok(Event::default().event("content_block_start").data(json!({
                                             "type": "content_block_start", "index": block_idx, "content_block": {"type": "thinking", "thinking": ""}
-                                        }).to_string())));
+                                        }).to_string()))).is_err() { return; }
                                     }
-                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(json!({
+                                    if sse_tx.send(Ok(Event::default().event("content_block_delta").data(json!({
                                         "type": "content_block_delta", "index": block_idx, "delta": {"type": "thinking_delta", "thinking": delta}
-                                    }).to_string())));
+                                    }).to_string()))).is_err() { return; }
                                 }
-                                grammar::StreamDelta::Text(delta) => {
-                                    if think_open {
-                                        let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
-                                        block_idx += 1;
-                                        think_open = false;
+                                grammar::StreamDelta::Text(mut delta) => {
+                                    if !stop_seqs.is_empty() {
+                                        let prev_len = text_acc.len();
+                                        text_acc.push_str(&delta);
+                                        if let Some((pos, matched)) = stop_seqs.iter().filter(|s| !s.is_empty()).filter_map(|s| text_acc.find(s.as_str()).map(|p| (p, s.clone()))).min_by_key(|x| x.0) {
+                                            hit_stop_seq = Some(matched);
+                                            if pos > prev_len {
+                                                delta = text_acc[prev_len..pos].to_string();
+                                            } else {
+                                                delta.clear();
+                                            }
+                                        }
                                     }
-                                    if !text_open {
-                                        text_open = true;
-                                        let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(json!({
-                                            "type": "content_block_start", "index": block_idx, "content_block": {"type": "text", "text": ""}
-                                        }).to_string())));
+                                    if !delta.is_empty() {
+                                        if think_open {
+                                            let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
+                                            block_idx += 1;
+                                            think_open = false;
+                                        }
+                                        if !text_open {
+                                            text_open = true;
+                                            if sse_tx.send(Ok(Event::default().event("content_block_start").data(json!({
+                                                "type": "content_block_start", "index": block_idx, "content_block": {"type": "text", "text": ""}
+                                            }).to_string()))).is_err() { return; }
+                                        }
+                                        if sse_tx.send(Ok(Event::default().event("content_block_delta").data(json!({
+                                            "type": "content_block_delta", "index": block_idx, "delta": {"type": "text_delta", "text": delta}
+                                        }).to_string()))).is_err() { return; }
                                     }
-                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(json!({
-                                        "type": "content_block_delta", "index": block_idx, "delta": {"type": "text_delta", "text": delta}
-                                    }).to_string())));
+                                    if hit_stop_seq.is_some() {
+                                        break;
+                                    }
                                 }
                                 grammar::StreamDelta::ToolCall(tc) => {
                                     if think_open {
@@ -3033,6 +3140,18 @@ async fn anthropic_messages(
                                     block_idx += 1;
                                 }
                             }
+                        }
+                        if let Some(matched) = hit_stop_seq {
+                            if think_open || text_open {
+                                let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": block_idx}).to_string())));
+                            }
+                            let _ = sse_tx.send(Ok(Event::default().event("message_delta").data(json!({
+                                "type": "message_delta",
+                                "delta": {"stop_reason": "stop_sequence", "stop_sequence": matched},
+                                "usage": {"output_tokens": pred_n_anth}
+                            }).to_string())));
+                            let _ = sse_tx.send(Ok(Event::default().event("message_stop").data(json!({"type": "message_stop"}).to_string())));
+                            break;
                         }
                     }
                     GenEvent::Done { finish_reason, pred_n, .. } => {
@@ -3190,6 +3309,9 @@ async fn responses_http(
                 json!({"type":"response.created","response":{"id":resp_id,"object":"response","status":"in_progress","model":model_id,"created_at":created,"output":[]}}).to_string()
             )));
             while let Some(ev) = rx.recv().await {
+                if sse_tx.is_closed() {
+                    break;
+                }
                 match ev {
                     GenEvent::Prefill { prompt_n: pn, cached_n: cn, .. } => {
                         prompt_n = pn;
@@ -3201,17 +3323,17 @@ async fn responses_http(
                                 grammar::StreamDelta::Text(delta) => {
                                     if !msg_started {
                                         msg_started = true;
-                                        let _ = sse_tx.send(Ok(Event::default().event("response.output_item.added").data(
+                                        if sse_tx.send(Ok(Event::default().event("response.output_item.added").data(
                                             json!({
                                                 "type": "response.output_item.added",
                                                 "output_index": out_index,
                                                 "item": {"id": msg_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
                                             }).to_string()
-                                        )));
+                                        ))).is_err() { return; }
                                     }
-                                    let _ = sse_tx.send(Ok(Event::default().event("response.output_text.delta").data(
+                                    if sse_tx.send(Ok(Event::default().event("response.output_text.delta").data(
                                         json!({"type":"response.output_text.delta","response_id":resp_id,"item_id":msg_id,"output_index":out_index,"content_index":0,"delta":delta}).to_string()
-                                    )));
+                                    ))).is_err() { return; }
                                 }
                                 grammar::StreamDelta::Reasoning(_) => {}
                                 grammar::StreamDelta::ToolCall(tc) => {

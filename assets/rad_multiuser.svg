@@ -29,50 +29,50 @@
   <rect width="960" height="502" rx="16" fill="url(#bg)"/>
   <rect x="1" y="1" width="958" height="500" rx="15" fill="none" stroke="#1e293b" stroke-width="2"/>
 
-  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="23" font-weight="700" fill="#f8fafc">RAD v0.30.0 Multi-User Scaling: Inkling-2-Mini on Single R9700</text>
-  <text x="36" y="70" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">Aggregate Decode Throughput (tok/s) with Bank-Free WMMA, Split-KV Multi-User &amp; 32-Tok exp2f FlashAttention</text>
+  <text x="36" y="46" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="23" font-weight="700" fill="#f8fafc">RAD v0.30.2 Multi-User Scaling: Inkling-2-Mini on Single R9700</text>
+  <text x="36" y="70" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13.5" fill="#94a3b8">Aggregate Decode Throughput (tok/s) with Bank-Free WMMA, Padded sm_vt &amp; 32-Tok exp2f FlashAttention</text>
 
   <rect x="36" y="90" width="888" height="372" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
 
   <text x="56" y="128" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#94a3b8">B=8 Continuous Batching (80.4 tok/s/user)</text>
-  <rect x="365" y="113" width="73" height="22" rx="5" fill="url(#slateGrad)"/>
-  <text x="448" y="129" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#cbd5e1">643.6 tok/s</text>
+  <rect x="365" y="113" width="67" height="22" rx="5" fill="url(#slateGrad)"/>
+  <text x="442" y="129" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#cbd5e1">643.6 tok/s</text>
 
-  <text x="56" y="162" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=8 Batched DFlash 2 K=8 (98.6 tok/s/user)</text>
-  <rect x="365" y="147" width="84" height="22" rx="5" fill="url(#tealGrad)"/>
-  <text x="459" y="163" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#2dd4bf">788.8 tok/s</text>
+  <text x="56" y="162" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=8 Batched DFlash 2 K=8 (98.9 tok/s/user)</text>
+  <rect x="365" y="147" width="83" height="22" rx="5" fill="url(#tealGrad)"/>
+  <text x="458" y="163" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#2dd4bf">791.0 tok/s</text>
 
   <text x="56" y="196" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=16 Continuous Batching (57.9 tok/s/user)</text>
-  <rect x="365" y="181" width="105" height="22" rx="5" fill="url(#slateGrad)"/>
-  <text x="480" y="197" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#cbd5e1">926.3 tok/s</text>
+  <rect x="365" y="181" width="97" height="22" rx="5" fill="url(#slateGrad)"/>
+  <text x="472" y="197" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#cbd5e1">926.3 tok/s</text>
 
   <text x="56" y="230" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=16 Batched DFlash 2 K=8 (73.4 tok/s/user)</text>
-  <rect x="365" y="215" width="132" height="22" rx="5" fill="url(#tealGrad)"/>
-  <text x="507" y="231" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#2dd4bf">1,174.4 tok/s</text>
+  <rect x="365" y="215" width="123" height="22" rx="5" fill="url(#tealGrad)"/>
+  <text x="498" y="231" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#2dd4bf">1,174.4 tok/s</text>
 
   <text x="56" y="264" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=32 Continuous Batching (39.9 tok/s/user)</text>
-  <rect x="365" y="249" width="145" height="22" rx="5" fill="url(#cyanGrad)"/>
-  <text x="520" y="265" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">1,277.8 tok/s</text>
+  <rect x="365" y="249" width="134" height="22" rx="5" fill="url(#cyanGrad)"/>
+  <text x="509" y="265" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">1,277.8 tok/s</text>
 
   <text x="56" y="298" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" fill="#cbd5e1">B=128 LDS WMMA MoE (14.5 tok/s/user)</text>
-  <rect x="365" y="283" width="210" height="22" rx="5" fill="url(#purpleGrad)"/>
-  <text x="585" y="299" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#c084fc">1,856.0 tok/s</text>
+  <rect x="365" y="283" width="195" height="22" rx="5" fill="url(#purpleGrad)"/>
+  <text x="570" y="299" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#c084fc">1,856.0 tok/s</text>
 
-  <text x="56" y="332" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=4 Hybrid DFlash 2 + K=128 (730.9/user)</text>
-  <rect x="365" y="317" width="310" height="22" rx="5" fill="url(#greenGrad)"/>
-  <text x="685" y="333" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">2,923.5 tok/s</text>
+  <text x="56" y="332" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=4 Hybrid DFlash 2 + K=128 (752.8/user)</text>
+  <rect x="365" y="317" width="316" height="22" rx="5" fill="url(#greenGrad)"/>
+  <text x="691" y="333" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">3,011.4 tok/s</text>
 
-  <text x="56" y="366" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Live HTTP SSE (322.9 tok/s/user)</text>
-  <rect x="365" y="351" width="322" height="22" rx="5" fill="url(#cyanGrad)"/>
-  <text x="697" y="367" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">3,042.8 tok/s (2,342 full)</text>
+  <text x="56" y="366" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Live HTTP SSE (412.3 tok/s/user)</text>
+  <rect x="365" y="351" width="346" height="22" rx="5" fill="url(#cyanGrad)"/>
+  <text x="721" y="367" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#22d3ee">3,295.9 tok/s (temp=0.2)</text>
 
-  <text x="56" y="400" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Hybrid DFlash 2 + K=128 (468.1/user)</text>
-  <rect x="365" y="385" width="397" height="22" rx="5" fill="url(#greenGrad)"/>
-  <text x="772" y="401" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">3,745.1 tok/s</text>
+  <text x="56" y="400" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#f8fafc">B=8 Hybrid DFlash 2 + K=128 (483.0/user)</text>
+  <rect x="365" y="385" width="405" height="22" rx="5" fill="url(#greenGrad)"/>
+  <text x="780" y="401" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">3,863.7 tok/s</text>
 
-  <text x="56" y="434" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">B=16 Hybrid DFlash 2 + K=64 (253.7/user)</text>
+  <text x="56" y="434" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">B=16 Hybrid DFlash 2 + K=64 (256.3/user)</text>
   <rect x="365" y="419" width="430" height="22" rx="5" fill="url(#greenGrad)"/>
-  <text x="805" y="435" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">4,058.5 tok/s</text>
+  <text x="805" y="435" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700" fill="#34d399">4,100.4 tok/s</text>
 
   <text x="36" y="484" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="11.5" fill="#64748b">Measured on a single AMD Radeon AI PRO R9700 (32 GB, gfx1201, ROCm 7.14) via `rad bench` &amp; `rad serve` | github.com/metaspartan/RAD</text>
 </svg>

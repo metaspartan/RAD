@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <math.h>
 
+static constexpr float LOG2E = 1.4426950408889634f;
+
 typedef int32_t wmma_i8_v __attribute__((ext_vector_type(8)));
 typedef int32_t wmma_i2_v __attribute__((ext_vector_type(2)));
 typedef float wmma_f8_v __attribute__((ext_vector_type(8)));
@@ -1848,7 +1850,7 @@ __global__ void attn_batch_gqa3_flash_fp16_t(const float* __restrict__ Q,
     const _Float16* vc_h = reinterpret_cast<const _Float16*>(v_cache) + (size_t)kv_h * max_ctx * dh;
 
     __shared__ _Float16 sm_k[32][136];
-    __shared__ _Float16 sm_vt[128][32];
+    __shared__ _Float16 sm_vt[128][40];
 
     for (int tile_base = t_min; tile_base < t_max; tile_base += 32) {
         int n_kv_big = min(32, t_max - tile_base);
@@ -2459,7 +2461,7 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
         return;
     }
 
-    float q_scale = rsqrtf((float)dh);
+    float q_scale = rsqrtf((float)dh) * LOG2E;
     wmma_h8_v q_reg[8];
     float4 r_reg0 = make_float4(0.f, 0.f, 0.f, 0.f);
     float4 r_reg1 = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -2475,8 +2477,12 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
             for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)(qh[dbase + j] * q_scale);
         }
         const float4* rh4 = reinterpret_cast<const float4*>(R + (size_t)q_idx * r_dim + (size_t)h * d_rel);
-        r_reg0 = rh4[0]; r_reg1 = rh4[1]; r_reg2 = rh4[2]; r_reg3 = rh4[3];
-        sink_q = sinks[(size_t)q_idx * n_head + h];
+        float4 t0 = rh4[0], t1 = rh4[1], t2 = rh4[2], t3 = rh4[3];
+        r_reg0 = make_float4(t0.x * LOG2E, t0.y * LOG2E, t0.z * LOG2E, t0.w * LOG2E);
+        r_reg1 = make_float4(t1.x * LOG2E, t1.y * LOG2E, t1.z * LOG2E, t1.w * LOG2E);
+        r_reg2 = make_float4(t2.x * LOG2E, t2.y * LOG2E, t2.z * LOG2E, t2.w * LOG2E);
+        r_reg3 = make_float4(t3.x * LOG2E, t3.y * LOG2E, t3.z * LOG2E, t3.w * LOG2E);
+        sink_q = sinks[(size_t)q_idx * n_head + h] * LOG2E;
     } else {
 #pragma unroll
         for (int db = 0; db < 8; ++db) {
@@ -2578,26 +2584,30 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
             }
             float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
             float m_new = fmaxf(m_q, tile_max);
-            float alpha = (m_q > -1e20f) ? expf(m_q - m_new) : 0.0f;
+            bool need_rescale = (m_new > m_q && m_q > -1e20f);
+            float alpha = (m_q > -1e20f) ? (need_rescale ? exp2f(m_q - m_new) : 1.0f) : 0.0f;
 
             wmma_h8_v p_reg;
             float local_sum = 0.0f;
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                float p = (sc_arr[i] > -1e20f) ? expf(sc_arr[i] - m_new) : 0.0f;
+                float p = (sc_arr[i] > -1e20f) ? exp2f(sc_arr[i] - m_new) : 0.0f;
                 p_reg[i] = (_Float16)p;
                 local_sum += p;
             }
             l_q = l_q * alpha + local_sum + __shfl_xor(local_sum, 16, 32);
             m_q = m_new;
 
+            if (need_rescale) {
+#pragma unroll
+                for (int db = 0; db < 8; ++db) o_acc[db] *= alpha;
+            }
 #pragma unroll
             for (int db = 0; db < 8; ++db) {
                 wmma_h8_v vt_v;
                 int d_row = db * 16 + col;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) vt_v[j] = sm_u.kv.vt[tg][d_row][half * 8 + j];
-                o_acc[db] *= alpha;
                 o_acc[db] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vt_v, p_reg, o_acc[db]);
             }
         }
@@ -2628,11 +2638,11 @@ extern "C" __global__ void attn_b8_gqa3_flash_split_k(const float* __restrict__ 
             float m0 = sm_m[0][gg][bt];
             float m1 = sm_m[1][gg][bt];
             float gm = fmaxf(m0, m1);
-            float sc0 = (m0 > -1e20f) ? expf(m0 - gm) : 0.0f;
-            float sc1 = (m1 > -1e20f) ? expf(m1 - gm) : 0.0f;
+            float sc0 = (m0 > -1e20f) ? exp2f(m0 - gm) : 0.0f;
+            float sc1 = (m1 > -1e20f) ? exp2f(m1 - gm) : 0.0f;
             float gl = sm_l[0][gg][bt] * sc0 + sm_l[1][gg][bt] * sc1;
             float* dst = split_buf + (((size_t)h_out * n_splits + sp) * 64 + (q_off + bt)) * 130;
-            if (lane == 0) { dst[0] = gm; dst[1] = gl; }
+            if (lane == 0) { dst[0] = (gm > -1e20f) ? (gm * 0.6931471805599453f) : -1e30f; dst[1] = gl; }
 #pragma unroll
             for (int blk = 0; blk < 4; ++blk) {
                 int d = blk * 32 + lane;
@@ -2864,12 +2874,12 @@ extern "C" __global__ void attn_b8_flash_reduce_q8_k(const float* __restrict__ s
     for (int sp = 0; sp < n_splits; ++sp) {
         const float* p = split_buf + (((size_t)h * n_splits + sp) * 64 + bt) * 130;
         if (p[0] > -1e20f) {
-            float sc = expf(p[0] - gm);
+            float sc = exp2f((p[0] - gm) * LOG2E);
             gl += p[1] * sc;
             go += p[2 + d] * sc;
         }
     }
-    float v = (go / gl) / (1.0f + expf(-gate[(size_t)bt * q_dim + (size_t)h * 128 + d]));
+    float v = (go / gl) / (1.0f + exp2f(-gate[(size_t)bt * q_dim + (size_t)h * 128 + d] * LOG2E));
     __shared__ int8_t smq[4][32];
     size_t qbase = ((size_t)bt * n_head + h) * 4;
     w_q8_store(v, lane, out_q8 + qbase + wid, smq[wid]);
@@ -2963,7 +2973,7 @@ extern "C" __global__ void dspark_attn_wmma_gqa4_split_k(const float* __restrict
         return;
     }
 
-    float q_scale = rsqrtf((float)dh);
+    float q_scale = rsqrtf((float)dh) * LOG2E;
     wmma_h8_v q_reg[8];
     if (vq) {
         const float* qh = Q + ((size_t)col * n_head + h) * dh;
@@ -3055,26 +3065,30 @@ extern "C" __global__ void dspark_attn_wmma_gqa4_split_k(const float* __restrict
         }
         float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
         float m_new = fmaxf(m_q, tile_max);
-        float alpha = (m_q > -1e20f) ? expf(m_q - m_new) : 0.0f;
+        bool need_rescale = (m_new > m_q && m_q > -1e20f);
+        float alpha = (m_q > -1e20f) ? (need_rescale ? exp2f(m_q - m_new) : 1.0f) : 0.0f;
 
         wmma_h8_v p_reg;
         float local_sum = 0.0f;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            float p = (sc_arr[i] > -1e20f) ? expf(sc_arr[i] - m_new) : 0.0f;
+            float p = (sc_arr[i] > -1e20f) ? exp2f(sc_arr[i] - m_new) : 0.0f;
             p_reg[i] = (_Float16)p;
             local_sum += p;
         }
         l_q = l_q * alpha + local_sum + __shfl_xor(local_sum, 16, 32);
         m_q = m_new;
 
+        if (need_rescale) {
+#pragma unroll
+            for (int db = 0; db < 8; ++db) o_acc[db] *= alpha;
+        }
 #pragma unroll
         for (int db = 0; db < 8; ++db) {
             wmma_h8_v vt_v;
             int d_row = db * 16 + col;
 #pragma unroll
             for (int j = 0; j < 8; ++j) vt_v[j] = sm_u.kv.vt[d_row][half * 8 + j];
-            o_acc[db] *= alpha;
             o_acc[db] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vt_v, p_reg, o_acc[db]);
         }
         __syncthreads();
@@ -3124,7 +3138,7 @@ extern "C" __global__ void dspark_attn_wmma_reduce_q8_k(const float* __restrict_
     for (int sp = 0; sp < n_splits; ++sp) {
         const float* p = split_buf + (((size_t)h * n_splits + sp) * 8 + bt) * 130;
         if (p[0] > -1e20f) {
-            float sc = expf(p[0] - gm);
+            float sc = exp2f(p[0] - gm);
             gl += p[1] * sc;
             go += p[2 + d] * sc;
         }

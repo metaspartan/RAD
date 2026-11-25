@@ -502,6 +502,8 @@ pub fn parse_single_tool_call(
 pub struct SamplingParams {
     pub temperature: f32,
     pub top_p: f32,
+    pub top_k: usize,
+    pub min_p: f32,
     pub repetition_penalty: f32,
     pub seed: u64,
 }
@@ -511,6 +513,8 @@ impl SamplingParams {
         Self {
             temperature: 0.0,
             top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
             seed: 0,
         }
@@ -566,6 +570,9 @@ pub fn sample_from_logits(logits: &[f32], recent_tokens: &[i32], params: &mut Sa
     if params.temperature <= 1e-5 {
         return top[0].1 as i32;
     }
+    if params.top_k > 0 && params.top_k < top.len() {
+        top.truncate(params.top_k);
+    }
     let max_l = top[0].0;
     let mut probs: Vec<(f32, usize)> = Vec::with_capacity(top.len());
     let mut sum = 0.0f32;
@@ -576,6 +583,15 @@ pub fn sample_from_logits(logits: &[f32], recent_tokens: &[i32], params: &mut Sa
     }
     if sum <= 0.0 || !sum.is_finite() {
         return top[0].1 as i32;
+    }
+    let min_p = params.min_p.clamp(0.0, 1.0);
+    if min_p > 0.0 {
+        let thresh = probs[0].0 * min_p;
+        probs.retain(|x| x.0 >= thresh);
+        if probs.is_empty() {
+            return top[0].1 as i32;
+        }
+        sum = probs.iter().map(|x| x.0).sum();
     }
     let top_p = params.top_p.clamp(0.05, 1.0);
     let mut cum = 0.0f32;
@@ -627,6 +643,9 @@ pub fn sample_from_topk(vals: &[f32], ids: &[i32], recent_tokens: &[i32], params
     if params.temperature <= 1e-5 {
         return top[0].1;
     }
+    if params.top_k > 0 && params.top_k < top.len() {
+        top.truncate(params.top_k);
+    }
     let max_l = top[0].0;
     let mut probs: Vec<(f32, i32)> = Vec::with_capacity(n);
     let mut sum = 0.0f32;
@@ -637,6 +656,15 @@ pub fn sample_from_topk(vals: &[f32], ids: &[i32], recent_tokens: &[i32], params
     }
     if sum <= 0.0 || !sum.is_finite() {
         return top[0].1;
+    }
+    let min_p = params.min_p.clamp(0.0, 1.0);
+    if min_p > 0.0 {
+        let thresh = probs[0].0 * min_p;
+        probs.retain(|x| x.0 >= thresh);
+        if probs.is_empty() {
+            return top[0].1;
+        }
+        sum = probs.iter().map(|x| x.0).sum();
     }
     let top_p = params.top_p.clamp(0.05, 1.0);
     let mut cum = 0.0f32;
@@ -856,7 +884,7 @@ impl InklingStreamParser {
                     self.tool_name_hint = self.tool_inline_prefix.trim().to_string();
                 } else {
                     self.tool_inline_after_text = false;
-                    self.tool_inline_prefix.clear();
+                    self.tool_inline_prefix = tok.decode(&self.text_ids, true).unwrap_or_default();
                     self.tool_name_hint = tok.decode(&self.header_ids, true).unwrap_or_default().trim().to_string();
                 }
                 self.header_ids.clear();
@@ -870,7 +898,7 @@ impl InklingStreamParser {
                     self.tool_name_hint = self.tool_inline_prefix.trim().to_string();
                 } else {
                     self.tool_inline_after_text = false;
-                    self.tool_inline_prefix.clear();
+                    self.tool_inline_prefix = tok.decode(&self.text_ids, true).unwrap_or_default();
                     self.tool_name_hint = tok.decode(&self.header_ids, true).unwrap_or_default().trim().to_string();
                 }
                 self.header_ids.clear();

@@ -999,7 +999,7 @@ extern "C" __global__ void attn_b48_gqa3_flash_split_q8kv_k(const float* __restr
     const __half* vs_h = v_scale + (size_t)kv_h * max_ctx;
 
     __shared__ _Float16 sm_k[32][136];
-    __shared__ _Float16 sm_vt[128][32];
+    __shared__ _Float16 sm_vt[128][40];
 
     for (int tile_base = tile_s; tile_base < tile_e; tile_base += 32) {
         int n_kv_big = min(32, tile_e - tile_base);
@@ -1450,7 +1450,7 @@ __global__ void attn_batch_gqa3_flash_q8kv_t(const float* __restrict__ Q,
     const __half* vs_h = v_scale + (size_t)kv_h * max_ctx;
 
     __shared__ _Float16 sm_k[32][136];
-    __shared__ _Float16 sm_vt[128][32];
+    __shared__ _Float16 sm_vt[128][40];
 
     for (int tile_base = 0; tile_base < t_max; tile_base += 32) {
         int n_kv_big = min(32, t_max - tile_base);
@@ -1582,7 +1582,7 @@ __global__ void attn_batch_gqa3_flash_q8kv_t(const float* __restrict__ Q,
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 int d = db * 16 + half * 8 + i;
-                oh[d] = (o_acc[db][i] * inv_l) / (1.0f + expf(-gh[d]));
+                oh[d] = (o_acc[db][i] * inv_l) / (1.0f + exp2f(-gh[d] * 1.4426950408889634f));
             }
         }
     }
@@ -1764,7 +1764,7 @@ extern "C" __global__ void attn_batch_gated_flash_q8kv_k(const float* __restrict
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 int d = db * 16 + half * 8 + i;
-                oh[d] = (o_acc[db][i] * inv_l) / (1.0f + expf(-gh[d]));
+                oh[d] = (o_acc[db][i] * inv_l) / (1.0f + exp2f(-gh[d] * 1.4426950408889634f));
             }
         }
     }

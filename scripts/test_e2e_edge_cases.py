@@ -1,5 +1,6 @@
 import argparse
 import json
+import time
 import urllib.error
 import urllib.request
 
@@ -12,6 +13,19 @@ def make_headers(api_key, use_x_api_key=False):
         else:
             h["Authorization"] = f"Bearer {api_key}"
     return h
+
+
+def get_json(url, headers):
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, raw
 
 
 def post_json(url, payload, headers, timeout=60):
@@ -216,6 +230,168 @@ def test_batch_completions_endpoint(base_url, headers):
     print("[PASS] batch_completions_endpoint (2 prompts batched)")
 
 
+def test_sse_client_disconnect_cancellation(base_url, headers):
+    body = json.dumps({
+        "model": "inkling-2-mini",
+        "messages": [{"role": "user", "content": "Write a 1500 word detailed essay about GPU architecture."}],
+        "max_tokens": 1500,
+        "temperature": 0.0,
+        "stream": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }).encode("utf-8")
+    req = urllib.request.Request(f"{base_url}/v1/chat/completions", data=body, headers=headers, method="POST")
+    resp = urllib.request.urlopen(req, timeout=30)
+    chunks = 0
+    for raw in resp:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if line.startswith("data: "):
+            chunks += 1
+            if chunks >= 5:
+                break
+    t_close = time.perf_counter()
+    resp.close()
+    freed_ms = None
+    for _ in range(40):
+        time.sleep(0.05)
+        st, slots = get_json(f"{base_url}/slots", headers)
+        assert st == 200
+        active = int(slots.get("active", 0)) + int(slots.get("prefilling", 0)) + int(slots.get("queued", 0))
+        if active == 0:
+            freed_ms = (time.perf_counter() - t_close) * 1000.0
+            break
+    assert freed_ms is not None and freed_ms < 2000.0, f"slot not freed promptly after client disconnect: {freed_ms}"
+    print(f"[PASS] sse_client_disconnect_cancellation: slot freed in {freed_ms:.0f} ms after {chunks} chunks")
+
+
+def test_streaming_stop_sequences(base_url, headers):
+    body = json.dumps({
+        "model": "inkling-2-mini",
+        "messages": [{"role": "user", "content": "Count from 1 to 10 separated by commas: 1, 2, 3, ..."}],
+        "max_tokens": 64,
+        "temperature": 0.0,
+        "stop": ["5"],
+        "stream": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }).encode("utf-8")
+    req = urllib.request.Request(f"{base_url}/v1/chat/completions", data=body, headers=headers, method="POST")
+    text = []
+    finish_reason = None
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            ev = json.loads(line[6:])
+            ch = ev.get("choices", [])
+            if ch:
+                c = ch[0].get("delta", {}).get("content")
+                if c:
+                    text.append(c)
+                if ch[0].get("finish_reason"):
+                    finish_reason = ch[0]["finish_reason"]
+    oai_txt = "".join(text)
+    assert "5" not in oai_txt and finish_reason == "stop", f"OAI SSE stop failed: fr={finish_reason} txt={oai_txt!r}"
+
+    anth_body = json.dumps({
+        "model": "inkling-2-mini",
+        "messages": [{"role": "user", "content": "Count from 1 to 10 separated by commas: 1, 2, 3, ..."}],
+        "max_tokens": 64,
+        "temperature": 0.0,
+        "stop_sequences": ["5"],
+        "stream": True,
+    }).encode("utf-8")
+    req2 = urllib.request.Request(f"{base_url}/v1/messages", data=anth_body, headers=headers, method="POST")
+    anth_txt = []
+    stop_reason = None
+    with urllib.request.urlopen(req2, timeout=30) as resp2:
+        for raw in resp2:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data: "):
+                continue
+            ev = json.loads(line[6:])
+            if ev.get("type") == "content_block_delta" and ev.get("delta", {}).get("type") == "text_delta":
+                anth_txt.append(ev["delta"]["text"])
+            elif ev.get("type") == "message_delta":
+                stop_reason = ev.get("delta", {}).get("stop_reason")
+    atxt = "".join(anth_txt)
+    assert "5" not in atxt and stop_reason == "stop_sequence", f"Anthropic SSE stop failed: sr={stop_reason} txt={atxt!r}"
+    print(f"[PASS] streaming_stop_sequences: oai={oai_txt.strip()!r} anth={atxt.strip()!r}")
+
+
+def test_sampling_top_k_min_p_seed(base_url, headers):
+    p_det = {
+        "model": "inkling-2-mini",
+        "messages": [{"role": "user", "content": "Give one short sentence about stars."}],
+        "max_tokens": 24,
+        "temperature": 0.7,
+        "top_k": 1,
+        "seed": 4242,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    st1, d1 = post_json(f"{base_url}/v1/chat/completions", p_det, headers)
+    st2, d2 = post_json(f"{base_url}/v1/chat/completions", p_det, headers)
+    assert st1 == 200 and st2 == 200
+    c1 = d1["choices"][0]["message"]["content"]
+    c2 = d2["choices"][0]["message"]["content"]
+    assert len(c1.strip()) > 0 and c1 == c2, f"top_k=1 mismatch: {c1!r} vs {c2!r}"
+
+    p_smp = {
+        "model": "inkling-2-mini",
+        "messages": [{"role": "user", "content": "Give one short creative sentence about oceans."}],
+        "max_tokens": 24,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 20,
+        "min_p": 0.05,
+        "seed": 4242,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    st3, d3 = post_json(f"{base_url}/v1/chat/completions", p_smp, headers)
+    assert st3 == 200
+    c3 = d3["choices"][0]["message"]["content"]
+    assert len(c3.strip()) > 0, f"top_k/min_p empty: {d3}"
+    print(f"[PASS] sampling_top_k_min_p_seed: top_k1={c1.strip()!r} sampled={c3.strip()!r}")
+
+
+def test_mixed_concurrent_prefill_decode_ttft(base_url, headers):
+    import threading
+    long_done = {}
+    def run_long():
+        st, d = post_json(
+            f"{base_url}/v1/chat/completions",
+            {
+                "model": "inkling-2-mini",
+                "messages": [{"role": "user", "content": "Write a detailed Python class implementing a red-black tree with insert and search."}],
+                "max_tokens": 256,
+                "temperature": 0.0,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            headers,
+        )
+        long_done["status"] = st
+    th = threading.Thread(target=run_long)
+    th.start()
+    time.sleep(0.15)
+    t0 = time.perf_counter()
+    st_s, d_s = post_json(
+        f"{base_url}/v1/chat/completions",
+        {
+            "model": "inkling-2-mini",
+            "messages": [{"role": "user", "content": "What is 7 * 8? Reply with just the number."}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        headers,
+    )
+    short_ms = (time.perf_counter() - t0) * 1000.0
+    th.join(timeout=60)
+    assert st_s == 200 and long_done.get("status") == 200
+    reply = d_s["choices"][0]["message"]["content"]
+    assert "56" in reply, f"concurrent short reply wrong: {reply!r}"
+    print(f"[PASS] mixed_concurrent_prefill_decode_ttft: short_e2e={short_ms:.1f} ms reply={reply.strip()!r}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8088")
@@ -229,7 +405,11 @@ def main():
     test_unicode_emoji_cjk_sse(args.url, headers)
     test_anthropic_multiturn_tools_prefix_cache(args.url, headers)
     test_batch_completions_endpoint(args.url, headers)
-    print("ALL 7 EDGE-CASE E2E TESTS PASSED!")
+    test_sse_client_disconnect_cancellation(args.url, headers)
+    test_streaming_stop_sequences(args.url, headers)
+    test_sampling_top_k_min_p_seed(args.url, headers)
+    test_mixed_concurrent_prefill_decode_ttft(args.url, headers)
+    print("ALL 11 EDGE-CASE E2E TESTS PASSED!")
 
 
 if __name__ == "__main__":

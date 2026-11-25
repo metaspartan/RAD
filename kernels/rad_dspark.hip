@@ -363,7 +363,7 @@ extern "C" __global__ void dspark_attn_split8_k(const float* __restrict__ Q,
 
     int p0 = lane * 2;
     int p1 = lane * 2 + 64;
-    float q_scale = rsqrtf((float)dh);
+    float q_scale = rsqrtf((float)dh) * 1.4426950408889634f;
     float q0a = 0.0f, q0b = 0.0f, q1a = 0.0f, q1b = 0.0f;
     if (wid < K_len) {
         const float* qh = Q + ((size_t)wid * n_head + h) * dh;
@@ -416,8 +416,8 @@ extern "C" __global__ void dspark_attn_split8_k(const float* __restrict__ Q,
                 float dot = q0a * k0.x + q0b * k0.y + q1a * k1.x + q1b * k1.y;
                 float score = __shfl(ds_warp_sum32(dot), 0, 32);
                 float m_new = fmaxf(m, score);
-                float alpha = (m > -1e20f) ? expf(m - m_new) : 0.0f;
-                float p = expf(score - m_new);
+                float alpha = (m > -1e20f) ? exp2f(m - m_new) : 0.0f;
+                float p = exp2f(score - m_new);
                 l = l * alpha + p;
                 m = m_new;
                 float2 v0 = sm_v0[j][lane];
@@ -463,7 +463,7 @@ extern "C" __global__ void dspark_attn_split_reduce_k(const float* __restrict__ 
         float ms = sb[128];
         float ls = sb[129];
         if (ls > 0.0f) {
-            float sc = expf(ms - gm);
+            float sc = exp2f(ms - gm);
             gl += ls * sc;
             go0 = fmaf(sb[d0], sc, go0);
             go1 = fmaf(sb[d1], sc, go1);
@@ -507,7 +507,7 @@ extern "C" __global__ void dspark_attn_gqa2_split8_k(const float* __restrict__ Q
 
     int p0 = lane * 2;
     int p1 = lane * 2 + 64;
-    float q_scale = rsqrtf((float)dh);
+    float q_scale = rsqrtf((float)dh) * 1.4426950408889634f;
     float q0a = 0.0f, q0b = 0.0f, q1a = 0.0f, q1b = 0.0f;
     float r0a = 0.0f, r0b = 0.0f, r1a = 0.0f, r1b = 0.0f;
     if (wid < K_len) {
@@ -566,8 +566,8 @@ extern "C" __global__ void dspark_attn_gqa2_split8_k(const float* __restrict__ Q
                 float d0 = q0a * k0.x + q0b * k0.y + q1a * k1.x + q1b * k1.y;
                 float sc0 = __shfl(ds_warp_sum32(d0), 0, 32);
                 float mn0 = fmaxf(m0, sc0);
-                float al0 = (m0 > -1e20f) ? expf(m0 - mn0) : 0.0f;
-                float pv0 = expf(sc0 - mn0);
+                float al0 = (m0 > -1e20f) ? exp2f(m0 - mn0) : 0.0f;
+                float pv0 = exp2f(sc0 - mn0);
                 l0 = l0 * al0 + pv0; m0 = mn0;
                 o0 = fmaf(pv0, v0.x, o0 * al0); o1 = fmaf(pv0, v0.y, o1 * al0);
                 o2 = fmaf(pv0, v1.x, o2 * al0); o3 = fmaf(pv0, v1.y, o3 * al0);
@@ -575,8 +575,8 @@ extern "C" __global__ void dspark_attn_gqa2_split8_k(const float* __restrict__ Q
                 float d1 = r0a * k0.x + r0b * k0.y + r1a * k1.x + r1b * k1.y;
                 float sc1 = __shfl(ds_warp_sum32(d1), 0, 32);
                 float mn1 = fmaxf(m1, sc1);
-                float al1 = (m1 > -1e20f) ? expf(m1 - mn1) : 0.0f;
-                float pv1 = expf(sc1 - mn1);
+                float al1 = (m1 > -1e20f) ? exp2f(m1 - mn1) : 0.0f;
+                float pv1 = exp2f(sc1 - mn1);
                 l1 = l1 * al1 + pv1; m1 = mn1;
                 u0 = fmaf(pv1, v0.x, u0 * al1); u1 = fmaf(pv1, v0.y, u1 * al1);
                 u2 = fmaf(pv1, v1.x, u2 * al1); u3 = fmaf(pv1, v1.y, u3 * al1);
@@ -637,7 +637,7 @@ extern "C" __global__ void dspark_attn_split_reduce_q8_k(const float* __restrict
         float ms = sb[128];
         float ls = sb[129];
         if (ls > 0.0f) {
-            float sc = expf(ms - gm);
+            float sc = exp2f(ms - gm);
             gl += ls * sc;
             go = fmaf(sb[d], sc, go);
         }
@@ -1006,7 +1006,7 @@ extern "C" __global__ void dspark_attn_multi_split4_k(const float* __restrict__ 
 
     int p0 = lane * 2;
     int p1 = lane * 2 + 64;
-    float q_scale = rsqrtf((float)dh);
+    float q_scale = rsqrtf((float)dh) * 1.4426950408889634f;
     float q0a = 0.0f, q0b = 0.0f, q1a = 0.0f, q1b = 0.0f;
     if (wid < K_len) {
         int bt = u * K_len + wid;
@@ -1061,8 +1061,8 @@ extern "C" __global__ void dspark_attn_multi_split4_k(const float* __restrict__ 
                 float dot = q0a * k0.x + q0b * k0.y + q1a * k1.x + q1b * k1.y;
                 float score = __shfl(ds_warp_sum32(dot), 0, 32);
                 float m_new = fmaxf(m, score);
-                float alpha = (m > -1e20f) ? expf(m - m_new) : 0.0f;
-                float p = expf(score - m_new);
+                float alpha = (m > -1e20f) ? exp2f(m - m_new) : 0.0f;
+                float p = exp2f(score - m_new);
                 l = l * alpha + p;
                 m = m_new;
                 float2 v0 = sm_v0[j][lane];
@@ -1109,7 +1109,7 @@ extern "C" __global__ void dspark_attn_multi_split_reduce_k(const float* __restr
         float ms = sb[128];
         float ls = sb[129];
         if (ls > 0.0f) {
-            float sc = expf(ms - gm);
+            float sc = exp2f(ms - gm);
             gl += ls * sc;
             go0 = fmaf(sb[d0], sc, go0);
             go1 = fmaf(sb[d1], sc, go1);
