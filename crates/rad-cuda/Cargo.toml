@@ -1,0 +1,8 @@
+[package]
+name = "rad-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "rad_cuda"
+
+[dependencies]
