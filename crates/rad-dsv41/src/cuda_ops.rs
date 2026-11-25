@@ -126,6 +126,7 @@ extern "C" {
         rope_dim: i32,
         start_pos: i32,
         theta: f32,
+        sign: f32,
         stream: CudaStream,
     );
 

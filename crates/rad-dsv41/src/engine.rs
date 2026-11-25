@@ -231,8 +231,7 @@ impl Dsv41Engine {
         }
 
         let start_pos = self.pos as i32;
-        let mscale = 0.1f32 * tc.rope_scaling.factor.max(1.0).ln() + 1.0f32;
-        let attn_scale = (mscale * mscale) / (tc.head_dim as f32).sqrt();
+        let attn_scale = 1.0f32 / (tc.head_dim as f32).sqrt();
 
         for l in 0..self.layers.len() {
             unsafe {
@@ -256,13 +255,6 @@ impl Dsv41Engine {
 
                 self.exl3_proj(self.d_normed.ptr, &lw.wkv, self.d_kv.ptr, mi, 0, stream);
                 cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, lw.kv_norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, stream);
-                rad_cuda::cudaMemcpyAsync(
-                    self.d_v_tmp.ptr,
-                    self.d_kv_normed.ptr,
-                    m * tc.head_dim * 2,
-                    rad_cuda::CUDA_MEMCPY_DEVICE_TO_DEVICE,
-                    stream,
-                );
                 cuda_ops::rad_cuda_rope_yarn_f16(
                     self.d_q.ptr,
                     self.d_kv_normed.ptr,
@@ -273,11 +265,12 @@ impl Dsv41Engine {
                     tc.qk_rope_head_dim as i32,
                     start_pos,
                     tc.rope_theta,
+                    1.0f32,
                     stream,
                 );
                 cuda_ops::rad_cuda_kv_scatter_f16(
                     self.d_kv_normed.ptr,
-                    self.d_v_tmp.ptr,
+                    self.d_kv_normed.ptr,
                     self.kv_caches[l].k_cache.ptr,
                     self.kv_caches[l].v_cache.ptr,
                     mi,
@@ -300,6 +293,19 @@ impl Dsv41Engine {
                     self.max_ctx as i32,
                     tc.head_dim as i32,
                     attn_scale,
+                    stream,
+                );
+                cuda_ops::rad_cuda_rope_yarn_f16(
+                    self.d_attn_out.ptr,
+                    std::ptr::null_mut(),
+                    mi,
+                    n_heads_local as i32,
+                    0,
+                    tc.head_dim as i32,
+                    tc.qk_rope_head_dim as i32,
+                    start_pos,
+                    tc.rope_theta,
+                    -1.0f32,
                     stream,
                 );
 

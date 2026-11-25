@@ -1,11 +1,41 @@
+use core::ffi::{c_char, c_void};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RadRdmaInfo {
+    qpn: u32,
+    psn: u32,
+    rkey: u32,
+    addr: u64,
+    gid: [u8; 16],
+}
+
+extern "C" {
+    fn rad_rdma_init(dev_name: *const c_char, buf_bytes: usize, local_info: *mut RadRdmaInfo) -> *mut c_void;
+    fn rad_rdma_connect(handle: *mut c_void, remote_info: *const RadRdmaInfo) -> i32;
+    fn rad_rdma_allreduce_f16(handle: *mut c_void, data: *mut u16, n_elems: i32) -> i32;
+    fn rad_rdma_close(handle: *mut c_void);
+}
 
 pub struct Tp2Comm {
     pub rank: usize,
     stream: Option<TcpStream>,
     peer_buf: Vec<f32>,
+    rdma: *mut c_void,
+}
+
+unsafe impl Send for Tp2Comm {}
+
+impl Drop for Tp2Comm {
+    fn drop(&mut self) {
+        if !self.rdma.is_null() {
+            unsafe { rad_rdma_close(self.rdma) };
+            self.rdma = std::ptr::null_mut();
+        }
+    }
 }
 
 impl Tp2Comm {
@@ -14,11 +44,12 @@ impl Tp2Comm {
             rank: 0,
             stream: None,
             peer_buf: Vec::new(),
+            rdma: std::ptr::null_mut(),
         }
     }
 
     pub fn connect(rank: usize, addr: &str) -> std::io::Result<Self> {
-        let s = if rank == 0 {
+        let mut s = if rank == 0 {
             let listener = TcpListener::bind(addr)?;
             let (conn, _) = listener.accept()?;
             conn
@@ -43,10 +74,60 @@ impl Tp2Comm {
             }
         };
         s.set_nodelay(true)?;
+
+        let mut rdma_handle: *mut c_void = std::ptr::null_mut();
+        let dev = b"rocep1s0f1\0";
+        let mut local_info = RadRdmaInfo::default();
+        let h = unsafe { rad_rdma_init(dev.as_ptr() as *const c_char, 2 * 1024 * 1024, &mut local_info) };
+        let local_ok: u8 = if h.is_null() { 0 } else { 1 };
+        let mut peer_ok = [0u8; 1];
+        if rank == 0 {
+            s.write_all(&[local_ok])?;
+            s.read_exact(&mut peer_ok)?;
+        } else {
+            s.read_exact(&mut peer_ok)?;
+            s.write_all(&[local_ok])?;
+        }
+        if local_ok == 1 && peer_ok[0] == 1 {
+            let info_sz = std::mem::size_of::<RadRdmaInfo>();
+            let local_bytes = unsafe { std::slice::from_raw_parts(&local_info as *const RadRdmaInfo as *const u8, info_sz) };
+            let mut remote_info = RadRdmaInfo::default();
+            let remote_bytes = unsafe { std::slice::from_raw_parts_mut(&mut remote_info as *mut RadRdmaInfo as *mut u8, info_sz) };
+            if rank == 0 {
+                s.write_all(local_bytes)?;
+                s.read_exact(remote_bytes)?;
+            } else {
+                s.read_exact(remote_bytes)?;
+                s.write_all(local_bytes)?;
+            }
+            let rc = unsafe { rad_rdma_connect(h, &remote_info) };
+            let mut ready = [if rc == 0 { 1u8 } else { 0u8 }];
+            let mut peer_ready = [0u8; 1];
+            if rank == 0 {
+                s.write_all(&ready)?;
+                s.read_exact(&mut peer_ready)?;
+            } else {
+                s.read_exact(&mut peer_ready)?;
+                s.write_all(&ready)?;
+            }
+            if ready[0] == 1 && peer_ready[0] == 1 {
+                rdma_handle = h;
+                if rank == 0 {
+                    println!("[rdma] ConnectX-7 RoCE v2 connected (rocep1s0f1)");
+                }
+            } else {
+                unsafe { rad_rdma_close(h) };
+                ready[0] = 0;
+            }
+        } else if !h.is_null() {
+            unsafe { rad_rdma_close(h) };
+        }
+
         Ok(Self {
             rank,
             stream: Some(s),
             peer_buf: Vec::with_capacity(65536),
+            rdma: rdma_handle,
         })
     }
 
@@ -98,6 +179,12 @@ impl Tp2Comm {
     }
 
     pub fn all_reduce_sum_f16(&mut self, data: &mut [u16]) -> std::io::Result<()> {
+        if !self.rdma.is_null() {
+            let rc = unsafe { rad_rdma_allreduce_f16(self.rdma, data.as_mut_ptr(), data.len() as i32) };
+            if rc == 0 {
+                return Ok(());
+            }
+        }
         let Some(ref mut s) = self.stream else {
             return Ok(());
         };

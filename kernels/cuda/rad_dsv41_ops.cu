@@ -171,7 +171,8 @@ __global__ void rope_yarn_f16_k(
     int head_dim,
     int rope_dim,
     int start_pos,
-    float theta
+    float theta,
+    float sign
 ) {
     int h = blockIdx.x;
     int mr = blockIdx.y;
@@ -194,7 +195,7 @@ __global__ void rope_yarn_f16_k(
     float pos_f = (float)(start_pos + mr);
     float ang = pos_f * freq;
     float cs = cosf(ang);
-    float sn = sinf(ang);
+    float sn = sign * sinf(ang);
     int rope_off = head_dim - rope_dim;
     if (h < n_q_heads) {
         half* p = q + ((size_t)mr * n_q_heads + h) * head_dim + rope_off;
@@ -471,11 +472,12 @@ void rad_cuda_rope_yarn_f16(
     int rope_dim,
     int start_pos,
     float theta,
+    float sign,
     cudaStream_t stream
 ) {
     dim3 grid(n_q_heads + n_kv_heads, M);
     rope_yarn_f16_k<<<grid, rope_dim / 2, 0, stream>>>(
-        q, k, n_q_heads, n_kv_heads, head_dim, rope_dim, start_pos, theta
+        q, k, n_q_heads, n_kv_heads, head_dim, rope_dim, start_pos, theta, sign
     );
 }
 
