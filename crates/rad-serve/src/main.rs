@@ -610,7 +610,7 @@ fn format_prompt_with_tools(
                     }
                 }
                 let has_tcs = m.tool_calls.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
-                if !txt.is_empty() || !has_tcs {
+                if !txt.is_empty() || !has_tcs || !enable_thinking {
                     s.push_str("<|message_model|><|content_text|>");
                     s.push_str(&txt);
                     s.push_str("<|end_message|>");
@@ -619,15 +619,19 @@ fn format_prompt_with_tools(
                     for tc in tcs {
                         let fn_obj = tc.get("function").unwrap_or(tc);
                         if let Some(name) = fn_obj.get("name").and_then(|v| v.as_str()) {
-                            let args_val = match fn_obj.get("arguments").or_else(|| fn_obj.get("args")) {
+                            let args_json = match fn_obj.get("arguments").or_else(|| fn_obj.get("args")) {
                                 Some(serde_json::Value::String(st)) => {
-                                    serde_json::from_str::<serde_json::Value>(st).unwrap_or_else(|_| json!({}))
+                                    let trimmed = st.trim();
+                                    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+                                        trimmed.to_string()
+                                    } else {
+                                        "{}".into()
+                                    }
                                 }
-                                Some(v) if v.is_object() => v.clone(),
-                                _ => json!({}),
+                                Some(v) if v.is_object() => serde_json::to_string(v).unwrap_or_else(|_| "{}".into()),
+                                _ => "{}".into(),
                             };
                             let name_json = serde_json::to_string(name).unwrap_or_else(|_| format!("\"{name}\""));
-                            let args_json = serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".into());
                             let call_json = format!("{{\"name\":{name_json},\"args\":{args_json}}}");
                             s.push_str("<|message_model|>");
                             s.push_str(name);
