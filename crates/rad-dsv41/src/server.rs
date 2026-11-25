@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -37,8 +37,8 @@ pub enum ServeEvent {
 #[derive(Deserialize)]
 pub struct ChatReq {
     pub model: Option<String>,
-    pub messages: Vec<serde_json::Value>,
-    pub tools: Option<Vec<serde_json::Value>>,
+    pub messages: Vec<Value>,
+    pub tools: Option<Vec<Value>>,
     pub max_tokens: Option<usize>,
     pub max_completion_tokens: Option<usize>,
     pub stream: Option<bool>,
@@ -70,7 +70,7 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-async fn health(State(st): State<Arc<ServerState>>) -> Json<serde_json::Value> {
+async fn health(State(st): State<Arc<ServerState>>) -> Json<Value> {
     Json(json!({
         "status": "ok",
         "engine": "rad-cuda",
@@ -96,10 +96,10 @@ async fn models(State(st): State<Arc<ServerState>>, headers: HeaderMap) -> Respo
     .into_response()
 }
 
-fn extract_content_str(m: &serde_json::Value) -> String {
+fn extract_content_str(m: &Value) -> String {
     match m.get("content") {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(arr)) => {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => {
             let mut s = String::new();
             for item in arr {
                 if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
@@ -113,7 +113,7 @@ fn extract_content_str(m: &serde_json::Value) -> String {
     }
 }
 
-pub fn format_dsv41_prompt(messages: &[serde_json::Value], tools: Option<&[serde_json::Value]>) -> String {
+pub fn format_dsv41_prompt(messages: &[Value], tools: Option<&[Value]>) -> String {
     let mut out = String::from("<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n");
     let mut sys_text = String::new();
     for m in messages {
@@ -176,6 +176,32 @@ pub fn format_dsv41_prompt(messages: &[serde_json::Value], tools: Option<&[serde
                     }
                 }
                 out.push_str(&extract_content_str(m));
+                if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
+                    if !tcs.is_empty() {
+                        out.push_str("\n\n<｜DSML｜ calls>\n");
+                        for tc in tcs {
+                            let fn_obj = tc.get("function").unwrap_or(tc);
+                            let name = fn_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            out.push_str(&format!("<｜DSML｜ invoke name=\"{name}\">\n"));
+                            let args_val = match fn_obj.get("arguments") {
+                                Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::String(s.clone())),
+                                Some(v) => v.clone(),
+                                None => json!({}),
+                            };
+                            if let Some(obj) = args_val.as_object() {
+                                for (k, v) in obj {
+                                    let (is_str, val_str) = match v {
+                                        Value::String(s) => ("true", s.clone()),
+                                        other => ("false", other.to_string()),
+                                    };
+                                    out.push_str(&format!("<｜DSML｜ parameter name=\"{k}\" string=\"{is_str}\">{val_str}</｜DSML｜ parameter>\n"));
+                                }
+                            }
+                            out.push_str("</｜DSML｜ invoke>\n");
+                        }
+                        out.push_str("</｜DSML｜ calls>");
+                    }
+                }
                 out.push_str("<｜end▁of▁sentence｜>");
             }
             _ => {}
@@ -183,6 +209,78 @@ pub fn format_dsv41_prompt(messages: &[serde_json::Value], tools: Option<&[serde
     }
     out.push_str("<｜Assistant｜><think>");
     out
+}
+
+pub fn split_think_and_dsml(raw: &str) -> (Option<String>, String, Vec<Value>) {
+    let (reasoning, rest) = if let Some(idx) = raw.find("</think>") {
+        let r = raw[..idx].trim().to_string();
+        let after = raw[idx + "</think>".len()..].trim_start();
+        (if r.is_empty() { None } else { Some(r) }, after)
+    } else {
+        (None, raw)
+    };
+    let dsml_open = "<｜DSML｜ calls>";
+    let dsml_close = "</｜DSML｜ calls>";
+    let mut tool_calls = Vec::new();
+    let content = if let Some(s) = rest.find(dsml_open) {
+        let before = rest[..s].trim().to_string();
+        let body = &rest[s + dsml_open.len()..];
+        let block = body.find(dsml_close).map(|e| &body[..e]).unwrap_or(body);
+        let inv_open = "<｜DSML｜ invoke name=\"";
+        let inv_close = "</｜DSML｜ invoke>";
+        let mut cursor = block;
+        let mut idx = 0usize;
+        while let Some(i_start) = cursor.find(inv_open) {
+            let after_name = &cursor[i_start + inv_open.len()..];
+            let Some(q_end) = after_name.find("\">") else { break };
+            let fn_name = after_name[..q_end].to_string();
+            let inv_body_start = &after_name[q_end + 2..];
+            let (inv_body, next_cur) = if let Some(ic) = inv_body_start.find(inv_close) {
+                (&inv_body_start[..ic], &inv_body_start[ic + inv_close.len()..])
+            } else {
+                (inv_body_start, "")
+            };
+            let mut args_map = serde_json::Map::new();
+            let p_open = "<｜DSML｜ parameter name=\"";
+            let p_close = "</｜DSML｜ parameter>";
+            let mut pcur = inv_body;
+            while let Some(ps) = pcur.find(p_open) {
+                let pa = &pcur[ps + p_open.len()..];
+                let Some(pe) = pa.find('"') else { break };
+                let pname = pa[..pe].to_string();
+                let Some(gt) = pa.find('>') else { break };
+                let attr = &pa[..gt];
+                let is_str = !attr.contains("string=\"false\"");
+                let val_start = &pa[gt + 1..];
+                let (vraw, np) = if let Some(pc) = val_start.find(p_close) {
+                    (&val_start[..pc], &val_start[pc + p_close.len()..])
+                } else {
+                    (val_start, "")
+                };
+                let jval = if is_str {
+                    Value::String(vraw.to_string())
+                } else {
+                    serde_json::from_str::<Value>(vraw.trim()).unwrap_or_else(|_| Value::String(vraw.to_string()))
+                };
+                args_map.insert(pname, jval);
+                pcur = np;
+            }
+            tool_calls.push(json!({
+                "id": format!("call_rad_{idx}"),
+                "type": "function",
+                "function": {
+                    "name": fn_name,
+                    "arguments": Value::Object(args_map).to_string()
+                }
+            }));
+            idx += 1;
+            cursor = next_cur;
+        }
+        before
+    } else {
+        rest.to_string()
+    };
+    (reasoning, content, tool_calls)
 }
 
 async fn chat_completions(
@@ -209,36 +307,103 @@ async fn chat_completions(
         let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
         tokio::spawn(async move {
             let mut sent_role = false;
+            let mut in_think = true;
+            let mut raw_acc = String::new();
+            let mut in_dsml = false;
             while let Some(ev) = rx.recv().await {
                 if sse_tx.is_closed() {
                     break;
                 }
                 match ev {
                     ServeEvent::Token(delta) => {
-                        let d_obj = if !sent_role {
-                            sent_role = true;
-                            json!({"role": "assistant", "content": delta})
+                        raw_acc.push_str(&delta);
+                        if in_dsml {
+                            continue;
+                        }
+                        if in_think {
+                            if let Some(pos) = delta.find("</think>") {
+                                let r_part = &delta[..pos];
+                                let c_part = &delta[pos + "</think>".len()..];
+                                in_think = false;
+                                if !r_part.is_empty() {
+                                    let d_obj = if !sent_role {
+                                        sent_role = true;
+                                        json!({"role": "assistant", "reasoning_content": r_part})
+                                    } else {
+                                        json!({"reasoning_content": r_part})
+                                    };
+                                    let chunk = json!({
+                                        "id": req_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
+                                        "choices": [{"index": 0, "delta": d_obj, "finish_reason": null}]
+                                    });
+                                    if sse_tx.send(Ok(Event::default().data(chunk.to_string()))).is_err() { return; }
+                                }
+                                if !c_part.is_empty() {
+                                    let d_obj = if !sent_role {
+                                        sent_role = true;
+                                        json!({"role": "assistant", "content": c_part})
+                                    } else {
+                                        json!({"content": c_part})
+                                    };
+                                    let chunk = json!({
+                                        "id": req_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
+                                        "choices": [{"index": 0, "delta": d_obj, "finish_reason": null}]
+                                    });
+                                    if sse_tx.send(Ok(Event::default().data(chunk.to_string()))).is_err() { return; }
+                                }
+                            } else {
+                                let d_obj = if !sent_role {
+                                    sent_role = true;
+                                    json!({"role": "assistant", "reasoning_content": delta})
+                                } else {
+                                    json!({"reasoning_content": delta})
+                                };
+                                let chunk = json!({
+                                    "id": req_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
+                                    "choices": [{"index": 0, "delta": d_obj, "finish_reason": null}]
+                                });
+                                if sse_tx.send(Ok(Event::default().data(chunk.to_string()))).is_err() { return; }
+                            }
+                        } else if raw_acc.contains("<｜DSML｜ calls>") {
+                            in_dsml = true;
                         } else {
-                            json!({"content": delta})
-                        };
-                        let chunk = json!({
-                            "id": req_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_id,
-                            "choices": [{"index": 0, "delta": d_obj, "finish_reason": null}]
-                        });
-                        if sse_tx.send(Ok(Event::default().data(chunk.to_string()))).is_err() {
-                            return;
+                            let d_obj = if !sent_role {
+                                sent_role = true;
+                                json!({"role": "assistant", "content": delta})
+                            } else {
+                                json!({"content": delta})
+                            };
+                            let chunk = json!({
+                                "id": req_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
+                                "choices": [{"index": 0, "delta": d_obj, "finish_reason": null}]
+                            });
+                            if sse_tx.send(Ok(Event::default().data(chunk.to_string()))).is_err() { return; }
                         }
                     }
                     ServeEvent::Done { finish_reason, .. } => {
+                        let (_, _, tool_calls) = split_think_and_dsml(&raw_acc);
+                        let mut fr = finish_reason;
+                        if !tool_calls.is_empty() {
+                            fr = "tool_calls";
+                            let tc_deltas: Vec<Value> = tool_calls
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, mut tc)| {
+                                    if let Some(obj) = tc.as_object_mut() {
+                                        obj.insert("index".to_string(), json!(idx));
+                                    }
+                                    tc
+                                })
+                                .collect();
+                            let chunk = json!({
+                                "id": req_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
+                                "choices": [{"index": 0, "delta": {"tool_calls": tc_deltas}, "finish_reason": null}]
+                            });
+                            let _ = sse_tx.send(Ok(Event::default().data(chunk.to_string())));
+                        }
                         let done = json!({
-                            "id": req_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_id,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                            "id": req_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": fr}]
                         });
                         let _ = sse_tx.send(Ok(Event::default().data(done.to_string())));
                         let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
@@ -257,13 +422,13 @@ async fn chat_completions(
             .into_response();
     }
 
-    let mut content = String::new();
+    let mut raw = String::new();
     let mut prompt_n = 0usize;
     let mut pred_n = 0usize;
     let mut finish_reason = "stop";
     while let Some(ev) = rx.recv().await {
         match ev {
-            ServeEvent::Token(s) => content.push_str(&s),
+            ServeEvent::Token(s) => raw.push_str(&s),
             ServeEvent::Done { prompt_n: pn, pred_n: gn, finish_reason: fr } => {
                 prompt_n = pn;
                 pred_n = gn;
@@ -275,6 +440,17 @@ async fn chat_completions(
             }
         }
     }
+    let (reasoning, content, tool_calls) = split_think_and_dsml(&raw);
+    if !tool_calls.is_empty() {
+        finish_reason = "tool_calls";
+    }
+    let mut msg = json!({"role": "assistant", "content": content});
+    if let Some(rc) = reasoning {
+        msg["reasoning_content"] = json!(rc);
+    }
+    if !tool_calls.is_empty() {
+        msg["tool_calls"] = Value::Array(tool_calls);
+    }
     Json(json!({
         "id": req_id,
         "object": "chat.completion",
@@ -282,7 +458,7 @@ async fn chat_completions(
         "model": model_id,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": content},
+            "message": msg,
             "finish_reason": finish_reason
         }],
         "usage": {
@@ -300,4 +476,22 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_think_and_dsml_tool_calls() {
+        let raw = "Let me check.\n</think>I will run it.\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"exec\">\n<｜DSML｜ parameter name=\"cmd\" string=\"true\">ls -la</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"timeout\" string=\"false\">30</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let (rc, content, tcs) = split_think_and_dsml(raw);
+        assert_eq!(rc.as_deref(), Some("Let me check."));
+        assert_eq!(content, "I will run it.");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0]["function"]["name"], "exec");
+        let args: Value = serde_json::from_str(tcs[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["cmd"], "ls -la");
+        assert_eq!(args["timeout"], 30);
+    }
 }

@@ -1,5 +1,6 @@
 mod config;
 mod cuda_ops;
+mod engram;
 mod engine;
 mod mtp;
 mod safetensors;
@@ -25,6 +26,10 @@ use tokio::sync::mpsc;
 struct Cli {
     #[arg(long)]
     model: PathBuf,
+    #[arg(long)]
+    engram_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    enable_mtp: bool,
     #[arg(long, default_value_t = false)]
     bench_exl3: bool,
     #[arg(long, default_value_t = false)]
@@ -164,9 +169,16 @@ fn worker_loop(eng: &mut Dsv41Engine, comm: &mut Tp2Comm) -> Result<()> {
     Ok(())
 }
 
-fn run_bench_layer(model_dir: &PathBuf, max_ctx: usize, max_layers: usize, comm: &mut Tp2Comm) -> Result<()> {
+fn run_bench_layer(cli: &Cli, comm: &mut Tp2Comm) -> Result<()> {
     let t_load = Instant::now();
-    let mut eng = Dsv41Engine::load(model_dir, max_ctx, comm, Some(max_layers))?;
+    let mut eng = Dsv41Engine::load(
+        &cli.model,
+        cli.engram_dir.as_deref(),
+        cli.max_ctx,
+        comm,
+        Some(cli.max_layers),
+        cli.enable_mtp,
+    )?;
     println!(
         "loaded {} layer(s) (rank={}/{}) in {:.2}s",
         eng.layers.len(),
@@ -235,7 +247,14 @@ fn run_bench_layer(model_dir: &PathBuf, max_ctx: usize, max_layers: usize, comm:
 
 fn run_prompt(cli: &Cli, prompt_text: &str, comm: &mut Tp2Comm) -> Result<()> {
     let t_load = Instant::now();
-    let mut eng = Dsv41Engine::load(&cli.model, cli.max_ctx, comm, Some(cli.max_layers))?;
+    let mut eng = Dsv41Engine::load(
+        &cli.model,
+        cli.engram_dir.as_deref(),
+        cli.max_ctx,
+        comm,
+        Some(cli.max_layers),
+        cli.enable_mtp,
+    )?;
     println!(
         "loaded {} layer(s) (rank={}/{}) in {:.2}s",
         eng.layers.len(),
@@ -292,7 +311,14 @@ fn run_prompt(cli: &Cli, prompt_text: &str, comm: &mut Tp2Comm) -> Result<()> {
 fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
     let t_load = Instant::now();
     let world_size = comm.world_size();
-    let mut eng = Dsv41Engine::load(&cli.model, cli.max_ctx, &mut comm, Some(cli.max_layers))?;
+    let mut eng = Dsv41Engine::load(
+        &cli.model,
+        cli.engram_dir.as_deref(),
+        cli.max_ctx,
+        &mut comm,
+        Some(cli.max_layers),
+        cli.enable_mtp,
+    )?;
     println!(
         "rad-dsv41 serve ready in {:.2}s (rank={}/{}, layers={}, ctx={}, port={})",
         t_load.elapsed().as_secs_f64(),
@@ -441,7 +467,7 @@ fn main() -> Result<()> {
         run_bench_exl3(&cli.model, &mut comm)?;
     }
     if cli.bench_layer {
-        run_bench_layer(&cli.model, cli.max_ctx, cli.max_layers, &mut comm)?;
+        run_bench_layer(&cli, &mut comm)?;
     }
     if let Some(ref p) = cli.prompt {
         run_prompt(&cli, p, &mut comm)?;

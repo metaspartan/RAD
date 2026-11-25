@@ -6,6 +6,7 @@ use std::io::Write;
 use std::path::Path;
 use crate::config::DeepseekV41Config;
 use crate::cuda_ops;
+use crate::engram::{EngramHost, EngramLayerWeights};
 use crate::mtp::{ngram_draft, DsparkMtp};
 use crate::safetensors::SafetensorsIndex;
 use crate::weights::{load_raw_buf_replicated, Exl3Linear, LayerWeights};
@@ -27,6 +28,11 @@ pub struct Dsv41Engine {
     pub head: Exl3Linear,
     pub layers: Vec<LayerWeights>,
     pub kv_caches: Vec<KvCacheLayer>,
+    pub engram_layers: Vec<EngramLayerWeights>,
+    pub engram_host: Option<EngramHost>,
+    pub d_engram_in: CudaBuf,
+    pub d_engram_kv: CudaBuf,
+    pub tok_history: Vec<i32>,
     pub mtp: Option<DsparkMtp>,
     pub d_streams: CudaBuf,
     pub d_branch_in: CudaBuf,
@@ -69,9 +75,11 @@ pub struct Dsv41Engine {
 impl Dsv41Engine {
     pub fn load(
         model_dir: &Path,
+        engram_dir: Option<&Path>,
         max_ctx: usize,
         comm: &mut Tp2Comm,
         max_layers: Option<usize>,
+        load_mtp: bool,
     ) -> Result<Self> {
         let rank = comm.rank;
         let world = comm.world_size();
@@ -111,7 +119,24 @@ impl Dsv41Engine {
                 let _ = std::io::stdout().flush();
             }
         }
-        let mtp = if n_layers == tc.num_hidden_layers && tc.num_nextn_predict_layers > 0 {
+        let mut engram_layers = Vec::new();
+        let engram_host = if let Some(edir) = engram_dir {
+            for (tidx, &lid) in tc.engram_layer_ids.iter().enumerate() {
+                if lid < n_layers {
+                    engram_layers.push(EngramLayerWeights::load(idx_opt.as_mut(), lid, tidx, comm)?);
+                }
+            }
+            if rank == 0 && !engram_layers.is_empty() {
+                let tok = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+                    .map_err(|e| anyhow::anyhow!("tokenizer load for engram failed: {e}"))?;
+                Some(EngramHost::open(edir, &tok, tc.vocab_size, cfg.pad_token_id as usize)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mtp = if load_mtp && n_layers == tc.num_hidden_layers && tc.num_nextn_predict_layers > 0 {
             let m = DsparkMtp::load(idx_opt.as_mut(), &cfg, max_ctx, comm)?;
             if rank == 0 {
                 println!("[load] DSpark MTP ({} layers, block={}) ready", m.layers.len(), tc.dspark_block_size);
@@ -143,6 +168,11 @@ impl Dsv41Engine {
             head,
             layers,
             kv_caches,
+            engram_layers,
+            engram_host,
+            d_engram_in: CudaBuf::new(MAX_BATCH * 6144 * 2).map_err(CudaFail)?,
+            d_engram_kv: CudaBuf::new(MAX_BATCH * 5 * d * 2).map_err(CudaFail)?,
+            tok_history: Vec::with_capacity(max_ctx),
             mtp,
             d_streams: CudaBuf::new(MAX_BATCH * 4 * d * 4).map_err(CudaFail)?,
             d_branch_in: CudaBuf::new(MAX_BATCH * d * 4).map_err(CudaFail)?,
@@ -240,6 +270,10 @@ impl Dsv41Engine {
 
         let tok_bytes = unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, m * 4) };
         self.d_tok_ids.copy_from(tok_bytes, None).map_err(CudaFail)?;
+        if self.tok_history.len() > self.pos {
+            self.tok_history.truncate(self.pos);
+        }
+        self.tok_history.extend_from_slice(tokens);
         unsafe {
             cuda_ops::rad_cuda_embed_to_mhc_f16(self.embed.ptr, self.d_tok_ids.ptr as *const i32, self.d_streams.ptr, mi, d as i32, stream);
         }
@@ -249,6 +283,38 @@ impl Dsv41Engine {
         let branch_dst = comm.rdma_ptrs().map(|(s, _)| s).unwrap_or(self.d_branch_out.ptr);
 
         for l in 0..self.layers.len() {
+            if let Some(e_idx) = self.engram_layers.iter().position(|e| e.layer_id == l) {
+                let table_idx = self.engram_layers[e_idx].table_idx;
+                let row_bytes = if self.rank == 0 {
+                    let vals = self
+                        .engram_host
+                        .as_ref()
+                        .unwrap()
+                        .lookup_batch_f16(table_idx, &self.tok_history, self.pos, m)?;
+                    let bytes = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 2) }.to_vec();
+                    if self.world > 1 {
+                        comm.send_bytes(&bytes)?;
+                    }
+                    bytes
+                } else {
+                    comm.recv_bytes()?
+                };
+                self.d_engram_in.copy_from(&row_bytes, None).map_err(CudaFail)?;
+                unsafe {
+                    let ew = &self.engram_layers[e_idx];
+                    self.exl3_proj(self.d_engram_in.ptr, &ew.wkv, self.d_engram_kv.ptr, mi, 0, stream);
+                    cuda_ops::rad_cuda_engram_gate_f32(
+                        self.d_streams.ptr,
+                        self.d_engram_kv.ptr,
+                        ew.q_weight.ptr,
+                        ew.k_weight.ptr,
+                        mi,
+                        d as i32,
+                        tc.rms_norm_eps,
+                        stream,
+                    );
+                }
+            }
             unsafe {
                 let lw = &self.layers[l];
                 cuda_ops::rad_cuda_mhc_pre_and_coeff(

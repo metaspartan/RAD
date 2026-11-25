@@ -546,6 +546,98 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     );
 }
 
+__global__ void engram_gate_f32_k(
+    float* __restrict__ streams,
+    const half* __restrict__ kv,
+    const float* __restrict__ q_weight,
+    const float* __restrict__ k_weight,
+    int D,
+    float eps
+) {
+    int r = blockIdx.x;
+    int mr = blockIdx.y;
+    int t = threadIdx.x;
+    float* sr = streams + ((size_t)mr * 4 + r) * D;
+    const half* kr = kv + ((size_t)mr * 5 + r) * D;
+    const half* vr = kv + ((size_t)mr * 5 + 4) * D;
+    const float* qw = q_weight + (size_t)r * D;
+    const float* kw = k_weight + (size_t)r * D;
+
+    float qss = 0.0f;
+    float kss = 0.0f;
+    for (int i = t; i < D; i += blockDim.x) {
+        float qv = sr[i];
+        float kv_v = __half2float(kr[i]);
+        qss = fmaf(qv, qv, qss);
+        kss = fmaf(kv_v, kv_v, kss);
+    }
+    int lane = t & 31;
+    int warp = t >> 5;
+    __shared__ float sm_q[32];
+    __shared__ float sm_k[32];
+    for (int m = 16; m > 0; m >>= 1) {
+        qss += __shfl_xor_sync(0xFFFFFFFFu, qss, m);
+        kss += __shfl_xor_sync(0xFFFFFFFFu, kss, m);
+    }
+    if (lane == 0) {
+        sm_q[warp] = qss;
+        sm_k[warp] = kss;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float vq = (lane < (blockDim.x >> 5)) ? sm_q[lane] : 0.0f;
+        float vk = (lane < (blockDim.x >> 5)) ? sm_k[lane] : 0.0f;
+        for (int m = 16; m > 0; m >>= 1) {
+            vq += __shfl_xor_sync(0xFFFFFFFFu, vq, m);
+            vk += __shfl_xor_sync(0xFFFFFFFFu, vk, m);
+        }
+        if (lane == 0) {
+            sm_q[0] = rsqrtf(vq / (float)D + eps);
+            sm_k[0] = rsqrtf(vk / (float)D + eps);
+        }
+    }
+    __syncthreads();
+    float qinv = sm_q[0];
+    float kinv = sm_k[0];
+
+    float dot = 0.0f;
+    for (int i = t; i < D; i += blockDim.x) {
+        float qn = sr[i] * qinv * qw[i];
+        float kn = __half2float(kr[i]) * kinv * kw[i];
+        dot = fmaf(qn, kn, dot);
+    }
+    for (int m = 16; m > 0; m >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, m);
+    if (lane == 0) sm_q[warp] = dot;
+    __syncthreads();
+    if (warp == 0) {
+        float vd = (lane < (blockDim.x >> 5)) ? sm_q[lane] : 0.0f;
+        for (int m = 16; m > 0; m >>= 1) vd += __shfl_xor_sync(0xFFFFFFFFu, vd, m);
+        if (lane == 0) {
+            float sc = vd * rsqrtf((float)D);
+            sm_q[0] = 1.0f / (1.0f + expf(-sc));
+        }
+    }
+    __syncthreads();
+    float gate = sm_q[0];
+    for (int i = t; i < D; i += blockDim.x) {
+        sr[i] += gate * __half2float(vr[i]);
+    }
+}
+
+void rad_cuda_engram_gate_f32(
+    float* streams,
+    const half* kv,
+    const float* q_weight,
+    const float* k_weight,
+    int M,
+    int D,
+    float eps,
+    cudaStream_t stream
+) {
+    dim3 grid(4, M);
+    engram_gate_f32_k<<<grid, 256, 0, stream>>>(streams, kv, q_weight, k_weight, D, eps);
+}
+
 void rad_cuda_mtp_add_proj_to_mhc_f32(
     const __nv_bfloat16* embed,
     const int* tok_ids,

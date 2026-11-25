@@ -158,6 +158,17 @@ extern "C" {
         stream: CudaStream,
     );
 
+    pub fn rad_cuda_engram_gate_f32(
+        streams: *mut c_void,
+        kv: *const c_void,
+        q_weight: *const c_void,
+        k_weight: *const c_void,
+        m: i32,
+        d: i32,
+        eps: f32,
+        stream: CudaStream,
+    );
+
     pub fn rad_cuda_mtp_add_proj_to_mhc_f32(
         embed: *const c_void,
         tok_ids: *const i32,
