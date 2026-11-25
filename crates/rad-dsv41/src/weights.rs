@@ -267,6 +267,32 @@ pub fn load_raw_buf_row_shard(
     buf_from_slice(&bytes[..half])
 }
 
+pub struct CompressorWeights {
+    pub wkv: Exl3Linear,
+    pub wgate: Option<Exl3Linear>,
+    pub norm: CudaBuf,
+    pub ratio: usize,
+}
+
+impl CompressorWeights {
+    pub fn load(
+        mut idx: Option<&mut SafetensorsIndex>,
+        layer_id: usize,
+        ratio: usize,
+        comm: &mut Tp2Comm,
+    ) -> Result<Self> {
+        let p = format!("layers.{layer_id}.attn.compressor");
+        let wkv = Exl3Linear::load_replicated(idx.as_deref_mut(), &format!("{p}.wkv"), comm)?;
+        let wgate = if ratio > 1 {
+            Some(Exl3Linear::load_replicated(idx.as_deref_mut(), &format!("{p}.wgate"), comm)?)
+        } else {
+            None
+        };
+        let norm = load_raw_buf_replicated(idx.as_deref_mut(), &format!("{p}.norm.weight"), comm)?;
+        Ok(Self { wkv, wgate, norm, ratio })
+    }
+}
+
 pub struct ExpertWeights {
     pub w1: Exl3Linear,
     pub w2: Exl3Linear,

@@ -9,13 +9,21 @@ use crate::cuda_ops;
 use crate::engram::{EngramHost, EngramLayerWeights};
 use crate::mtp::{ngram_draft, DsparkMtp};
 use crate::safetensors::SafetensorsIndex;
-use crate::weights::{load_raw_buf_replicated, Exl3Linear, LayerWeights};
+use crate::weights::{load_raw_buf_replicated, CompressorWeights, Exl3Linear, LayerWeights};
 
 pub const MAX_BATCH: usize = 64;
 
 pub struct KvCacheLayer {
     pub k_cache: CudaBuf,
     pub v_cache: CudaBuf,
+}
+
+pub struct CompKvSlot {
+    pub layer_id: usize,
+    pub weights: CompressorWeights,
+    pub raw_kv: CudaBuf,
+    pub raw_gate: Option<CudaBuf>,
+    pub comp_kv: CudaBuf,
 }
 
 pub struct Dsv41Engine {
@@ -28,6 +36,7 @@ pub struct Dsv41Engine {
     pub head: Exl3Linear,
     pub layers: Vec<LayerWeights>,
     pub kv_caches: Vec<KvCacheLayer>,
+    pub comp_slots: Vec<CompKvSlot>,
     pub engram_layers: Vec<EngramLayerWeights>,
     pub engram_host: Option<EngramHost>,
     pub d_engram_in: CudaBuf,
@@ -122,6 +131,28 @@ impl Dsv41Engine {
                 let _ = std::io::stdout().flush();
             }
         }
+        let mut comp_slots = Vec::new();
+        for &lid in &tc.kv_source_layer_ids {
+            if lid < n_layers {
+                let ratio = tc.compress_ratios.get(lid).copied().unwrap_or(1).max(1);
+                let weights = CompressorWeights::load(idx_opt.as_mut(), lid, ratio, comm)?;
+                let raw_kv = CudaBuf::new(max_ctx * tc.head_dim * 2).map_err(CudaFail)?;
+                let raw_gate = if ratio > 1 {
+                    Some(CudaBuf::new(max_ctx * tc.head_dim * 2).map_err(CudaFail)?)
+                } else {
+                    None
+                };
+                let comp_cap = (max_ctx / ratio).max(1);
+                let comp_kv = CudaBuf::new(comp_cap * tc.head_dim * 2).map_err(CudaFail)?;
+                comp_slots.push(CompKvSlot {
+                    layer_id: lid,
+                    weights,
+                    raw_kv,
+                    raw_gate,
+                    comp_kv,
+                });
+            }
+        }
         let mut engram_layers = Vec::new();
         let engram_host = if let Some(edir) = engram_dir {
             for (tidx, &lid) in tc.engram_layer_ids.iter().enumerate() {
@@ -171,6 +202,7 @@ impl Dsv41Engine {
             head,
             layers,
             kv_caches,
+            comp_slots,
             engram_layers,
             engram_host,
             d_engram_in: CudaBuf::new(MAX_BATCH * 6144 * 2).map_err(CudaFail)?,
@@ -391,12 +423,56 @@ impl Dsv41Engine {
                     stream,
                 );
 
+                if let Some(cs_idx) = self.comp_slots.iter().position(|s| s.layer_id == l) {
+                    let ratio = self.comp_slots[cs_idx].weights.ratio;
+                    self.exl3_proj(self.d_normed.ptr, &self.comp_slots[cs_idx].weights.wkv, self.d_kv.ptr, mi, 0, stream);
+                    if ratio == 1 {
+                        cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, self.comp_slots[cs_idx].weights.norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, stream);
+                        cuda_ops::rad_cuda_rope_yarn_f16(std::ptr::null_mut(), self.d_kv_normed.ptr, mi, 0, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, r_theta, r_orig, 1.0f32, stream);
+                        cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv_normed.ptr, self.d_kv_normed.ptr, self.comp_slots[cs_idx].comp_kv.ptr, self.comp_slots[cs_idx].comp_kv.ptr, mi, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
+                    } else {
+                        cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv.ptr, self.d_kv.ptr, self.comp_slots[cs_idx].raw_kv.ptr, self.comp_slots[cs_idx].raw_kv.ptr, mi, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
+                        if let (Some(ref wg), Some(ref rg)) = (&self.comp_slots[cs_idx].weights.wgate, &self.comp_slots[cs_idx].raw_gate) {
+                            self.exl3_proj(self.d_normed.ptr, wg, self.d_kv.ptr, mi, 0, stream);
+                            cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv.ptr, self.d_kv.ptr, rg.ptr, rg.ptr, mi, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
+                            let c_start = start_pos / 2;
+                            let c_end = (start_pos + mi) / 2;
+                            if c_end > c_start {
+                                cuda_ops::rad_cuda_csa2_compress_pair_f16(
+                                    self.comp_slots[cs_idx].raw_kv.ptr,
+                                    rg.ptr,
+                                    self.comp_slots[cs_idx].weights.norm.ptr,
+                                    self.comp_slots[cs_idx].comp_kv.ptr,
+                                    c_start,
+                                    c_end - c_start,
+                                    tc.head_dim as i32,
+                                    tc.qk_rope_head_dim as i32,
+                                    r_theta,
+                                    r_orig,
+                                    tc.rms_norm_eps,
+                                    stream,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let sink_ptr = (lw.attn_sink.ptr as *const f32).add(self.rank * n_heads_local);
                 let sw = if is_comp { tc.sliding_window as i32 } else { 0 };
+                let (comp_ptr, comp_ratio) = if is_comp {
+                    if let Some(cs) = self.comp_slots.iter().rfind(|s| s.layer_id <= l) {
+                        (cs.comp_kv.ptr as *const c_void, cs.weights.ratio as i32)
+                    } else {
+                        (std::ptr::null(), 0)
+                    }
+                } else {
+                    (std::ptr::null(), 0)
+                };
                 cuda_ops::rad_cuda_mqa_attn_sink_causal_f16(
                     self.d_q.ptr,
                     self.kv_caches[l].k_cache.ptr,
                     self.kv_caches[l].v_cache.ptr,
+                    comp_ptr,
                     sink_ptr,
                     self.d_attn_out.ptr,
                     mi,
@@ -404,6 +480,7 @@ impl Dsv41Engine {
                     start_pos,
                     self.max_ctx as i32,
                     sw,
+                    comp_ratio,
                     tc.head_dim as i32,
                     attn_scale,
                     stream,
@@ -865,7 +942,7 @@ impl Dsv41Engine {
         let t2 = std::time::Instant::now();
         unsafe {
             let sink_ptr = (lw.attn_sink.ptr as *const f32).add(self.rank * n_heads_local);
-            cuda_ops::rad_cuda_mqa_attn_sink_causal_f16(self.d_q.ptr, self.kv_caches[0].k_cache.ptr, self.kv_caches[0].v_cache.ptr, sink_ptr, self.d_attn_out.ptr, 1, n_heads_local as i32, start_pos, self.max_ctx as i32, 0, tc.head_dim as i32, attn_scale, stream);
+            cuda_ops::rad_cuda_mqa_attn_sink_causal_f16(self.d_q.ptr, self.kv_caches[0].k_cache.ptr, self.kv_caches[0].v_cache.ptr, std::ptr::null(), sink_ptr, self.d_attn_out.ptr, 1, n_heads_local as i32, start_pos, self.max_ctx as i32, 0, 0, tc.head_dim as i32, attn_scale, stream);
             cuda_ops::rad_cuda_rope_yarn_f16(self.d_attn_out.ptr, std::ptr::null_mut(), 1, n_heads_local as i32, 0, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, -1.0f32, stream);
         }
         let _ = sync_t();

@@ -148,6 +148,7 @@ extern "C" {
         q: *const c_void,
         k_cache: *const c_void,
         v_cache: *const c_void,
+        comp_kv: *const c_void,
         attn_sink: *const f32,
         out: *mut c_void,
         m: i32,
@@ -155,8 +156,24 @@ extern "C" {
         start_pos: i32,
         max_ctx: i32,
         sliding_window: i32,
+        comp_ratio: i32,
         head_dim: i32,
         scale: f32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_csa2_compress_pair_f16(
+        raw_kv: *const c_void,
+        raw_gate: *const c_void,
+        norm_w: *const c_void,
+        comp_out: *mut c_void,
+        c_start: i32,
+        n_pairs: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        theta: f32,
+        orig_len: i32,
+        eps: f32,
         stream: CudaStream,
     );
 

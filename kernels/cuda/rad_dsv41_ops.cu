@@ -297,12 +297,14 @@ __global__ void mqa_attn_sink_causal_f16_k(
     const half* __restrict__ q,
     const half* __restrict__ k_cache,
     const half* __restrict__ v_cache,
+    const half* __restrict__ comp_kv,
     const float* __restrict__ attn_sink,
     half* __restrict__ out,
     int n_heads,
     int start_pos,
     int max_ctx,
     int sliding_window,
+    int comp_ratio,
     int head_dim,
     float scale
 ) {
@@ -310,9 +312,9 @@ __global__ void mqa_attn_sink_causal_f16_k(
     int mr = blockIdx.y;
     int t = threadIdx.x;
     const half* qh = q + ((size_t)mr * n_heads + h) * head_dim;
-    extern __shared__ float dspark_smem[];
-    float* s_q = dspark_smem;
-    float* s_acc = dspark_smem + head_dim;
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* s_acc = smem + head_dim;
     __shared__ float wsum[32];
     for (int d = t; d < head_dim; d += blockDim.x) {
         s_q[d] = __half2float(qh[d]);
@@ -353,10 +355,119 @@ __global__ void mqa_attn_sink_causal_f16_k(
             s_acc[d] = s_acc[d] * alpha + beta * __half2float(vp[d]);
         }
     }
+    if (comp_kv && comp_ratio > 0) {
+        int n_comp = seq_len / comp_ratio;
+        int c_start = (n_comp > 512) ? (n_comp - 512) : 0;
+        for (int c = c_start; c < n_comp; ++c) {
+            const half* ck = comp_kv + (size_t)c * head_dim;
+            float dot = 0.0f;
+            for (int d = t; d < head_dim; d += blockDim.x) {
+                dot += s_q[d] * __half2float(ck[d]);
+            }
+            for (int m = 16; m > 0; m >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, m);
+            if (lane == 0) wsum[warp] = dot;
+            __syncthreads();
+            if (warp == 0) {
+                float v = (lane < (blockDim.x >> 5)) ? wsum[lane] : 0.0f;
+                for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+                if (lane == 0) wsum[0] = v * scale;
+            }
+            __syncthreads();
+            float score = wsum[0];
+            __syncthreads();
+            float new_max = fmaxf(m_max, score);
+            float alpha = expf(m_max - new_max);
+            float beta = expf(score - new_max);
+            l_sum = l_sum * alpha + beta;
+            m_max = new_max;
+            for (int d = t; d < head_dim; d += blockDim.x) {
+                s_acc[d] = s_acc[d] * alpha + beta * __half2float(ck[d]);
+            }
+        }
+    }
     float inv = 1.0f / fmaxf(l_sum, 1e-20f);
     half* oh = out + ((size_t)mr * n_heads + h) * head_dim;
     for (int d = t; d < head_dim; d += blockDim.x) {
         oh[d] = __float2half(s_acc[d] * inv);
+    }
+}
+
+__global__ void csa2_compress_pair_f16_k(
+    const half* __restrict__ raw_kv,
+    const half* __restrict__ raw_gate,
+    const __nv_bfloat16* __restrict__ norm_w,
+    half* __restrict__ comp_out,
+    int c_start,
+    int head_dim,
+    int rope_dim,
+    float theta,
+    int orig_len,
+    float eps
+) {
+    int c = c_start + blockIdx.x;
+    int t = threadIdx.x;
+    const half* k0 = raw_kv + (size_t)(2 * c) * head_dim;
+    const half* k1 = raw_kv + (size_t)(2 * c + 1) * head_dim;
+    const half* g0 = raw_gate + (size_t)(2 * c) * head_dim;
+    const half* g1 = raw_gate + (size_t)(2 * c + 1) * head_dim;
+    __shared__ float s_v[512];
+    __shared__ float sm[32];
+    float ss = 0.0f;
+    for (int i = t; i < head_dim; i += blockDim.x) {
+        float sc0 = __half2float(g0[i]);
+        float sc1 = __half2float(g1[i]);
+        float mx = fmaxf(sc0, sc1);
+        float e0 = expf(sc0 - mx);
+        float e1 = expf(sc1 - mx);
+        float w0 = e0 / (e0 + e1);
+        float v = w0 * __half2float(k0[i]) + (1.0f - w0) * __half2float(k1[i]);
+        s_v[i] = v;
+        ss += v * v;
+    }
+    int lane = t & 31;
+    int warp = t >> 5;
+    for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, m);
+    if (lane == 0) sm[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < (blockDim.x >> 5)) ? sm[lane] : 0.0f;
+        for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+        if (lane == 0) sm[0] = rsqrtf(v / (float)head_dim + eps);
+    }
+    __syncthreads();
+    float inv = sm[0];
+    for (int i = t; i < head_dim; i += blockDim.x) {
+        s_v[i] = s_v[i] * inv * __bfloat162float(norm_w[i]);
+    }
+    __syncthreads();
+    int rope_off = head_dim - rope_dim;
+    int half_r = rope_dim >> 1;
+    if (t < half_r) {
+        float freq = 1.0f / powf(theta, (float)(2 * t) / (float)rope_dim);
+        if (orig_len > 0) {
+            float factor = 16.0f;
+            float orig_ctx = (float)orig_len;
+            float low = floorf((float)rope_dim * logf(orig_ctx / (32.0f * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
+            float high = ceilf((float)rope_dim * logf(orig_ctx / (1.0f * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
+            if (low < 0.0f) low = 0.0f;
+            if (high > (float)(rope_dim - 1)) high = (float)(rope_dim - 1);
+            float ramp = ((float)t - low) / fmaxf(high - low, 0.001f);
+            if (ramp < 0.0f) ramp = 0.0f;
+            if (ramp > 1.0f) ramp = 1.0f;
+            freq = (freq / factor) * ramp + freq * (1.0f - ramp);
+        }
+        float ang = (float)(2 * c) * freq;
+        float cs = cosf(ang);
+        float sn = sinf(ang);
+        float x0 = s_v[rope_off + 2 * t];
+        float x1 = s_v[rope_off + 2 * t + 1];
+        s_v[rope_off + 2 * t] = x0 * cs - x1 * sn;
+        s_v[rope_off + 2 * t + 1] = x0 * sn + x1 * cs;
+    }
+    __syncthreads();
+    half* dst = comp_out + (size_t)c * head_dim;
+    for (int i = t; i < head_dim; i += blockDim.x) {
+        dst[i] = __float2half(s_v[i]);
     }
 }
 
@@ -541,6 +652,7 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     const half* q,
     const half* k_cache,
     const half* v_cache,
+    const half* comp_kv,
     const float* attn_sink,
     half* out,
     int M,
@@ -548,6 +660,7 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     int start_pos,
     int max_ctx,
     int sliding_window,
+    int comp_ratio,
     int head_dim,
     float scale,
     cudaStream_t stream
@@ -555,7 +668,27 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     size_t smem = (size_t)head_dim * 2 * sizeof(float);
     dim3 grid(n_heads, M);
     mqa_attn_sink_causal_f16_k<<<grid, 256, smem, stream>>>(
-        q, k_cache, v_cache, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, head_dim, scale
+        q, k_cache, v_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, head_dim, scale
+    );
+}
+
+void rad_cuda_csa2_compress_pair_f16(
+    const half* raw_kv,
+    const half* raw_gate,
+    const __nv_bfloat16* norm_w,
+    half* comp_out,
+    int c_start,
+    int n_pairs,
+    int head_dim,
+    int rope_dim,
+    float theta,
+    int orig_len,
+    float eps,
+    cudaStream_t stream
+) {
+    if (n_pairs <= 0) return;
+    csa2_compress_pair_f16_k<<<n_pairs, 256, 0, stream>>>(
+        raw_kv, raw_gate, norm_w, comp_out, c_start, head_dim, rope_dim, theta, orig_len, eps
     );
 }
 
