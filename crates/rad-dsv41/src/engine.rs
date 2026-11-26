@@ -70,7 +70,6 @@ pub struct Dsv41Engine {
     pub d_moe_act: CudaBuf,
     pub d_moe_outs: CudaBuf,
     pub d_shared_g: CudaBuf,
-    pub d_shared_u: CudaBuf,
     pub d_shared_out: CudaBuf,
     pub d_logits: CudaBuf,
     pub d_tok_ids: CudaBuf,
@@ -242,7 +241,6 @@ impl Dsv41Engine {
             d_moe_act: CudaBuf::new(MAX_BATCH * tc.num_experts_per_tok * tc.moe_intermediate_size * 2).map_err(CudaFail)?,
             d_moe_outs: CudaBuf::new(MAX_BATCH * tc.num_experts_per_tok * d * 2).map_err(CudaFail)?,
             d_shared_g: CudaBuf::new(MAX_BATCH * (tc.moe_intermediate_size / world) * 2).map_err(CudaFail)?,
-            d_shared_u: CudaBuf::new(MAX_BATCH * (tc.moe_intermediate_size / world) * 2).map_err(CudaFail)?,
             d_shared_out: CudaBuf::new(MAX_BATCH * d * 2).map_err(CudaFail)?,
             d_logits: CudaBuf::new(max_head_m * vocab_local * 2).map_err(CudaFail)?,
             d_tok_ids: CudaBuf::new(MAX_BATCH * 4).map_err(CudaFail)?,
@@ -287,6 +285,34 @@ impl Dsv41Engine {
             w.bits as i32,
             self.wht_scale,
             add_to_y,
+            stream,
+        );
+    }
+
+    unsafe fn exl3_proj_swiglu(
+        &self,
+        x: *const c_void,
+        w: &Exl3Linear,
+        gate_in: *const c_void,
+        y: *mut c_void,
+        m: i32,
+        swiglu_limit: f32,
+        stream: CudaStream,
+    ) {
+        cuda_ops::rad_cuda_wht128_pre_mul_f16(x, w.suh.ptr, self.d_xrot.ptr, m, w.k as i32, self.wht_scale, stream);
+        cuda_ops::rad_cuda_exl3_mma_swiglu_f16(
+            self.d_xrot.ptr,
+            w.trellis.ptr,
+            w.svh.ptr,
+            self.d_z_scratch.ptr,
+            gate_in,
+            y,
+            m,
+            w.k as i32,
+            w.n as i32,
+            w.bits as i32,
+            self.wht_scale,
+            swiglu_limit,
             stream,
         );
     }
@@ -419,15 +445,7 @@ impl Dsv41Engine {
             stream,
         );
         self.exl3_proj(self.d_normed.ptr, &lw.shared_w1, self.d_shared_g.ptr, mi, 0, stream);
-        self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, mi, 0, stream);
-        cuda_ops::rad_cuda_clamped_swiglu_f16(
-            self.d_shared_g.ptr,
-            self.d_shared_u.ptr,
-            self.d_shared_g.ptr,
-            mi * (tc.moe_intermediate_size / self.world) as i32,
-            tc.swiglu_limit,
-            stream,
-        );
+        self.exl3_proj_swiglu(self.d_normed.ptr, &lw.shared_w3, self.d_shared_g.ptr, self.d_shared_g.ptr, mi, tc.swiglu_limit, stream);
         self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, mi, 0, stream);
 
         let tk = tc.num_experts_per_tok as i32;
@@ -943,8 +961,7 @@ impl Dsv41Engine {
         let t6 = std::time::Instant::now();
         unsafe {
             self.exl3_proj(self.d_normed.ptr, &lw.shared_w1, self.d_shared_g.ptr, 1, 0, stream);
-            self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, 1, 0, stream);
-            cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_shared_g.ptr, self.d_shared_u.ptr, self.d_shared_g.ptr, (tc.moe_intermediate_size / self.world) as i32, tc.swiglu_limit, stream);
+            self.exl3_proj_swiglu(self.d_normed.ptr, &lw.shared_w3, self.d_shared_g.ptr, self.d_shared_g.ptr, 1, tc.swiglu_limit, stream);
             self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, 1, 0, stream);
         }
         let _ = sync_t();
@@ -1145,8 +1162,7 @@ impl Dsv41Engine {
                                 let n_local = lw.experts.len() as i32;
                                 cuda_ops::rad_cuda_moe_route_sqrtsoftplus(self.d_normed.ptr, lw.gate_w.ptr, lw.gate_bias.ptr, self.d_gate_raw.ptr, self.d_gate_sel.ptr, self.d_topk_ids.ptr, self.d_topk_weights.ptr, mi, tc.dspark_n_routed_experts as i32, d as i32, tk, tc.routed_scaling_factor, gs);
                                 self.exl3_proj(self.d_normed.ptr, &lw.shared_w1, self.d_shared_g.ptr, mi, 0, gs);
-                                self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, mi, 0, gs);
-                                cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_shared_g.ptr, self.d_shared_u.ptr, self.d_shared_g.ptr, mi * (tc.moe_intermediate_size / self.world) as i32, tc.swiglu_limit, gs);
+                                self.exl3_proj_swiglu(self.d_normed.ptr, &lw.shared_w3, self.d_shared_g.ptr, self.d_shared_g.ptr, mi, tc.swiglu_limit, gs);
                                 self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, mi, 0, gs);
                                 cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_gate.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 0, gs);
                                 cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, self.d_moe_act.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 1, gs);
@@ -1171,8 +1187,7 @@ impl Dsv41Engine {
                         let n_local = lw.experts.len() as i32;
                         cuda_ops::rad_cuda_moe_route_sqrtsoftplus(self.d_normed.ptr, lw.gate_w.ptr, lw.gate_bias.ptr, self.d_gate_raw.ptr, self.d_gate_sel.ptr, self.d_topk_ids.ptr, self.d_topk_weights.ptr, mi, tc.dspark_n_routed_experts as i32, d as i32, tk, tc.routed_scaling_factor, stream);
                         self.exl3_proj(self.d_normed.ptr, &lw.shared_w1, self.d_shared_g.ptr, mi, 0, stream);
-                        self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, mi, 0, stream);
-                        cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_shared_g.ptr, self.d_shared_u.ptr, self.d_shared_g.ptr, mi * (tc.moe_intermediate_size / self.world) as i32, tc.swiglu_limit, stream);
+                        self.exl3_proj_swiglu(self.d_normed.ptr, &lw.shared_w3, self.d_shared_g.ptr, self.d_shared_g.ptr, mi, tc.swiglu_limit, stream);
                         self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, mi, 0, stream);
                         cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_gate.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 0, stream);
                         cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, self.d_moe_act.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 1, stream);

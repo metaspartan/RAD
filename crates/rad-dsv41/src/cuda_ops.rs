@@ -29,6 +29,22 @@ extern "C" {
         stream: CudaStream,
     );
 
+    pub fn rad_cuda_exl3_mma_swiglu_f16(
+        x_rot: *const c_void,
+        trellis: *const c_void,
+        svh: *const c_void,
+        z_scratch_f32: *mut c_void,
+        gate_in: *const c_void,
+        y: *mut c_void,
+        m: i32,
+        k: i32,
+        n: i32,
+        bits: i32,
+        wht_scale: f32,
+        swiglu_limit: f32,
+        stream: CudaStream,
+    );
+
     pub fn rad_cuda_exl3_moe_mma_f16(
         x_in: *const c_void,
         trellis_ptrs: *const *const c_void,
@@ -88,6 +104,7 @@ extern "C" {
         stream: CudaStream,
     );
 
+    #[allow(dead_code)]
     pub fn rad_cuda_clamped_swiglu_f16(
         gate: *const c_void,
         up: *const c_void,

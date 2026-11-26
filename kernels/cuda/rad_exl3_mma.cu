@@ -121,38 +121,53 @@ __device__ __forceinline__ void mma_warp_wht128_f32(float& v0, float& v1, float&
 __global__ void mma_wht128_post_f32_to_f16_k(
     const float* __restrict__ z_f32,
     const half* __restrict__ svh,
+    const half* __restrict__ gate_in,
     half* __restrict__ y,
     int N,
     float scale,
+    float swiglu_limit,
     int add_to_y
 ) {
     int blk = blockIdx.x;
     int row = blockIdx.y;
     int lane = threadIdx.x;
     int col = blk * 128 + lane * 4;
-    const float* zr = z_f32 + (size_t)row * N + col;
-    float v0 = zr[0], v1 = zr[1], v2 = zr[2], v3 = zr[3];
+    float4 zv = *reinterpret_cast<const float4*>(z_f32 + (size_t)row * N + col);
+    float v0 = zv.x, v1 = zv.y, v2 = zv.z, v3 = zv.w;
     if (scale > 0.0f) {
         mma_warp_wht128_f32(v0, v1, v2, v3, lane, scale);
     }
     if (svh) {
-        v0 *= __half2float(svh[col + 0]);
-        v1 *= __half2float(svh[col + 1]);
-        v2 *= __half2float(svh[col + 2]);
-        v3 *= __half2float(svh[col + 3]);
+        uint2 sq = __ldg(reinterpret_cast<const uint2*>(svh + col));
+        float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
+        float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
+        v0 *= s01.x; v1 *= s01.y; v2 *= s23.x; v3 *= s23.y;
     }
-    half* yr = y + (size_t)row * N + col;
-    if (add_to_y) {
-        yr[0] = __float2half(fmaxf(fminf(__half2float(yr[0]) + v0, 65000.0f), -65000.0f));
-        yr[1] = __float2half(fmaxf(fminf(__half2float(yr[1]) + v1, 65000.0f), -65000.0f));
-        yr[2] = __float2half(fmaxf(fminf(__half2float(yr[2]) + v2, 65000.0f), -65000.0f));
-        yr[3] = __float2half(fmaxf(fminf(__half2float(yr[3]) + v3, 65000.0f), -65000.0f));
-    } else {
-        yr[0] = __float2half(fmaxf(fminf(v0, 65000.0f), -65000.0f));
-        yr[1] = __float2half(fmaxf(fminf(v1, 65000.0f), -65000.0f));
-        yr[2] = __float2half(fmaxf(fminf(v2, 65000.0f), -65000.0f));
-        yr[3] = __float2half(fmaxf(fminf(v3, 65000.0f), -65000.0f));
+    if (gate_in) {
+        uint2 gq = *reinterpret_cast<const uint2*>(gate_in + (size_t)row * N + col);
+        float2 g01 = __half22float2(*reinterpret_cast<const half2*>(&gq.x));
+        float2 g23 = __half22float2(*reinterpret_cast<const half2*>(&gq.y));
+        auto act = [&](float g, float u) -> float {
+            float gc = fminf(g, swiglu_limit);
+            float uc = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
+            return (gc / (1.0f + expf(-gc))) * uc;
+        };
+        v0 = act(g01.x, v0);
+        v1 = act(g01.y, v1);
+        v2 = act(g23.x, v2);
+        v3 = act(g23.y, v3);
+    } else if (add_to_y) {
+        uint2 yq = *reinterpret_cast<const uint2*>(y + (size_t)row * N + col);
+        float2 y01 = __half22float2(*reinterpret_cast<const half2*>(&yq.x));
+        float2 y23 = __half22float2(*reinterpret_cast<const half2*>(&yq.y));
+        v0 += y01.x; v1 += y01.y; v2 += y23.x; v3 += y23.y;
     }
+    half2 h01 = __float22half2_rn(make_float2(fmaxf(fminf(v0, 65000.0f), -65000.0f), fmaxf(fminf(v1, 65000.0f), -65000.0f)));
+    half2 h23 = __float22half2_rn(make_float2(fmaxf(fminf(v2, 65000.0f), -65000.0f), fmaxf(fminf(v3, 65000.0f), -65000.0f)));
+    uint2 out_u2;
+    out_u2.x = *reinterpret_cast<const uint32_t*>(&h01);
+    out_u2.y = *reinterpret_cast<const uint32_t*>(&h23);
+    *reinterpret_cast<uint2*>(y + (size_t)row * N + col) = out_u2;
 }
 
 template <int BITS>
@@ -992,23 +1007,19 @@ __global__ void batched_group_wht128_post_f32_to_f16_k(
     int row_g = blockIdx.y;
     int g = row_g % G;
     int base = block_idx * 128 + lane * 4;
-    const float* zr = z_f32 + (size_t)row_g * N;
-    const half* svh = svh_ptrs[g];
-    half* yr = y_out + (size_t)row_g * N;
-
-    float v0 = zr[base + 0];
-    float v1 = zr[base + 1];
-    float v2 = zr[base + 2];
-    float v3 = zr[base + 3];
+    float4 zv = *reinterpret_cast<const float4*>(z_f32 + (size_t)row_g * N + base);
+    float v0 = zv.x, v1 = zv.y, v2 = zv.z, v3 = zv.w;
     mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
-    v0 *= __half2float(svh[base + 0]);
-    v1 *= __half2float(svh[base + 1]);
-    v2 *= __half2float(svh[base + 2]);
-    v3 *= __half2float(svh[base + 3]);
-    yr[base + 0] = __float2half(fminf(fmaxf(v0, -65504.0f), 65504.0f));
-    yr[base + 1] = __float2half(fminf(fmaxf(v1, -65504.0f), 65504.0f));
-    yr[base + 2] = __float2half(fminf(fmaxf(v2, -65504.0f), 65504.0f));
-    yr[base + 3] = __float2half(fminf(fmaxf(v3, -65504.0f), 65504.0f));
+    uint2 sq = __ldg(reinterpret_cast<const uint2*>(svh_ptrs[g] + base));
+    float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
+    float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
+    v0 *= s01.x; v1 *= s01.y; v2 *= s23.x; v3 *= s23.y;
+    half2 h01 = __float22half2_rn(make_float2(fminf(fmaxf(v0, -65504.0f), 65504.0f), fminf(fmaxf(v1, -65504.0f), 65504.0f)));
+    half2 h23 = __float22half2_rn(make_float2(fminf(fmaxf(v2, -65504.0f), 65504.0f), fminf(fmaxf(v3, -65504.0f), 65504.0f)));
+    uint2 out_u2;
+    out_u2.x = *reinterpret_cast<const uint32_t*>(&h01);
+    out_u2.y = *reinterpret_cast<const uint32_t*>(&h23);
+    *reinterpret_cast<uint2*>(y_out + (size_t)row_g * N + base) = out_u2;
 }
 
 static int* g_moe_meta = nullptr;
@@ -1200,7 +1211,59 @@ void rad_cuda_exl3_mma_f16(
         }
     }
     dim3 post_grid(n_blocks, M);
-    mma_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh, y, N, wht_scale, add_to_y);
+    mma_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh, nullptr, y, N, wht_scale, 0.0f, add_to_y);
+}
+
+void rad_cuda_exl3_mma_swiglu_f16(
+    const half* x_rot,
+    const uint16_t* trellis,
+    const half* svh,
+    float* z_scratch_f32,
+    const half* gate_in,
+    half* y,
+    int M,
+    int K,
+    int N,
+    int bits,
+    float wht_scale,
+    float swiglu_limit,
+    cudaStream_t stream
+) {
+    int n_blocks = N / 128;
+    int use_m64 = (M >= 32);
+    int m_blocks = use_m64 ? ((M + 63) / 64) : ((M + 15) / 16);
+    int total_mn = n_blocks * m_blocks;
+    int target_ctas = (M >= 64) ? 96 : 192;
+    int split_k = (target_ctas + total_mn - 1) / total_mn;
+    int max_sk = K / 128;
+    if (split_k > max_sk) split_k = max_sk;
+    if (split_k > 16) split_k = 16;
+    if (split_k < 1) split_k = 1;
+    if (split_k > 1) {
+        cudaMemsetAsync(z_scratch_f32, 0, (size_t)M * N * sizeof(float), stream);
+    }
+    dim3 grid(n_blocks, m_blocks, split_k);
+    if (use_m64) {
+        switch (bits) {
+            case 2: exl3_mma_m64_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 3: exl3_mma_m64_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 4: exl3_mma_m64_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 5: exl3_mma_m64_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 6: exl3_mma_m64_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 8: exl3_mma_m64_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+        }
+    } else {
+        switch (bits) {
+            case 2: exl3_mma_m16_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 3: exl3_mma_m16_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 4: exl3_mma_m16_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 5: exl3_mma_m16_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 6: exl3_mma_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 8: exl3_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+        }
+    }
+    dim3 post_grid(n_blocks, M);
+    mma_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh, gate_in, y, N, wht_scale, swiglu_limit, 0);
 }
 
 }

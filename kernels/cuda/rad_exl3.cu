@@ -109,17 +109,23 @@ __global__ void wht128_pre_mul_f16_k(
     int row = blockIdx.y;
     int lane = threadIdx.x;
     int base = blk * 128 + lane * 4;
-    const half* xr = x + (size_t)row * K + base;
-    half* yr = y + (size_t)row * K + base;
-    float v0 = __half2float(xr[0]) * (suh ? __half2float(suh[base + 0]) : 1.0f);
-    float v1 = __half2float(xr[1]) * (suh ? __half2float(suh[base + 1]) : 1.0f);
-    float v2 = __half2float(xr[2]) * (suh ? __half2float(suh[base + 2]) : 1.0f);
-    float v3 = __half2float(xr[3]) * (suh ? __half2float(suh[base + 3]) : 1.0f);
+    uint2 xq = *reinterpret_cast<const uint2*>(x + (size_t)row * K + base);
+    float2 x01 = __half22float2(*reinterpret_cast<const half2*>(&xq.x));
+    float2 x23 = __half22float2(*reinterpret_cast<const half2*>(&xq.y));
+    float v0 = x01.x, v1 = x01.y, v2 = x23.x, v3 = x23.y;
+    if (suh) {
+        uint2 sq = __ldg(reinterpret_cast<const uint2*>(suh + base));
+        float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
+        float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
+        v0 *= s01.x; v1 *= s01.y; v2 *= s23.x; v3 *= s23.y;
+    }
     warp_wht128_f32(v0, v1, v2, v3, lane, scale);
-    yr[0] = __float2half(v0);
-    yr[1] = __float2half(v1);
-    yr[2] = __float2half(v2);
-    yr[3] = __float2half(v3);
+    half2 h01 = __float22half2_rn(make_float2(v0, v1));
+    half2 h23 = __float22half2_rn(make_float2(v2, v3));
+    uint2 out_u2;
+    out_u2.x = *reinterpret_cast<const uint32_t*>(&h01);
+    out_u2.y = *reinterpret_cast<const uint32_t*>(&h23);
+    *reinterpret_cast<uint2*>(y + (size_t)row * K + base) = out_u2;
 }
 
 __global__ void wht128_post_mul_f32_to_f16_k(
