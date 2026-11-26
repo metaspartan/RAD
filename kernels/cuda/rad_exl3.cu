@@ -105,9 +105,11 @@ __global__ void wht128_pre_mul_f16_k(
     int K,
     float scale
 ) {
-    int blk = blockIdx.x;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int blk = blockIdx.x * 4 + warp;
+    if (blk * 128 >= K) return;
     int row = blockIdx.y;
-    int lane = threadIdx.x;
     int base = blk * 128 + lane * 4;
     uint2 xq = *reinterpret_cast<const uint2*>(x + (size_t)row * K + base);
     float2 x01 = __half22float2(*reinterpret_cast<const half2*>(&xq.x));
@@ -447,8 +449,8 @@ void rad_cuda_wht128_pre_mul_f16(
     float scale,
     cudaStream_t stream
 ) {
-    dim3 grid(K / 128, M);
-    wht128_pre_mul_f16_k<<<grid, 32, 0, stream>>>(x, suh, y, K, scale);
+    dim3 grid((K / 128 + 3) / 4, M);
+    wht128_pre_mul_f16_k<<<grid, 128, 0, stream>>>(x, suh, y, K, scale);
 }
 
 void rad_cuda_exl3_reconstruct_f16(

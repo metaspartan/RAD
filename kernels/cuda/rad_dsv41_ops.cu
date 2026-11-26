@@ -16,9 +16,13 @@ __global__ void rms_norm_bf16w_f16_k(
     const half* xr = x + (size_t)row * D;
     half* yr = y + (size_t)row * D;
     float ss = 0.0f;
-    for (int i = t; i < D; i += blockDim.x) {
-        float v = __half2float(xr[i]);
-        ss += v * v;
+    int d4 = D >> 2;
+    const uint2* xr4 = reinterpret_cast<const uint2*>(xr);
+    for (int i = t; i < d4; i += blockDim.x) {
+        uint2 xq = xr4[i];
+        float2 x01 = __half22float2(*reinterpret_cast<const half2*>(&xq.x));
+        float2 x23 = __half22float2(*reinterpret_cast<const half2*>(&xq.y));
+        ss = fmaf(x01.x, x01.x, fmaf(x01.y, x01.y, fmaf(x23.x, x23.x, fmaf(x23.y, x23.y, ss))));
     }
     __shared__ float sm[32];
     int lane = t & 31;
@@ -33,9 +37,21 @@ __global__ void rms_norm_bf16w_f16_k(
     }
     __syncthreads();
     float inv = sm[0];
-    for (int i = t; i < D; i += blockDim.x) {
-        float v = __half2float(xr[i]) * inv * __bfloat162float(w[i]);
-        yr[i] = __float2half(v);
+    const uint2* w4 = reinterpret_cast<const uint2*>(w);
+    uint2* yr4 = reinterpret_cast<uint2*>(yr);
+    for (int i = t; i < d4; i += blockDim.x) {
+        uint2 xq = xr4[i];
+        uint2 wq = __ldg(w4 + i);
+        float2 x01 = __half22float2(*reinterpret_cast<const half2*>(&xq.x));
+        float2 x23 = __half22float2(*reinterpret_cast<const half2*>(&xq.y));
+        float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wq.x));
+        float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wq.y));
+        half2 h01 = __float22half2_rn(make_float2(x01.x * inv * w01.x, x01.y * inv * w01.y));
+        half2 h23 = __float22half2_rn(make_float2(x23.x * inv * w23.x, x23.y * inv * w23.y));
+        uint2 oq;
+        oq.x = *reinterpret_cast<const uint32_t*>(&h01);
+        oq.y = *reinterpret_cast<const uint32_t*>(&h23);
+        yr4[i] = oq;
     }
 }
 
@@ -182,12 +198,15 @@ __global__ void kv_scatter_f16_k(
     int head_dim
 ) {
     int mr = blockIdx.y;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < head_dim) {
+    int i8 = blockIdx.x * blockDim.x + threadIdx.x;
+    int d8 = head_dim >> 3;
+    if (i8 < d8) {
         int p = (start_pos + mr) % max_ctx;
-        k_cache[(size_t)p * head_dim + i] = k_in[(size_t)mr * head_dim + i];
+        reinterpret_cast<uint4*>(k_cache + (size_t)p * head_dim)[i8] =
+            reinterpret_cast<const uint4*>(k_in + (size_t)mr * head_dim)[i8];
         if (v_cache != k_cache) {
-            v_cache[(size_t)p * head_dim + i] = v_in[(size_t)mr * head_dim + i];
+            reinterpret_cast<uint4*>(v_cache + (size_t)p * head_dim)[i8] =
+                reinterpret_cast<const uint4*>(v_in + (size_t)mr * head_dim)[i8];
         }
     }
 }
@@ -1266,8 +1285,10 @@ void rad_cuda_kv_scatter_f16(
     int head_dim,
     cudaStream_t stream
 ) {
-    dim3 grid((head_dim + 255) / 256, M);
-    kv_scatter_f16_k<<<grid, 256, 0, stream>>>(k_in, v_in, k_cache, v_cache, start_pos, max_ctx, head_dim);
+    int d8 = head_dim >> 3;
+    int threads = (d8 < 64) ? 32 : ((d8 < 128) ? 64 : 128);
+    dim3 grid((d8 + threads - 1) / threads, M);
+    kv_scatter_f16_k<<<grid, threads, 0, stream>>>(k_in, v_in, k_cache, v_cache, start_pos, max_ctx, head_dim);
 }
 
 void rad_cuda_rope_yarn_f16(
