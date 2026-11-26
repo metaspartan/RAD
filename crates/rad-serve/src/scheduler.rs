@@ -140,7 +140,8 @@ pub(crate) fn prefill_tail_bucket(n: usize) -> usize {
 }
 
 pub(crate) fn ngram_bucket_len(avail: usize) -> usize {
-    if avail >= 256 { 256 }
+    if avail >= 384 { 384 }
+    else if avail >= 256 { 256 }
     else if avail >= 192 { 192 }
     else if avail >= 128 { 128 }
     else if avail >= 96 { 96 }
@@ -601,7 +602,9 @@ pub(crate) fn run_scheduler(
                     let res = (|| -> anyhow::Result<Vec<i32>> {
                         let rem_kv = engine.max_ctx.saturating_sub(pos0 as usize);
                         let in_edit = slot.last_emits >= 10;
-                        let max_ng_k = if slot.last_emits >= 64 {
+                        let max_ng_k = if slot.last_emits >= 192 {
+                            engine.multi_verify_cap.min(384).min(rem_kv)
+                        } else if slot.last_emits >= 64 {
                             engine.multi_verify_cap.min(256).min(rem_kv)
                         } else {
                             128usize.min(rem_kv)

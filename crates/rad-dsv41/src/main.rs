@@ -150,24 +150,20 @@ fn worker_loop(eng: &mut Dsv41Engine, comm: &mut Tp2Comm) -> Result<()> {
                 let _ = eng.step_batch(&toks, comm)?;
             }
             3 => {
-                let mut pval = 0u32;
-                comm.broadcast_u32(&mut pval)?;
-                eng.pos = pval as usize;
-                let mut crow = 0u32;
-                comm.broadcast_u32(&mut crow)?;
+                let mut pargs = [0u32; 2];
+                comm.broadcast_u32_array(&mut pargs)?;
+                eng.pos = pargs[0] as usize;
                 if let Some(ref mut mtp) = eng.mtp {
-                    mtp.last_ctx_row = crow as usize;
+                    mtp.last_ctx_row = pargs[1] as usize;
                 }
             }
             4 => {
                 eng.profile_step(eng.cfg.bos_token_id, comm)?;
             }
             5 => {
-                let mut a_val = 0u32;
-                comm.broadcast_u32(&mut a_val)?;
-                let mut nb_val = 1u32;
-                comm.broadcast_u32(&mut nb_val)?;
-                let _ = eng.draft_dspark(a_val as i32, nb_val as usize, comm)?;
+                let mut dargs = [0u32; 2];
+                comm.broadcast_u32_array(&mut dargs)?;
+                let _ = eng.draft_dspark(dargs[0] as i32, dargs[1] as usize, comm)?;
             }
             6 => {
                 comm.broadcast_i32_vec(&mut toks)?;

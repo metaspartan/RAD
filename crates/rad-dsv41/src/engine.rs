@@ -71,7 +71,7 @@ pub struct Dsv41Engine {
     pub d_shared_g: CudaBuf,
     pub d_shared_out: CudaBuf,
     pub d_logits: CudaBuf,
-    pub d_tok_ids: CudaBuf,
+    pub d_tok_ids: CudaPinnedBuf,
     pub d_arg_vals: CudaBuf,
     pub d_arg_ids: CudaBuf,
     pub d_best_val: CudaPinnedBuf,
@@ -241,7 +241,7 @@ impl Dsv41Engine {
             d_shared_g: CudaBuf::new(MAX_BATCH * (tc.moe_intermediate_size / world) * 2).map_err(CudaFail)?,
             d_shared_out: CudaBuf::new(MAX_BATCH * d * 2).map_err(CudaFail)?,
             d_logits: CudaBuf::new(max_head_m * vocab_local * 2).map_err(CudaFail)?,
-            d_tok_ids: CudaBuf::new(MAX_BATCH * 4).map_err(CudaFail)?,
+            d_tok_ids: CudaPinnedBuf::new(MAX_BATCH * 4).map_err(CudaFail)?,
             d_arg_vals: CudaBuf::new(max_head_m * 256 * 4).map_err(CudaFail)?,
             d_arg_ids: CudaBuf::new(max_head_m * 256 * 4).map_err(CudaFail)?,
             d_best_val: CudaPinnedBuf::new(max_head_m * 4).map_err(CudaFail)?,
@@ -550,7 +550,7 @@ impl Dsv41Engine {
         let stream: CudaStream = std::ptr::null_mut();
 
         let tok_bytes = unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, m * 4) };
-        self.d_tok_ids.copy_from(tok_bytes, None).map_err(CudaFail)?;
+        self.d_tok_ids.as_bytes_mut()[..m * 4].copy_from_slice(tok_bytes);
         if self.tok_history.len() > self.pos {
             self.tok_history.truncate(self.pos);
         }
@@ -883,7 +883,7 @@ impl Dsv41Engine {
             let _ = rad_cuda::sync_device();
             0.0
         };
-        self.d_tok_ids.copy_from(&token_id.to_le_bytes(), None).map_err(CudaFail)?;
+        self.d_tok_ids.as_bytes_mut()[..4].copy_from_slice(&token_id.to_le_bytes());
         unsafe {
             cuda_ops::rad_cuda_embed_to_mhc_f16(self.embed.ptr, self.d_tok_ids.ptr as *const i32, self.d_streams.ptr, 1, d as i32, stream);
         }
@@ -1029,7 +1029,7 @@ impl Dsv41Engine {
             let mut draft_in = vec![tc.dspark_noise_token_id; blk];
             draft_in[0] = *out.last().unwrap();
             let tok_bytes = unsafe { std::slice::from_raw_parts(draft_in.as_ptr() as *const u8, blk * 4) };
-            self.d_tok_ids.copy_from(tok_bytes, None).map_err(CudaFail)?;
+            self.d_tok_ids.as_bytes_mut()[..blk * 4].copy_from_slice(tok_bytes);
 
             unsafe {
                 cuda_ops::rad_cuda_embed_to_mhc_f16(self.embed.ptr, self.d_tok_ids.ptr as *const i32, self.d_streams.ptr, mi, d as i32, stream);
@@ -1070,7 +1070,7 @@ impl Dsv41Engine {
                     let lw = &mtp.layers[l];
                     cuda_ops::rad_cuda_rope_yarn_f16(self.d_q.ptr, self.d_kv_normed.ptr, mi, n_heads_local as i32, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, 1.0f32, stream);
                     let sink_ptr = (lw.attn_sink.ptr as *const f32).add(self.rank * n_heads_local);
-                    cuda_ops::rad_cuda_mqa_attn_sink_dspark_f16(self.d_q.ptr, mtp.kv_caches[l].k_cache.ptr, mtp.kv_caches[l].k_cache.ptr, self.d_kv_normed.ptr, sink_ptr, self.d_attn_out.ptr, mi, n_heads_local as i32, start_pos, self.max_ctx as i32, tc.sliding_window as i32, tc.head_dim as i32, attn_scale, stream);
+                    cuda_ops::rad_cuda_mqa_attn_sink_dspark_f16(self.d_q.ptr, mtp.kv_caches[l].k_cache.ptr, self.d_z_scratch.ptr, self.d_kv_normed.ptr, sink_ptr, self.d_attn_out.ptr, mi, n_heads_local as i32, start_pos, self.max_ctx as i32, tc.sliding_window as i32, tc.head_dim as i32, attn_scale, stream);
                     if b_idx + 1 < n_blk {
                         cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv_normed.ptr, self.d_kv_normed.ptr, mtp.kv_caches[l].k_cache.ptr, mtp.kv_caches[l].k_cache.ptr, mi, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
                     }
@@ -1226,10 +1226,8 @@ impl Dsv41Engine {
                 let n_blk = 1usize;
                 let mut dcmd = 5u32;
                 comm.broadcast_u32(&mut dcmd)?;
-                let mut a_val = anchor as u32;
-                comm.broadcast_u32(&mut a_val)?;
-                let mut nb_val = n_blk as u32;
-                comm.broadcast_u32(&mut nb_val)?;
+                let mut dargs = [anchor as u32, n_blk as u32];
+                comm.broadcast_u32_array(&mut dargs)?;
                 (self.draft_dspark(anchor, n_blk, comm)?, "dspark")
             } else {
                 (vec![anchor], "single")
@@ -1280,10 +1278,8 @@ impl Dsv41Engine {
             }
             let mut pcmd = 3u32;
             comm.broadcast_u32(&mut pcmd)?;
-            let mut pval = new_pos as u32;
-            comm.broadcast_u32(&mut pval)?;
-            let mut crow = k_acc.saturating_sub(1).min(15) as u32;
-            comm.broadcast_u32(&mut crow)?;
+            let mut pargs = [new_pos as u32, k_acc.saturating_sub(1).min(15) as u32];
+            comm.broadcast_u32_array(&mut pargs)?;
             return Ok(accepted);
         }
         let mut one = vec![anchor];

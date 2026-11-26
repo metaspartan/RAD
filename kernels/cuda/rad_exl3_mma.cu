@@ -667,21 +667,22 @@ void exl3_moe_mma_grouped_m64_mul1_k(
 
     for (int kb_idx = kb_start; kb_idx < kb_end; ++kb_idx) {
         int kb = kb_idx * 128;
+        int base = kb + lane * 4;
+        float s0 = 1.0f, s1 = 1.0f, s2 = 1.0f, s3 = 1.0f;
+        if (suh) {
+            uint2 sq = __ldg(reinterpret_cast<const uint2*>(suh + base));
+            float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
+            float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
+            s0 = s01.x; s1 = s01.y; s2 = s23.x; s3 = s23.y;
+        }
         for (int r = warp; r < g_len; r += 8) {
             int pid = s_pair_ids[r];
             int mr = pid / top_k;
             const half* x_src = x_per_expert ? (x_in + (size_t)pid * K) : (x_in + (size_t)mr * K);
-            int base = kb + lane * 4;
             uint2 xq = *reinterpret_cast<const uint2*>(x_src + base);
             float2 x01 = __half22float2(*reinterpret_cast<const half2*>(&xq.x));
             float2 x23 = __half22float2(*reinterpret_cast<const half2*>(&xq.y));
-            float v0 = x01.x, v1 = x01.y, v2 = x23.x, v3 = x23.y;
-            if (suh) {
-                uint2 sq = __ldg(reinterpret_cast<const uint2*>(suh + base));
-                float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
-                float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
-                v0 *= s01.x; v1 *= s01.y; v2 *= s23.x; v3 *= s23.y;
-            }
+            float v0 = x01.x * s0, v1 = x01.y * s1, v2 = x23.x * s2, v3 = x23.y * s3;
             mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
             half2 h01 = __float22half2_rn(make_float2(v0, v1));
             half2 h23 = __float22half2_rn(make_float2(v2, v3));

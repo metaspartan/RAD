@@ -683,7 +683,7 @@ impl InklingEngine {
         }
 
         let d_pos0 = self.bsc.d_pos0.ptr as *const i32;
-        let snap_lim = self.multi_verify_cap.min(256);
+        let snap_lim = self.multi_verify_cap.min(384);
         let k_snap = if b <= snap_lim { sl.k_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
         let v_snap = if b <= snap_lim { sl.v_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
         if let (Some(ref ks), Some(ref vs)) = (&sl.k_scale, &sl.v_scale) {
@@ -822,7 +822,7 @@ impl InklingEngine {
         } else {
             std::ptr::null_mut()
         };
-        let ap_snap = if b <= self.multi_verify_cap.min(256) { sl.attn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+        let ap_snap = if b <= self.multi_verify_cap.min(384) { sl.attn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
         if l.wo.ty == WeightType::Q4_0 && (b == 4 || b == 6 || b == 8) {
             ops::ink_wo_conv_res_q4_batch_snap(s, l.wo.buf.ptr as *const u8, self.bsc.xq.ptr, l.attn_post_conv.ptr as *const f32, sl.attn_post_hist.ptr as *mut f32, ap_snap, cur, block_dst, ffn_inp, e, q_dim, bi);
         } else {
@@ -968,7 +968,7 @@ impl InklingEngine {
             }
             _ => unreachable!(),
         };
-        let fp_snap = if b <= self.multi_verify_cap.min(256) { sl.ffn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
+        let fp_snap = if b <= self.multi_verify_cap.min(384) { sl.ffn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
         if b <= 128 && l.ffn_down_exps.ty == WeightType::Q4_0 {
             ops::ink_shortconv_res_batch_snap_clear(s, moe_raw, l.ffn_post_conv.ptr as *const f32, sl.ffn_post_hist.ptr as *mut f32, fp_snap, ffn_inp, std::ptr::null_mut(), cur, e, bi);
         } else {
@@ -1070,7 +1070,7 @@ impl InklingEngine {
 
     pub fn verify_batch(&mut self, tokens: &[i32]) -> Result<Vec<i32>> {
         let b = tokens.len();
-        assert!(b >= 1 && b <= self.multi_verify_cap.min(256));
+        assert!(b >= 1 && b <= self.multi_verify_cap.min(384));
         let pos0 = self.pos;
         let tok_bytes = unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, b * 4) };
         let key = (0usize, b);
@@ -1166,7 +1166,7 @@ impl InklingEngine {
             return Ok(out);
         }
         let b = tokens.len();
-        assert!(b >= 1 && b <= self.multi_verify_cap.min(256));
+        assert!(b >= 1 && b <= self.multi_verify_cap.min(384));
         let pos0 = self.seq_pos[seq];
         let tok_bytes = unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, b * 4) };
         let key = (seq, b);

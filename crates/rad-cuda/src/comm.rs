@@ -304,6 +304,19 @@ impl Tp2Comm {
         Ok(())
     }
 
+    pub fn broadcast_u32_array<const N: usize>(&mut self, vals: &mut [u32; N]) -> std::io::Result<()> {
+        let Some(ref mut s) = self.stream else {
+            return Ok(());
+        };
+        let bytes = unsafe { std::slice::from_raw_parts_mut(vals.as_mut_ptr() as *mut u8, N * 4) };
+        if self.rank == 0 {
+            s.write_all(bytes)?;
+        } else {
+            s.read_exact(bytes)?;
+        }
+        Ok(())
+    }
+
     pub fn broadcast_i32_vec(&mut self, data: &mut Vec<i32>) -> std::io::Result<()> {
         let Some(ref mut s) = self.stream else {
             return Ok(());
