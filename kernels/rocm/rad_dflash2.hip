@@ -352,7 +352,7 @@ extern "C" __global__ void dflash2_topk16_part_k(const float* __restrict__ logit
     int row = blockIdx.x;
     int ch = blockIdx.y;
     int tid = threadIdx.x;
-    int chunk_sz = (vocab_unpadded + n_chunks - 1) / n_chunks;
+    int chunk_sz = (((vocab_unpadded + n_chunks - 1) / n_chunks) + 3) & ~3;
     int i_beg = ch * chunk_sz;
     int i_end = min(vocab_unpadded, i_beg + chunk_sz);
     const float* row_p = logits + (size_t)row * vocab_padded;
@@ -364,7 +364,27 @@ extern "C" __global__ void dflash2_topk16_part_k(const float* __restrict__ logit
         best_v[k] = -1e30f;
         best_i[k] = 0;
     }
-    for (int i = i_beg + tid; i < i_end; i += 256) {
+    int i_end4 = i_end & ~3;
+    const float4* row_p4 = reinterpret_cast<const float4*>(row_p);
+    for (int i = i_beg + tid * 4; i < i_end4; i += 1024) {
+        float4 v4 = row_p4[i >> 2];
+        float vals[4] = {v4.x, v4.y, v4.z, v4.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float v = vals[j];
+            if (v > best_v[15]) {
+                int pos = 15;
+                while (pos > 0 && v > best_v[pos - 1]) {
+                    best_v[pos] = best_v[pos - 1];
+                    best_i[pos] = best_i[pos - 1];
+                    --pos;
+                }
+                best_v[pos] = v;
+                best_i[pos] = i + j;
+            }
+        }
+    }
+    for (int i = i_end4 + tid; i < i_end; i += 256) {
         float v = row_p[i];
         if (v > best_v[15]) {
             int pos = 15;
