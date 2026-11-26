@@ -82,10 +82,13 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **Cybara Multi-Turn Agentic E2E (Live Desktop -> RAD R9700)** | **6-turn + 4-turn concurrent** | 10KB Rust analysis (`5,572` chars) + 3-file Python engine (`16/16` tests) + concurrent 80-entry needle haystack (`5,011`-char parser + exact recall), `0` looping |
 | **Live SSE API (8-User Independent File Edits, `B=8`)** | **2,342.3 agg tok/s** | `9,295` tokens across 8 distinct edits in `3.97 s` (**`289–324 tok/s/user`**, avg `296 tok/s/user`, all 8 users finishing within `0.32 s`) |
 
-### Live Recorded Demo Videos (Single AMD Radeon AI PRO R9700)
+### Live Recorded Demo Videos
 
+- **RAD Chat TUI Live Demo (R9700 `inkling-2-mini` + 2x DGX Spark `deepseek-v4-flash-vision-exp`, 1x Real-Time with Live Streaming Metrics & Sparkline):** [assets/rad_chat_tui.mp4](assets/rad_chat_tui.mp4)
 - **8-User Concurrent Live SSE Serving (`9,295` tok in `3.97 s`, `2,342 tok/s` full / `296 tok/s/user` avg, up to `324/user`):** [assets/rad_multiuser_x.mp4](assets/rad_multiuser_x.mp4)
 - **Single-User Live SSE Serving (`1,075 tok/s` live HTTP SSE code edit):** [assets/rad_promo_x.mp4](assets/rad_promo_x.mp4)
+
+<video src="https://raw.githubusercontent.com/metaspartan/RAD/main/assets/rad_chat_tui.mp4" controls width="100%"></video>
 
 <video src="https://raw.githubusercontent.com/metaspartan/RAD/main/assets/rad_multiuser_x.mp4" controls width="100%"></video>
 
@@ -146,6 +149,8 @@ RAD/
 │       ├── rad_dsv41_router.cu Vectorized half2 MoE sqrtsoftplus router, parallel 256-thread top-K & argmax
 │       └── rad_rdma.cu        Zero-copy cudaHostAllocMapped ConnectX-7 RoCE v2 RDMA (libibverbs)
 ├── crates/
+│   ├── rad-http/              Shared OpenAI/Prometheus HTTP helpers, auth, CORS, reasoning & cycle detection
+│   ├── rad-chat/              Cross-platform Rust CLI & `ratatui` TUI (`rad-chat`) with live streaming metrics & sparkline
 │   ├── rad-gguf/              Zero-copy mmap GGUF reader
 │   ├── rad-hip/               Minimal ROCm/HIP FFI, RAII DevBuf, P2P & CapturedGraph
 │   ├── rad-core/              InklingEngine (model/{mod,decode,multi,profile}), DFlash 2 & DSpark, Paged KV, VisionEncoder
@@ -156,6 +161,7 @@ RAD/
 │   ├── rad_benchmark.svg      Single-user decode & prefill comparison chart
 │   ├── rad_longctx.svg        Long-context 2K–256K decode & prefill scaling chart
 │   ├── rad_multiuser.svg      Multi-user throughput scaling chart
+│   ├── rad_chat_tui.mp4       Live 1x real-time `rad-chat` TUI demo across R9700 & 2x DGX Spark
 │   ├── rad_multiuser_x.mp4    Live recorded 8-user concurrent SSE demo video
 │   └── rad_promo_x.mp4        Live recorded single-user SSE code-edit demo video
 └── scripts/
@@ -170,6 +176,24 @@ RAD/
 ---
 
 ## Quickstart
+
+### Interactive Chat CLI / TUI (`rad-chat`, Windows / Linux / macOS, no GPU required)
+
+```bash
+# Build cross-platform TUI client (zero GPU dependencies)
+cargo build --release -p rad-chat
+
+# Launch interactive full-screen TUI with live streaming tok/s, TTFT, sparkline & /metrics telemetry
+./target/release/rad-chat --url http://127.0.0.1:6733
+
+# Connect to 2x DGX Spark DeepSeek-V4.1-Flash with thinking enabled
+./target/release/rad-chat --url http://192.168.1.149:8888 --api-key <key> --think
+
+# One-shot streaming CLI mode
+./target/release/rad-chat --url http://127.0.0.1:6733 --prompt "Write a fast Rust binary search."
+```
+
+Slash commands inside the TUI: `/clear`, `/model [name]`, `/url <http://...>`, `/think`, `/effort <low|medium|high>`, `/temp <f>`, `/stats`, `/exit`.
 
 ### Prerequisites & Model Weights
 

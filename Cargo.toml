@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rad-http",
+    "crates/rad-chat",
     "crates/rad-hip",
     "crates/rad-gguf",
     "crates/rad-core",
