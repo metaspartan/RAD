@@ -182,7 +182,7 @@ void exl3_mma_m16_mul1_k(
     int kt_start = (K_tiles * sk) / split_k;
     int kt_end = (K_tiles * (sk + 1)) / split_k;
 
-    __shared__ uint32_t s_packed[8][PACKED_U32];
+    __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
 
     float c00 = 0.0f, c01 = 0.0f, c02 = 0.0f, c03 = 0.0f;
     float c10 = 0.0f, c11 = 0.0f, c12 = 0.0f, c13 = 0.0f;
@@ -194,11 +194,12 @@ void exl3_mma_m16_mul1_k(
     int k_off0 = tid_in_grp * 2;
     int k_off1 = k_off0 + 8;
 
+    constexpr int PACKED_U4 = 2 * BITS;
+    uint4* s_u4 = reinterpret_cast<uint4*>(s_packed[warp]);
     for (int kt = kt_start; kt < kt_end; ++kt) {
-        const uint32_t* g_tile = (const uint32_t*)(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
-        #pragma unroll
-        for (int w = lane; w < PACKED_U32; w += 32) {
-            s_packed[warp][w] = __ldg(g_tile + w);
+        const uint4* g_u4 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
+        if (lane < PACKED_U4) {
+            s_u4[lane] = __ldg(g_u4 + lane);
         }
         __syncwarp();
 
@@ -273,7 +274,7 @@ void exl3_mma_m64_mul1_k(
     int kt_start = (K_tiles * sk) / split_k;
     int kt_end = (K_tiles * (sk + 1)) / split_k;
 
-    __shared__ uint32_t s_packed[8][PACKED_U32];
+    __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
 
     float c0[4][4];
     float c1[4][4];
@@ -291,11 +292,12 @@ void exl3_mma_m64_mul1_k(
     int k_off0 = tid_in_grp * 2;
     int k_off1 = k_off0 + 8;
 
+    constexpr int PACKED_U4 = 2 * BITS;
+    uint4* s_u4 = reinterpret_cast<uint4*>(s_packed[warp]);
     for (int kt = kt_start; kt < kt_end; ++kt) {
-        const uint32_t* g_tile = (const uint32_t*)(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
-        #pragma unroll
-        for (int w = lane; w < PACKED_U32; w += 32) {
-            s_packed[warp][w] = __ldg(g_tile + w);
+        const uint4* g_u4 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
+        if (lane < PACKED_U4) {
+            s_u4[lane] = __ldg(g_u4 + lane);
         }
         __syncwarp();
 
@@ -391,7 +393,7 @@ void exl3_moe_mma_m16_mul1_k(
     int N_tiles = N >> 4;
     if (n_tile >= N_tiles) return;
 
-    __shared__ uint32_t s_packed[8][PACKED_U32];
+    __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
     __shared__ half s_x128[128];
 
     float c00 = 0.0f, c01 = 0.0f, c02 = 0.0f, c03 = 0.0f;
@@ -419,13 +421,14 @@ void exl3_moe_mma_m16_mul1_k(
         __syncthreads();
 
         int kt0 = kb >> 4;
+        constexpr int PACKED_U4 = 2 * BITS;
+        uint4* s_u4 = reinterpret_cast<uint4*>(s_packed[warp]);
         #pragma unroll
         for (int sub = 0; sub < 8; ++sub) {
             int kt = kt0 + sub;
-            const uint32_t* g_tile = (const uint32_t*)(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
-            #pragma unroll
-            for (int w = lane; w < PACKED_U32; w += 32) {
-                s_packed[warp][w] = __ldg(g_tile + w);
+            const uint4* g_u4 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
+            if (lane < PACKED_U4) {
+                s_u4[lane] = __ldg(g_u4 + lane);
             }
             __syncwarp();
 
@@ -475,28 +478,27 @@ __global__ void moe_wht128_post_f32_to_f16_k(
     int eid = expert_ids[pair_idx];
     int local_eid = eid - expert_start;
     if (local_eid < 0 || local_eid >= n_local_experts) {
-        half zero = __float2half(0.0f);
-        y_out[off + 0] = zero;
-        y_out[off + 1] = zero;
-        y_out[off + 2] = zero;
-        y_out[off + 3] = zero;
+        *reinterpret_cast<uint2*>(y_out + off) = make_uint2(0u, 0u);
         return;
     }
     const half* svh = svh_ptrs ? svh_ptrs[local_eid] : nullptr;
-    float v0 = z_f32[off + 0], v1 = z_f32[off + 1], v2 = z_f32[off + 2], v3 = z_f32[off + 3];
+    float4 zv = *reinterpret_cast<const float4*>(z_f32 + off);
+    float v0 = zv.x, v1 = zv.y, v2 = zv.z, v3 = zv.w;
     if (scale > 0.0f) {
         mma_warp_wht128_f32(v0, v1, v2, v3, lane, scale);
     }
     if (svh) {
-        v0 *= __half2float(svh[col + 0]);
-        v1 *= __half2float(svh[col + 1]);
-        v2 *= __half2float(svh[col + 2]);
-        v3 *= __half2float(svh[col + 3]);
+        uint2 sv = *reinterpret_cast<const uint2*>(svh + col);
+        float2 s0 = __half22float2(*reinterpret_cast<const half2*>(&sv.x));
+        float2 s1 = __half22float2(*reinterpret_cast<const half2*>(&sv.y));
+        v0 *= s0.x;
+        v1 *= s0.y;
+        v2 *= s1.x;
+        v3 *= s1.y;
     }
-    y_out[off + 0] = __float2half(v0);
-    y_out[off + 1] = __float2half(v1);
-    y_out[off + 2] = __float2half(v2);
-    y_out[off + 3] = __float2half(v3);
+    half2 h0 = __float22half2_rn(make_float2(v0, v1));
+    half2 h1 = __float22half2_rn(make_float2(v2, v3));
+    *reinterpret_cast<uint2*>(y_out + off) = make_uint2(*reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1));
 }
 
 __global__ void moe_build_groups_k(
@@ -504,48 +506,208 @@ __global__ void moe_build_groups_k(
     int pairs,
     int expert_start,
     int n_local_experts,
+    int group_cap,
     int* __restrict__ sorted_pairs,
     int* __restrict__ grp_eids,
     int* __restrict__ grp_offs,
     int* __restrict__ grp_lens,
     int* __restrict__ num_groups
 ) {
-    if (threadIdx.x != 0) return;
-    int counts[256];
-    int heads[256];
-    for (int e = 0; e < n_local_experts; ++e) counts[e] = 0;
-    for (int p = 0; p < pairs; ++p) {
-        int le = expert_ids[p] - expert_start;
-        if (le >= 0 && le < n_local_experts) counts[le] += 1;
+    __shared__ int s_counts[256];
+    __shared__ int s_heads[256];
+    int t = threadIdx.x;
+    if (t < n_local_experts) {
+        s_counts[t] = 0;
     }
-    int cur = 0;
-    int ng = 0;
-    for (int e = 0; e < n_local_experts; ++e) {
-        int c = counts[e];
-        heads[e] = cur;
-        if (c > 0) {
-            int rem = c;
-            int off = cur;
-            while (rem > 0) {
-                int take = (rem > 16) ? 16 : rem;
-                grp_eids[ng] = e;
-                grp_offs[ng] = off;
-                grp_lens[ng] = take;
-                ng += 1;
-                off += take;
-                rem -= take;
-            }
-            cur += c;
-        }
-    }
-    for (int p = 0; p < pairs; ++p) {
+    __syncthreads();
+    for (int p = t; p < pairs; p += blockDim.x) {
         int le = expert_ids[p] - expert_start;
         if (le >= 0 && le < n_local_experts) {
-            int pos = heads[le]++;
+            atomicAdd(&s_counts[le], 1);
+        }
+    }
+    __syncthreads();
+    if (t == 0) {
+        int cur = 0;
+        int ng = 0;
+        for (int e = 0; e < n_local_experts; ++e) {
+            int c = s_counts[e];
+            s_heads[e] = cur;
+            if (c > 0) {
+                int rem = c;
+                int off = cur;
+                while (rem > 0) {
+                    int take = (rem > group_cap) ? group_cap : rem;
+                    grp_eids[ng] = e;
+                    grp_offs[ng] = off;
+                    grp_lens[ng] = take;
+                    ng += 1;
+                    off += take;
+                    rem -= take;
+                }
+                cur += c;
+            }
+        }
+        num_groups[0] = ng;
+    }
+    __syncthreads();
+    for (int p = t; p < pairs; p += blockDim.x) {
+        int le = expert_ids[p] - expert_start;
+        if (le >= 0 && le < n_local_experts) {
+            int pos = atomicAdd(&s_heads[le], 1);
             sorted_pairs[pos] = p;
         }
     }
-    num_groups[0] = ng;
+}
+
+template <int BITS>
+__global__ __launch_bounds__(256)
+void exl3_moe_mma_grouped_m64_mul1_k(
+    const half* __restrict__ x_in,
+    const uint16_t* const* __restrict__ trellis_ptrs,
+    const half* const* __restrict__ suh_ptrs,
+    const int* __restrict__ sorted_pairs,
+    const int* __restrict__ grp_eids,
+    const int* __restrict__ grp_offs,
+    const int* __restrict__ grp_lens,
+    const int* __restrict__ num_groups,
+    float* __restrict__ z_f32,
+    int top_k,
+    int K,
+    int N,
+    int split_k,
+    float wht_scale,
+    int x_per_expert
+) {
+    constexpr int PACKED_U16 = 16 * BITS;
+    constexpr int PACKED_U32 = 8 * BITS;
+    constexpr int PACKED_U4 = 2 * BITS;
+    int g = blockIdx.y;
+    if (g >= num_groups[0]) return;
+    int t = threadIdx.x;
+    int lane = t & 31;
+    int warp = t >> 5;
+    int n_tile = blockIdx.x * 8 + warp;
+    int sk = blockIdx.z;
+    int N_tiles = N >> 4;
+    if (n_tile >= N_tiles) return;
+
+    int local_eid = grp_eids[g];
+    int g_off = grp_offs[g];
+    int g_len = grp_lens[g];
+    const uint16_t* trellis = trellis_ptrs[local_eid];
+    const half* suh = suh_ptrs ? suh_ptrs[local_eid] : nullptr;
+
+    int K_blocks128 = K >> 7;
+    int kb_start = (K_blocks128 * sk) / split_k;
+    int kb_end = (K_blocks128 * (sk + 1)) / split_k;
+
+    __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
+    __shared__ half s_x128[64][128];
+    __shared__ int s_pair_ids[64];
+    if (t < g_len) {
+        s_pair_ids[t] = sorted_pairs[g_off + t];
+    }
+    __syncthreads();
+
+    float c0[4][4];
+    float c1[4][4];
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            c0[r][j] = 0.0f;
+            c1[r][j] = 0.0f;
+        }
+    }
+
+    int group_id = lane >> 2;
+    int tid_in_grp = lane & 3;
+    int k_off0 = tid_in_grp * 2;
+    int k_off1 = k_off0 + 8;
+    uint4* s_u4 = reinterpret_cast<uint4*>(s_packed[warp]);
+
+    for (int kb_idx = kb_start; kb_idx < kb_end; ++kb_idx) {
+        int kb = kb_idx * 128;
+        for (int r = warp; r < g_len; r += 8) {
+            int pid = s_pair_ids[r];
+            int mr = pid / top_k;
+            const half* x_src = x_per_expert ? (x_in + (size_t)pid * K) : (x_in + (size_t)mr * K);
+            int base = kb + lane * 4;
+            float v0 = __half2float(x_src[base + 0]) * (suh ? __half2float(suh[base + 0]) : 1.0f);
+            float v1 = __half2float(x_src[base + 1]) * (suh ? __half2float(suh[base + 1]) : 1.0f);
+            float v2 = __half2float(x_src[base + 2]) * (suh ? __half2float(suh[base + 2]) : 1.0f);
+            float v3 = __half2float(x_src[base + 3]) * (suh ? __half2float(suh[base + 3]) : 1.0f);
+            mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
+            s_x128[r][lane * 4 + 0] = __float2half(v0);
+            s_x128[r][lane * 4 + 1] = __float2half(v1);
+            s_x128[r][lane * 4 + 2] = __float2half(v2);
+            s_x128[r][lane * 4 + 3] = __float2half(v3);
+        }
+        __syncthreads();
+
+        int kt0 = kb >> 4;
+        #pragma unroll
+        for (int sub = 0; sub < 8; ++sub) {
+            int kt = kt0 + sub;
+            const uint4* g_u4 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
+            if (lane < PACKED_U4) {
+                s_u4[lane] = __ldg(g_u4 + lane);
+            }
+            __syncwarp();
+
+            uint32_t b00, b01, b10, b11;
+            mma_dq8_mul1<BITS>(s_packed[warp], lane * 8, b00, b01, b10, b11);
+
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                int row0 = r * 16 + group_id;
+                int row1 = row0 + 8;
+                uint32_t a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u;
+                if (row0 < g_len) {
+                    const half* p0 = &s_x128[row0][sub * 16];
+                    a0 = *reinterpret_cast<const uint32_t*>(p0 + k_off0);
+                    a2 = *reinterpret_cast<const uint32_t*>(p0 + k_off1);
+                }
+                if (row1 < g_len) {
+                    const half* p1 = &s_x128[row1][sub * 16];
+                    a1 = *reinterpret_cast<const uint32_t*>(p1 + k_off0);
+                    a3 = *reinterpret_cast<const uint32_t*>(p1 + k_off1);
+                }
+                mma_m16n8k16_f32(c0[r][0], c0[r][1], c0[r][2], c0[r][3], a0, a1, a2, a3, b00, b01);
+                mma_m16n8k16_f32(c1[r][0], c1[r][1], c1[r][2], c1[r][3], a0, a1, a2, a3, b10, b11);
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+
+    int col_base = n_tile * 16 + tid_in_grp * 2;
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int row0 = r * 16 + group_id;
+        int row1 = row0 + 8;
+        if (row0 < g_len) {
+            int pid0 = s_pair_ids[row0];
+            float* z0 = z_f32 + (size_t)pid0 * N + col_base;
+            if (split_k == 1) {
+                z0[0] = c0[r][0]; z0[1] = c0[r][1]; z0[8] = c1[r][0]; z0[9] = c1[r][1];
+            } else {
+                atomicAdd(z0 + 0, c0[r][0]); atomicAdd(z0 + 1, c0[r][1]);
+                atomicAdd(z0 + 8, c1[r][0]); atomicAdd(z0 + 9, c1[r][1]);
+            }
+        }
+        if (row1 < g_len) {
+            int pid1 = s_pair_ids[row1];
+            float* z1 = z_f32 + (size_t)pid1 * N + col_base;
+            if (split_k == 1) {
+                z1[0] = c0[r][2]; z1[1] = c0[r][3]; z1[8] = c1[r][2]; z1[9] = c1[r][3];
+            } else {
+                atomicAdd(z1 + 0, c0[r][2]); atomicAdd(z1 + 1, c0[r][3]);
+                atomicAdd(z1 + 8, c1[r][2]); atomicAdd(z1 + 9, c1[r][3]);
+            }
+        }
+    }
 }
 
 template <int BITS>
@@ -589,7 +751,7 @@ void exl3_moe_mma_grouped_m16_mul1_k(
     int kb_start = (K_blocks128 * sk) / split_k;
     int kb_end = (K_blocks128 * (sk + 1)) / split_k;
 
-    __shared__ uint32_t s_packed[8][PACKED_U32];
+    __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
     __shared__ half s_x128[16][128];
     __shared__ int s_pair_ids[16];
     if (t < g_len) {
@@ -625,13 +787,14 @@ void exl3_moe_mma_grouped_m16_mul1_k(
         __syncthreads();
 
         int kt0 = kb >> 4;
+        constexpr int PACKED_U4 = 2 * BITS;
+        uint4* s_u4 = reinterpret_cast<uint4*>(s_packed[warp]);
         #pragma unroll
         for (int sub = 0; sub < 8; ++sub) {
             int kt = kt0 + sub;
-            const uint32_t* g_tile = (const uint32_t*)(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
-            #pragma unroll
-            for (int w = lane; w < PACKED_U32; w += 32) {
-                s_packed[warp][w] = __ldg(g_tile + w);
+            const uint4* g_u4 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
+            if (lane < PACKED_U4) {
+                s_u4[lane] = __ldg(g_u4 + lane);
             }
             __syncwarp();
 
@@ -717,7 +880,7 @@ void exl3_batched_group_mma_m16_mul1_k(
     int kb_start = (K_blocks128 * sk) / split_k;
     int kb_end = (K_blocks128 * (sk + 1)) / split_k;
 
-    __shared__ uint32_t s_packed[8][PACKED_U32];
+    __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
     __shared__ half s_x128[16][128];
 
     float c00 = 0.0f, c01 = 0.0f, c02 = 0.0f, c03 = 0.0f;
@@ -746,13 +909,14 @@ void exl3_batched_group_mma_m16_mul1_k(
         __syncthreads();
 
         int kt0 = kb >> 4;
+        constexpr int PACKED_U4 = 2 * BITS;
+        uint4* s_u4 = reinterpret_cast<uint4*>(s_packed[warp]);
         #pragma unroll
         for (int sub = 0; sub < 8; ++sub) {
             int kt = kt0 + sub;
-            const uint32_t* g_tile = (const uint32_t*)(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
-            #pragma unroll
-            for (int w = lane; w < PACKED_U32; w += 32) {
-                s_packed[warp][w] = __ldg(g_tile + w);
+            const uint4* g_u4 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
+            if (lane < PACKED_U4) {
+                s_u4[lane] = __ldg(g_u4 + lane);
             }
             __syncwarp();
 
@@ -836,7 +1000,7 @@ extern "C" {
 
 void rad_cuda_moe_init_meta(void) {
     if (!g_moe_meta) {
-        cudaMalloc(&g_moe_meta, 16384 * sizeof(int));
+        cudaMalloc(&g_moe_meta, 65536 * sizeof(int));
     }
 }
 
@@ -862,22 +1026,24 @@ void rad_cuda_exl3_moe_mma_f16(
 ) {
     int n_blocks = N / 128;
     int pairs = M * top_k;
-    if (M >= 2 && pairs <= 4096 && n_local_experts <= 256) {
+    if (M >= 2 && pairs <= 16384 && n_local_experts <= 256) {
         if (!g_moe_meta) {
-            cudaMalloc(&g_moe_meta, 16384 * sizeof(int));
+            cudaMalloc(&g_moe_meta, 65536 * sizeof(int));
         }
+        int use_m64 = (M >= 512);
+        int gcap = use_m64 ? 64 : 16;
         int* d_sorted = g_moe_meta;
-        int* d_eids = g_moe_meta + 4096;
-        int* d_offs = g_moe_meta + 8192;
-        int* d_lens = g_moe_meta + 12288;
-        int* d_ng = g_moe_meta + 16383;
+        int* d_eids = g_moe_meta + 16384;
+        int* d_offs = g_moe_meta + 32768;
+        int* d_lens = g_moe_meta + 49152;
+        int* d_ng = g_moe_meta + 65535;
         if (!reuse_groups) {
-            moe_build_groups_k<<<1, 1, 0, stream>>>(
-                expert_ids, pairs, expert_start, n_local_experts,
+            moe_build_groups_k<<<1, 256, 0, stream>>>(
+                expert_ids, pairs, expert_start, n_local_experts, gcap,
                 d_sorted, d_eids, d_offs, d_lens, d_ng
             );
         }
-        int max_groups = (pairs < n_local_experts + (pairs / 16) + 1) ? pairs : (n_local_experts + (pairs / 16) + 1);
+        int max_groups = (pairs < n_local_experts + (pairs / gcap) + 1) ? pairs : (n_local_experts + (pairs / gcap) + 1);
         int est_active = (pairs / 2 < n_local_experts) ? (pairs / 2) : n_local_experts;
         if (est_active < 1) est_active = 1;
         int split_k = (n_blocks * est_active < 64) ? 4 : ((n_blocks * est_active < 128) ? 2 : 1);
@@ -887,13 +1053,24 @@ void rad_cuda_exl3_moe_mma_f16(
             cudaMemsetAsync(z_scratch_f32, 0, (size_t)pairs * N * sizeof(float), stream);
         }
         dim3 grid(n_blocks, max_groups, split_k);
-        switch (bits) {
-            case 2: exl3_moe_mma_grouped_m16_mul1_k<2><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
-            case 3: exl3_moe_mma_grouped_m16_mul1_k<3><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
-            case 4: exl3_moe_mma_grouped_m16_mul1_k<4><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
-            case 5: exl3_moe_mma_grouped_m16_mul1_k<5><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
-            case 6: exl3_moe_mma_grouped_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
-            case 8: exl3_moe_mma_grouped_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+        if (use_m64) {
+            switch (bits) {
+                case 2: exl3_moe_mma_grouped_m64_mul1_k<2><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+                case 3: exl3_moe_mma_grouped_m64_mul1_k<3><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+                case 4: exl3_moe_mma_grouped_m64_mul1_k<4><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+                case 5: exl3_moe_mma_grouped_m64_mul1_k<5><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+                case 6: exl3_moe_mma_grouped_m64_mul1_k<6><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+                case 8: exl3_moe_mma_grouped_m64_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+            }
+        } else {
+            switch (bits) {
+                case 2: exl3_moe_mma_grouped_m16_mul1_k<2><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+                case 3: exl3_moe_mma_grouped_m16_mul1_k<3><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+                case 4: exl3_moe_mma_grouped_m16_mul1_k<4><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+                case 5: exl3_moe_mma_grouped_m16_mul1_k<5><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+                case 6: exl3_moe_mma_grouped_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+                case 8: exl3_moe_mma_grouped_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
+            }
         }
         dim3 post_grid(n_blocks, pairs);
         moe_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh_ptrs, expert_ids, y_out, N, wht_scale, expert_start, n_local_experts);

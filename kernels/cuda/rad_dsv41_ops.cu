@@ -771,7 +771,7 @@ void mqa_flash_mma16_f16_k(
     int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
 
     __shared__ half s_q[16][512];
-    __shared__ half s_kv[16][512];
+    __shared__ half s_kv[16][520];
     __shared__ float s_sp[8][16][16];
     __shared__ half s_p[16][16];
     __shared__ float s_m[16];
@@ -876,14 +876,15 @@ void mqa_flash_mma16_f16_k(
         __syncthreads();
     };
 
-    uint4* skv_u4 = reinterpret_cast<uint4*>(&s_kv[0][0]);
     for (int p0 = p_start; p0 < seq_len; p0 += 16) {
         int tile_len = seq_len - p0;
         if (tile_len > 16) tile_len = 16;
         int n_u4 = tile_len * 64;
         const uint4* src_u4 = reinterpret_cast<const uint4*>(k_cache + (size_t)p0 * 512);
         for (int i = t; i < 1024; i += 256) {
-            skv_u4[i] = (i < n_u4) ? __ldg(src_u4 + i) : make_uint4(0u, 0u, 0u, 0u);
+            int r = i >> 6;
+            int c4 = i & 63;
+            reinterpret_cast<uint4*>(s_kv[r])[c4] = (i < n_u4) ? __ldg(src_u4 + i) : make_uint4(0u, 0u, 0u, 0u);
         }
         __syncthreads();
         process_tile(tile_len);
@@ -897,7 +898,9 @@ void mqa_flash_mma16_f16_k(
             int n_u4 = tile_len * 64;
             const uint4* src_u4 = reinterpret_cast<const uint4*>(comp_kv + (size_t)c0 * 512);
             for (int i = t; i < 1024; i += 256) {
-                skv_u4[i] = (i < n_u4) ? __ldg(src_u4 + i) : make_uint4(0u, 0u, 0u, 0u);
+                int r = i >> 6;
+                int c4 = i & 63;
+                reinterpret_cast<uint4*>(s_kv[r])[c4] = (i < n_u4) ? __ldg(src_u4 + i) : make_uint4(0u, 0u, 0u, 0u);
             }
             __syncthreads();
             process_tile(tile_len);

@@ -14,7 +14,7 @@ use crate::mtp::{ngram_draft, DsparkMtp};
 use crate::safetensors::SafetensorsIndex;
 use crate::weights::{load_raw_buf_replicated, CompressorWeights, Exl3Linear, LayerWeights};
 
-pub const MAX_BATCH: usize = 512;
+pub const MAX_BATCH: usize = 2048;
 pub const MAX_DECODE_BATCH: usize = 128;
 
 pub struct KvCacheLayer {
@@ -590,7 +590,7 @@ impl Dsv41Engine {
                     );
                 }
             }
-            let use_graph = (m == 1 || m == 6 || m == 11 || m == 16 || m == 64 || m == 128 || m == 256 || m == 512) && comm.rdma_ptrs().is_some();
+            let use_graph = (m == 1 || m == 6 || m == 64 || m == 128 || m == 512 || m == 1024 || m == 2048) && comm.rdma_ptrs().is_some();
             if use_graph {
                 let gkey = (l, m);
                 if !self.qkv_graphs.contains_key(&gkey) {
