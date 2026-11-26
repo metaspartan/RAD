@@ -1214,8 +1214,10 @@ extern "C" __global__ void dspark_attn_wmma_gqa4_split_k(const float* __restrict
                     const _Float16* kp = kc_h + (size_t)kv_slot * dh + d8;
                     const _Float16* vp = vc_h + (size_t)kv_slot * dh + d8;
                     *reinterpret_cast<uint4*>(&sm_u.kv.k[tk][d8]) = *reinterpret_cast<const uint4*>(kp);
+                    uint4 vq = *reinterpret_cast<const uint4*>(vp);
+                    const _Float16* vh = reinterpret_cast<const _Float16*>(&vq);
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) sm_u.kv.vt[d8 + j][tk] = vp[j];
+                    for (int j = 0; j < 8; ++j) sm_u.kv.vt[d8 + j][tk] = vh[j];
                 } else {
                     int bi = kidx - ctx_cnt;
                     const float* kp = K_blk + ((size_t)bi * n_head_kv + kv_h) * dh + d8;
