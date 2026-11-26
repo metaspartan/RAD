@@ -82,7 +82,7 @@ impl Tp2Comm {
         let mut rdma_handle: *mut c_void = std::ptr::null_mut();
         let dev = b"rocep1s0f1\0";
         let mut local_info = RadRdmaInfo::default();
-        let h = unsafe { rad_rdma_init(dev.as_ptr() as *const c_char, 32 * 1024 * 1024, &mut local_info) };
+        let h = unsafe { rad_rdma_init(dev.as_ptr() as *const c_char, 64 * 1024 * 1024, &mut local_info) };
         let local_ok: u8 = if h.is_null() { 0 } else { 1 };
         let mut peer_ok = [0u8; 1];
         if rank == 0 {

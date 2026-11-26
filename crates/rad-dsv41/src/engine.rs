@@ -14,7 +14,7 @@ use crate::mtp::{ngram_draft_cfg, DsparkMtp};
 use crate::safetensors::SafetensorsIndex;
 use crate::weights::{load_raw_buf_replicated, CompressorWeights, Exl3Linear, LayerWeights};
 
-pub const MAX_BATCH: usize = 2048;
+pub const MAX_BATCH: usize = 4096;
 pub const MAX_DECODE_BATCH: usize = 256;
 
 pub struct KvCacheLayer {
@@ -195,9 +195,11 @@ impl Dsv41Engine {
         let groups_local = tc.o_groups / world;
         let vocab_local = tc.vocab_size / world;
         let max_head_m = MAX_DECODE_BATCH;
-        let z_elems = (MAX_BATCH * n_heads_local * tc.head_dim)
-            .max(MAX_BATCH * tc.num_experts_per_tok * d)
+        let z_elems = (512 * n_heads_local * tc.head_dim)
+            .max(512 * tc.num_experts_per_tok * d)
             .max(max_head_m * vocab_local);
+        let engram_in_bytes = if engram_layers.is_empty() { 4 } else { MAX_BATCH * 6144 * 2 };
+        let engram_kv_bytes = if engram_layers.is_empty() { 4 } else { MAX_BATCH * 5 * d * 2 };
 
         Ok(Self {
             cfg,
@@ -212,8 +214,8 @@ impl Dsv41Engine {
             comp_slots,
             engram_layers,
             engram_host,
-            d_engram_in: CudaBuf::new(MAX_BATCH * 6144 * 2).map_err(CudaFail)?,
-            d_engram_kv: CudaBuf::new(MAX_BATCH * 5 * d * 2).map_err(CudaFail)?,
+            d_engram_in: CudaBuf::new(engram_in_bytes).map_err(CudaFail)?,
+            d_engram_kv: CudaBuf::new(engram_kv_bytes).map_err(CudaFail)?,
             tok_history: Vec::with_capacity(max_ctx),
             mtp,
             d_streams: CudaBuf::new(MAX_BATCH * 4 * d * 4).map_err(CudaFail)?,
@@ -813,14 +815,19 @@ impl Dsv41Engine {
             let (b_self2, b_peer2) = self.exchange_branch(m, comm)?;
 
             unsafe {
-                if l + 1 < self.layers.len() && self.engram_layers.is_empty() {
+                if self.engram_layers.is_empty() {
+                    let next_norm = if l + 1 < self.layers.len() {
+                        self.layers[l + 1].attn_norm.ptr
+                    } else {
+                        self.final_norm.ptr
+                    };
                     cuda_ops::rad_cuda_mhc_sinkhorn_mix_pre_rmsnorm_only(
                         self.d_streams.ptr,
                         b_self2,
                         b_peer2,
                         self.d_h_coeff.ptr as *const f32,
                         self.d_pre_b.ptr,
-                        self.layers[l + 1].attn_norm.ptr,
+                        next_norm,
                         self.d_normed.ptr,
                         mi,
                         d as i32,
@@ -875,7 +882,9 @@ impl Dsv41Engine {
         let d = tc.hidden_size;
         let stream: CudaStream = std::ptr::null_mut();
         unsafe {
-            cuda_ops::rad_cuda_mhc_pre_mix_rmsnorm_only(self.d_streams.ptr, self.d_pre_b.ptr, self.final_norm.ptr, self.d_normed.ptr, m as i32, d as i32, tc.rms_norm_eps, stream);
+            if !self.engram_layers.is_empty() {
+                cuda_ops::rad_cuda_mhc_pre_mix_rmsnorm_only(self.d_streams.ptr, self.d_pre_b.ptr, self.final_norm.ptr, self.d_normed.ptr, m as i32, d as i32, tc.rms_norm_eps, stream);
+            }
             self.exl3_proj(self.d_normed.ptr, &self.head, self.d_logits.ptr, m as i32, 0, stream);
             cuda_ops::rad_cuda_argmax_f16(
                 self.d_logits.ptr,
@@ -907,10 +916,15 @@ impl Dsv41Engine {
         let stream: CudaStream = std::ptr::null_mut();
         let last = m - 1;
         unsafe {
-            let s_last = (self.d_streams.ptr as *const u8).add(last * 4 * d * 4) as *const c_void;
-            let p_last = (self.d_pre_b.ptr as *const u8).add(last * 4 * 4) as *const c_void;
-            cuda_ops::rad_cuda_mhc_pre_mix_rmsnorm_only(s_last, p_last, self.final_norm.ptr, self.d_normed.ptr, 1, d as i32, tc.rms_norm_eps, stream);
-            self.exl3_proj(self.d_normed.ptr, &self.head, self.d_logits.ptr, 1, 0, stream);
+            let head_in = if self.engram_layers.is_empty() {
+                (self.d_normed.ptr as *const u8).add(last * d * 2) as *const c_void
+            } else {
+                let s_last = (self.d_streams.ptr as *const u8).add(last * 4 * d * 4) as *const c_void;
+                let p_last = (self.d_pre_b.ptr as *const u8).add(last * 4 * 4) as *const c_void;
+                cuda_ops::rad_cuda_mhc_pre_mix_rmsnorm_only(s_last, p_last, self.final_norm.ptr, self.d_normed.ptr, 1, d as i32, tc.rms_norm_eps, stream);
+                self.d_normed.ptr as *const c_void
+            };
+            self.exl3_proj(head_in, &self.head, self.d_logits.ptr, 1, 0, stream);
             cuda_ops::rad_cuda_argmax_f16(
                 self.d_logits.ptr,
                 self.d_arg_vals.ptr,
