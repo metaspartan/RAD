@@ -151,7 +151,11 @@ pub fn format_dsv41_prompt(
                         out.push_str("<think>");
                         out.push_str(rc);
                         out.push_str("</think>");
+                    } else if !enable_thinking {
+                        out.push_str("</think>");
                     }
+                } else if !enable_thinking {
+                    out.push_str("</think>");
                 }
                 out.push_str(&extract_content_str(m));
                 if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {

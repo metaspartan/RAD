@@ -153,6 +153,10 @@ pub(crate) fn ngram_bucket_len(avail: usize) -> usize {
 }
 
 pub(crate) fn ngram_lookup_draft_ex(history: &[i32], anchor: i32, max_k: usize) -> Option<(Vec<i32>, usize)> {
+    ngram_lookup_draft_cfg(history, anchor, max_k, false)
+}
+
+pub(crate) fn ngram_lookup_draft_cfg(history: &[i32], anchor: i32, max_k: usize, in_edit: bool) -> Option<(Vec<i32>, usize)> {
     let n = history.len();
     if n < 16 || max_k < 8 {
         return None;
@@ -184,12 +188,20 @@ pub(crate) fn ngram_lookup_draft_ex(history: &[i32], anchor: i32, max_k: usize) 
         i -= 1;
     }
     if let Some(pos) = best_pos {
-        let cap_k = if best_len >= 5 {
+        let cap_k = if in_edit {
+            if best_len >= 5 {
+                max_k
+            } else {
+                max_k.min(16)
+            }
+        } else if best_len >= 9 {
             max_k
-        } else if best_len == 4 {
+        } else if best_len >= 7 {
             max_k.min(64)
-        } else {
+        } else if best_len >= 5 {
             max_k.min(24)
+        } else {
+            max_k.min(8)
         };
         let take = ngram_bucket_len((n - pos).min(cap_k));
         if take >= min_follow {
@@ -587,8 +599,9 @@ pub(crate) fn run_scheduler(
                     let res = (|| -> anyhow::Result<Vec<i32>> {
                         let rem_kv = engine.max_ctx.saturating_sub(pos0 as usize);
                         let max_ng_k = 128usize.min(rem_kv);
-                        let draft = if let Some((ng, mlen)) = ngram_lookup_draft_ex(&engine.seq_tokens[seq], slot.next_tok, max_ng_k) {
-                            if mlen >= 4 {
+                        let in_edit = slot.last_emits >= 10;
+                        let draft = if let Some((ng, mlen)) = ngram_lookup_draft_cfg(&engine.seq_tokens[seq], slot.next_tok, max_ng_k, in_edit) {
+                            if mlen >= 5 {
                                 ng
                             } else if seq == 0 {
                                 d.draft(slot.next_tok, &engine, spec_k)?
@@ -725,6 +738,7 @@ pub(crate) fn run_scheduler(
                             }
                             if !finished {
                                 slot.next_tok = last_tok;
+                                slot.last_emits = n_out;
                                 slot.last_tok_at = Instant::now();
                                 active.push(slot);
                             }

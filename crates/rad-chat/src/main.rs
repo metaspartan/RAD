@@ -1,9 +1,11 @@
 mod client;
+mod plain;
 mod ui;
 
 use anyhow::Result;
 use clap::Parser;
 use client::{fetch_health, fetch_metrics, fetch_models, stream_chat, ChatMessage, StreamEvent, StreamParams};
+use plain::{run_plain_cli, run_plain_scripted_capture, PlainConfig};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -37,6 +39,8 @@ struct Cli {
     think: bool,
     #[arg(long, default_value = "low")]
     effort: String,
+    #[arg(long, default_value_t = false)]
+    cli: bool,
     #[arg(long)]
     prompt: Option<String>,
     #[arg(long)]
@@ -427,6 +431,22 @@ async fn main() -> Result<()> {
     }
 
     let display_name = cli.display_name.clone().unwrap_or_else(|| model.clone());
+    if cli.cli {
+        let pcfg = PlainConfig {
+            base_url: cli.url.clone(),
+            api_key: cli.api_key.clone(),
+            model,
+            display_name,
+            max_tokens: cli.max_tokens,
+            temperature: cli.temp,
+            enable_thinking: cli.think,
+            reasoning_effort: cli.effort.clone(),
+        };
+        if let (Some(script), Some(cap)) = (cli.script.clone(), cli.capture_jsonl.clone()) {
+            return run_plain_scripted_capture(&client, pcfg, script, cap).await;
+        }
+        return run_plain_cli(&client, pcfg).await;
+    }
     let mut app = AppState::new(
         cli.url.clone(),
         model,

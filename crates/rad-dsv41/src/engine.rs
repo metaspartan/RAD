@@ -586,7 +586,7 @@ impl Dsv41Engine {
                     );
                 }
             }
-            let use_graph = (m == 1 || m == 6 || m == 64 || m == 128 || m == 512 || m == 1024 || m == 2048) && comm.rdma_ptrs().is_some();
+            let use_graph = (m == 1 || m == 6 || m == 16 || m == 32 || m == 64 || m == 128 || m == 512 || m == 1024 || m == 2048) && comm.rdma_ptrs().is_some();
             if use_graph {
                 let gkey = (l, m);
                 if !self.qkv_graphs.contains_key(&gkey) {
@@ -1187,24 +1187,17 @@ impl Dsv41Engine {
                 let prev_tok = *out.last().unwrap();
                 unsafe {
                     let row_ptr = (self.d_logits.ptr as *const u8).add(i * v_local * 2) as *const c_void;
-                    cuda_ops::rad_cuda_markov_bias_add_f16(
+                    cuda_ops::rad_cuda_markov_argmax_f16(
                         row_ptr,
                         mtp.markov_head.ptr,
                         mtp.markov_embed.ptr,
                         prev_tok,
-                        mtp.d_logits_row.ptr,
-                        v_local as i32,
-                        m_rank,
-                        stream,
-                    );
-                    cuda_ops::rad_cuda_argmax_f16(
-                        mtp.d_logits_row.ptr,
                         self.d_arg_vals.ptr,
                         self.d_arg_ids.ptr,
                         self.d_best_val.ptr,
                         self.d_best_id.ptr,
-                        1,
                         v_local as i32,
+                        m_rank,
                         stream,
                     );
                 }

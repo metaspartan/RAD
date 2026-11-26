@@ -80,13 +80,17 @@ Measured via `rad bench --ctx 262144 --max-seqs 1` on a single AMD Radeon AI PRO
 | **Multi-User 17.5K Long-Context E2E (`B=8`, 2 turns, live SSE)** | **99.8% cache / 222.6 ms TTFT** | Split-KV multi-user `K<=16` FlashAttention + exact `max_tokens` rewind (**`283.2 tok/s`** T1 pure DFlash 2, **`399.1 tok/s`** T2 cached Hybrid) |
 | **Live SSE API (8-User Concurrent, Hybrid `K=128`, `temp=0.2`)** | **3,306.5 agg tok/s** | **`413.5 tok/s/user`** avg (**`413.3–413.7 tok/s/user`** across all 8 users, `3,307.0` overlap; pure-gen `B=8` SSE **`315.3 tok/s`**) |
 | **Cybara Multi-Turn Agentic E2E (Live Desktop -> RAD R9700)** | **6-turn + 4-turn concurrent** | 10KB Rust analysis (`5,572` chars) + 3-file Python engine (`16/16` tests) + concurrent 80-entry needle haystack (`5,011`-char parser + exact recall), `0` looping |
+| **Live SSE API (4-Turn Website Build & Iterate, 6,400 tok)** | **345.1 tok/s avg** | **`1,006.3 tok/s`** T2 / **`867.0 tok/s`** T4 / **`154.4 tok/s`** T1 fresh HTML+CSS+JS (`72.8–115.2 ms` TTFT, adaptive `in_edit` hybrid) |
 | **Live SSE API (8-User Independent File Edits, `B=8`)** | **2,342.3 agg tok/s** | `9,295` tokens across 8 distinct edits in `3.97 s` (**`289–324 tok/s/user`**, avg `296 tok/s/user`, all 8 users finishing within `0.32 s`) |
 
 ### Live Recorded Demo Videos
 
+- **RAD Chat Plain CLI Live Demo (Non-TUI, `Inkling-2-Mini · Q4_K_XL · DFlash 2` + 2x DGX Spark `DeepSeek-V4.1-Flash-1017 · EXL3 2.9bpw`, 1x Real-Time):** [assets/rad_chat_cli.mp4](assets/rad_chat_cli.mp4)
 - **RAD Chat TUI Live Demo (`Inkling-2-Mini · Q4_K_XL · DFlash 2` @ `326.4 tok/s` + 2x DGX Spark `DeepSeek-V4.1-Flash-1017 · EXL3 2.9bpw` @ `216.9 tok/s`, 1x Real-Time with Live Metrics & Sparkline):** [assets/rad_chat_tui.mp4](assets/rad_chat_tui.mp4)
 - **8-User Concurrent Live SSE Serving (`9,295` tok in `3.97 s`, `2,342 tok/s` full / `296 tok/s/user` avg, up to `324/user`):** [assets/rad_multiuser_x.mp4](assets/rad_multiuser_x.mp4)
 - **Single-User Live SSE Serving (`1,075 tok/s` live HTTP SSE code edit):** [assets/rad_promo_x.mp4](assets/rad_promo_x.mp4)
+
+<video src="https://raw.githubusercontent.com/metaspartan/RAD/main/assets/rad_chat_cli.mp4" controls width="100%"></video>
 
 <video src="https://raw.githubusercontent.com/metaspartan/RAD/main/assets/rad_chat_tui.mp4" controls width="100%"></video>
 
@@ -109,9 +113,9 @@ First CUDA backend (`rad-cuda` + `rad-dsv41`) running **DeepSeek-V4.1-Flash-1017
 | **ConnectX-7 RoCE v2 RDMA AllReduce & Argmax** | **7 us** (**134x** vs TCP) | Zero-copy `cudaHostAllocMapped` + `libibverbs` (`32 MB` RDMA ring for `M=2048` prefill) + `IBV_SEND_INLINE` RDMA `all_reduce_argmax` |
 | **Tensor Core MoE Router (`384` exp) & `float4` mHC** | **~35 us** router / **~180 us** mHC | `moe_gate_logits_mma_f16_k` (50x prefill speedup) + single-pass `mhc_coeff_proj_24_k` (8x) + `float4`-vectorized `mhc_sinkhorn_mix` & `mhc_pre_mix` |
 | **GPU-Grouped MoE Tensor Core MMA (`M=2..2048`)** | **200 GB/s** (`M=128`) / `m64` prefill | 128-bit `uint4` trellis loads, modulo-free indexing, 256-thread `moe_build_groups_k`, `exl3_moe_mma_grouped_m64_mul1_k` (`M>=512`), fused `w3 + clamped_swiglu` post-pass, **100% bit-exact** parity |
-| **Live 40-Layer TP=2 RDMA Long-Context Prefill & TTFT (`65K` ctx)** | **640.4 tok/s** (`2K`) / **603.7 tok/s** (`5.5K`) / **507.0 tok/s** (`12K`) | Single-pass `step_batch_last` prefill cuts cold TTFT to **`134.5 ms`** (**`2.0x`** faster than `267.2 ms` vLLM, **`73.7 ms`** cached), `M=2048` + `m64` MoE + FlashMQA + Tensor Core router |
-| **Live 40-Layer TP=2 RDMA Pure Gen (`DSpark MTP` + CUDA Graphs)** | **63.3 tok/s** code (**86.6 tok/s** peak) | `Math=53.4 tok/s`, `Prose=29.2 tok/s`; `M=1/6/64/128/512/1024/2048` QKV/WO/FFN + 3-layer MTP CUDA Graphs, 4-head vectorized `half2` MQA |
-| **Live 40-Layer TP=2 RDMA Hybrid (`K=128` Edit & Cybara 37K)** | **212.1–216.9 tok/s** (`99.4 tok/s` Cybara) | `700` chunks in `3.30 s` (`403.2–410.3 tok/s` cold `550t` pp, `216.9 tok/s` live in `rad-chat`); live Cybara 3-turn vague-prompt web build & iteration at `37K` ctx: **`99.4 tok/s`** (`8,625` tok, **`96.2–98.6%`** prefix cache hit) |
+| **Live 40-Layer TP=2 RDMA Long-Context Prefill & TTFT (`65K` ctx)** | **640.4 tok/s** (`2K`) / **609.7 tok/s** (`5.5K`) / **507.0 tok/s** (`12K`) | Single-pass `step_batch_last` prefill cuts cold TTFT to **`134.5 ms`** (**`2.0x`** faster than `267.2 ms` vLLM, **`73.7–185 ms`** multi-turn cached), `M=2048` + `m64` MoE + FlashMQA (`M>=4`) + Tensor Core router |
+| **Live 40-Layer TP=2 RDMA Pure Gen (`DSpark MTP` + CUDA Graphs)** | **63.3 tok/s** code (**86.6 tok/s** peak) | `Math=55.0 tok/s`, `Prose=29.2 tok/s`; fused `rad_cuda_markov_argmax_f16`, `split_k=2` wave-balanced MoE `M=6`, `M=1/6/16/32/64/128/512/1024/2048` CUDA Graphs |
+| **Live 40-Layer TP=2 RDMA Hybrid (`K=128` Edit, Multi-Turn Web & Cybara 37K)** | **212.6–326.8 tok/s** (`124.0 tok/s` 4-turn web avg) | `700` chunks in `3.29 s` (`212.6 tok/s`); 4-turn live website coding: **`54.1` -> `216.1` -> `211.3` -> `326.8 tok/s`** (`182–243 ms` cached TTFT); live Cybara 37K ctx: **`99.4 tok/s`** (`8,625` tok, `96.2–98.6%` cache) |
 
 ### Supported Models & Weights
 
@@ -161,6 +165,7 @@ RAD/
 │   ├── rad_benchmark.svg      Single-user decode & prefill comparison chart
 │   ├── rad_longctx.svg        Long-context 2K–256K decode & prefill scaling chart
 │   ├── rad_multiuser.svg      Multi-user throughput scaling chart
+│   ├── rad_chat_cli.mp4       Live 1x real-time plain non-TUI `rad-chat --cli` demo across R9700 & 2x DGX Spark
 │   ├── rad_chat_tui.mp4       Live 1x real-time `rad-chat` TUI demo across R9700 & 2x DGX Spark
 │   ├── rad_multiuser_x.mp4    Live recorded 8-user concurrent SSE demo video
 │   └── rad_promo_x.mp4        Live recorded single-user SSE code-edit demo video
@@ -182,6 +187,9 @@ RAD/
 ```bash
 # Build cross-platform TUI client (zero GPU dependencies)
 cargo build --release -p rad-chat
+
+# Launch plain non-TUI interactive chat CLI (clean streaming terminal REPL)
+./target/release/rad-chat --cli --url http://127.0.0.1:6733
 
 # Launch interactive full-screen TUI with live streaming tok/s, TTFT, sparkline & /metrics telemetry
 ./target/release/rad-chat --url http://127.0.0.1:6733

@@ -1097,7 +1097,7 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     float scale,
     cudaStream_t stream
 ) {
-    if (head_dim == 512 && k_cache == v_cache && (n_heads % 16) == 0 && M >= 16) {
+    if (head_dim == 512 && k_cache == v_cache && (n_heads % 16) == 0 && (M >= 16 || (M >= 4 && start_pos + M >= 256))) {
         dim3 grid(n_heads / 16, M);
         mqa_flash_mma16_f16_k<<<grid, 256, 0, stream>>>(
             q, k_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
@@ -1498,6 +1498,120 @@ void rad_cuda_mqa_attn_sink_dspark_f16(
     mqa_attn_sink_dspark_f16_k<<<grid, 256, smem, stream>>>(
         q, k_ring, v_ring, kv_blk, attn_sink, out, n_heads, q0, max_ctx, sliding_window, M, head_dim, scale
     );
+}
+
+__global__ void markov_argmax_stage1_f16_k(
+    const half* __restrict__ logits_row,
+    const half* __restrict__ markov_head,
+    const __nv_bfloat16* __restrict__ markov_embed,
+    int prev_tok,
+    float* __restrict__ blk_vals,
+    int* __restrict__ blk_ids,
+    int vocab_local,
+    int rank
+) {
+    __shared__ float s_emb[256];
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) {
+        s_emb[i] = __bfloat162float(markov_embed[(size_t)prev_tok * rank + i]);
+    }
+    __syncthreads();
+    int tid = threadIdx.x;
+    int base = blockIdx.x * 1024 + tid;
+    int r2 = rank >> 1;
+    float best_v = -1e30f;
+    int best_i = 0;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        int v = base + k * 256;
+        if (v < vocab_local) {
+            const half2* mh2 = reinterpret_cast<const half2*>(markov_head + (size_t)v * rank);
+            float dot = 0.0f;
+            for (int i = 0; i < r2; ++i) {
+                float2 wv = __half22float2(__ldg(mh2 + i));
+                dot = fmaf(wv.x, s_emb[2 * i], dot);
+                dot = fmaf(wv.y, s_emb[2 * i + 1], dot);
+            }
+            float val = __half2float(__ldg(logits_row + v)) + dot;
+            if (val > best_v) {
+                best_v = val;
+                best_i = v;
+            }
+        }
+    }
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    for (int m = 16; m > 0; m >>= 1) {
+        float ov = __shfl_xor_sync(0xFFFFFFFFu, best_v, m);
+        int oi = __shfl_xor_sync(0xFFFFFFFFu, best_i, m);
+        if (ov > best_v || (ov == best_v && oi < best_i)) {
+            best_v = ov;
+            best_i = oi;
+        }
+    }
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    if (lane == 0) {
+        sv[warp] = best_v;
+        si[warp] = best_i;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float bv = (lane < 8) ? sv[lane] : -1e30f;
+        int bi = (lane < 8) ? si[lane] : 0;
+        for (int m = 4; m > 0; m >>= 1) {
+            float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, m);
+            int oi = __shfl_xor_sync(0xFFFFFFFFu, bi, m);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (lane == 0) {
+            blk_vals[blockIdx.x] = bv;
+            blk_ids[blockIdx.x] = bi;
+        }
+    }
+}
+
+__global__ void markov_argmax_stage2_k(
+    const float* __restrict__ blk_vals,
+    const int* __restrict__ blk_ids,
+    float* __restrict__ out_val,
+    int* __restrict__ out_id,
+    int n_blks
+) {
+    float bv = -1e30f;
+    int bi = 0;
+    for (int i = 0; i < n_blks; ++i) {
+        float v = blk_vals[i];
+        int id = blk_ids[i];
+        if (v > bv || (v == bv && id < bi)) {
+            bv = v;
+            bi = id;
+        }
+    }
+    out_val[0] = bv;
+    out_id[0] = bi;
+}
+
+void rad_cuda_markov_argmax_f16(
+    const half* logits_row,
+    const half* markov_head,
+    const __nv_bfloat16* markov_embed,
+    int prev_tok,
+    float* blk_vals,
+    int* blk_ids,
+    float* out_val,
+    int* out_id,
+    int vocab_local,
+    int rank,
+    cudaStream_t stream
+) {
+    int n_blks = (vocab_local + 1023) / 1024;
+    markov_argmax_stage1_f16_k<<<n_blks, 256, 0, stream>>>(
+        logits_row, markov_head, markov_embed, prev_tok, blk_vals, blk_ids, vocab_local, rank
+    );
+    markov_argmax_stage2_k<<<1, 1, 0, stream>>>(blk_vals, blk_ids, out_val, out_id, n_blks);
 }
 
 void rad_cuda_markov_bias_add_f16(

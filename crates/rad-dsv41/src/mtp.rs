@@ -21,6 +21,7 @@ pub struct DsparkMtp {
     pub d_taps_f16: CudaBuf,
     pub d_main_proj: CudaBuf,
     pub d_main_x: CudaBuf,
+    #[allow(dead_code)]
     pub d_logits_row: CudaBuf,
     pub last_ctx_row: usize,
 }
@@ -74,22 +75,22 @@ impl DsparkMtp {
 
 pub fn ngram_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<i32>> {
     let n = history.len();
-    if n < 8 || max_k < 4 {
+    if n < 16 || max_k < 16 {
         return None;
     }
     let c = history[n - 1];
     let b = history[n - 2];
     let mut best_pos: Option<usize> = None;
     let mut best_len = 0usize;
-    let mut i = n.saturating_sub(4);
-    while i >= 3 {
+    let mut i = n.saturating_sub(17);
+    while i >= 4 {
         if history[i] == anchor && history[i - 1] == c && history[i - 2] == b {
             let mut mlen = 3usize;
             let lim = 64usize.min(i).min(n);
             while mlen < lim && history[i - mlen] == history[n - mlen] {
                 mlen += 1;
             }
-            if mlen >= 4 && mlen > best_len {
+            if mlen >= 5 && mlen > best_len {
                 best_len = mlen;
                 best_pos = Some(i);
                 if mlen >= 16 {
@@ -100,13 +101,28 @@ pub fn ngram_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<i32
         i -= 1;
     }
     let pos = best_pos?;
-    let avail = (n - pos).min(max_k);
-    if avail < 6 {
+    let cap_k = if best_len >= 10 {
+        max_k
+    } else if best_len >= 7 {
+        max_k.min(64)
+    } else {
+        max_k.min(32)
+    };
+    let avail = (n - pos).min(cap_k);
+    let take = if avail >= 128 {
+        128
+    } else if avail >= 64 {
+        64
+    } else if avail >= 32 {
+        32
+    } else if avail >= 16 {
+        16
+    } else {
         return None;
-    }
-    let mut out = Vec::with_capacity(avail);
+    };
+    let mut out = Vec::with_capacity(take);
     out.push(anchor);
-    out.extend_from_slice(&history[(pos + 1)..(pos + avail)]);
+    out.extend_from_slice(&history[(pos + 1)..(pos + take)]);
     Some(out)
 }
 
@@ -116,9 +132,10 @@ mod tests {
 
     #[test]
     fn ngram_draft_matches_repeated_suffix() {
-        let mut h: Vec<i32> = (1..20).collect();
-        h.extend_from_slice(&[5, 6, 7, 8]);
-        let d = ngram_draft(&h, 9, 8).expect("should match");
-        assert_eq!(&d[..5], &[9, 10, 11, 12, 13]);
+        let mut h: Vec<i32> = (1..40).collect();
+        h.extend_from_slice(&[5, 6, 7, 8, 9]);
+        let d = ngram_draft(&h, 10, 32).expect("should match");
+        assert_eq!(d.len(), 32);
+        assert_eq!(&d[..5], &[10, 11, 12, 13, 14]);
     }
 }
