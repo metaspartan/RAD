@@ -139,7 +139,11 @@ fn worker_loop(eng: &mut Dsv41Engine, comm: &mut Tp2Comm) -> Result<()> {
             0 => eng.pos = 0,
             1 => {
                 comm.broadcast_i32_vec(&mut toks)?;
-                eng.step_batch_no_head(&toks, comm)?;
+                eng.step_batch_no_head(&toks, comm, true)?;
+            }
+            7 => {
+                comm.broadcast_i32_vec(&mut toks)?;
+                eng.step_batch_no_head(&toks, comm, false)?;
             }
             2 => {
                 comm.broadcast_i32_vec(&mut toks)?;

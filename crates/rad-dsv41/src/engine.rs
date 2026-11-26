@@ -533,7 +533,7 @@ impl Dsv41Engine {
         Ok((self.d_branch_out.ptr, std::ptr::null()))
     }
 
-    fn forward_layers(&mut self, tokens: &[i32], comm: &mut Tp2Comm) -> Result<()> {
+    fn forward_layers(&mut self, tokens: &[i32], comm: &mut Tp2Comm, update_mtp: bool) -> Result<()> {
         let m = tokens.len();
         let mi = m as i32;
         let tc = self.cfg.text_config.clone();
@@ -772,31 +772,33 @@ impl Dsv41Engine {
                 );
             }
         }
-        if let Some(mtp) = self.mtp.take() {
-            unsafe {
-                self.exl3_proj(mtp.d_taps_f16.ptr, &mtp.main_proj, mtp.d_main_proj.ptr, mi, 0, stream);
-                cuda_ops::rad_cuda_rms_norm_bf16w_f16(mtp.d_main_proj.ptr, mtp.main_norm.ptr, mtp.d_main_x.ptr, mi, d as i32, tc.rms_norm_eps / 256.0f32, stream);
-                for ml in 0..mtp.layers.len() {
-                    let mlw = &mtp.layers[ml];
-                    self.exl3_proj(mtp.d_main_x.ptr, &mlw.wkv, self.d_kv.ptr, mi, 0, stream);
-                    cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, mlw.kv_norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, stream);
-                    cuda_ops::rad_cuda_rope_yarn_f16(std::ptr::null_mut(), self.d_kv_normed.ptr, mi, 0, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, 1.0f32, stream);
-                    cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv_normed.ptr, self.d_kv_normed.ptr, mtp.kv_caches[ml].k_cache.ptr, mtp.kv_caches[ml].k_cache.ptr, mi, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
+        if update_mtp {
+            if let Some(mtp) = self.mtp.take() {
+                unsafe {
+                    self.exl3_proj(mtp.d_taps_f16.ptr, &mtp.main_proj, mtp.d_main_proj.ptr, mi, 0, stream);
+                    cuda_ops::rad_cuda_rms_norm_bf16w_f16(mtp.d_main_proj.ptr, mtp.main_norm.ptr, mtp.d_main_x.ptr, mi, d as i32, tc.rms_norm_eps / 256.0f32, stream);
+                    for ml in 0..mtp.layers.len() {
+                        let mlw = &mtp.layers[ml];
+                        self.exl3_proj(mtp.d_main_x.ptr, &mlw.wkv, self.d_kv.ptr, mi, 0, stream);
+                        cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, mlw.kv_norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, stream);
+                        cuda_ops::rad_cuda_rope_yarn_f16(std::ptr::null_mut(), self.d_kv_normed.ptr, mi, 0, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, 1.0f32, stream);
+                        cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv_normed.ptr, self.d_kv_normed.ptr, mtp.kv_caches[ml].k_cache.ptr, mtp.kv_caches[ml].k_cache.ptr, mi, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
+                    }
                 }
+                self.mtp = Some(mtp);
             }
-            self.mtp = Some(mtp);
         }
         self.pos += m;
         Ok(())
     }
 
-    pub fn step_batch_no_head(&mut self, tokens: &[i32], comm: &mut Tp2Comm) -> Result<()> {
-        self.forward_layers(tokens, comm)
+    pub fn step_batch_no_head(&mut self, tokens: &[i32], comm: &mut Tp2Comm, update_mtp: bool) -> Result<()> {
+        self.forward_layers(tokens, comm, update_mtp)
     }
 
     pub fn step_batch(&mut self, tokens: &[i32], comm: &mut Tp2Comm) -> Result<Vec<i32>> {
         let m = tokens.len();
-        self.forward_layers(tokens, comm)?;
+        self.forward_layers(tokens, comm, true)?;
         let tc = &self.cfg.text_config;
         let d = tc.hidden_size;
         let stream: CudaStream = std::ptr::null_mut();
@@ -830,7 +832,7 @@ impl Dsv41Engine {
 
     pub fn step_batch_last(&mut self, tokens: &[i32], comm: &mut Tp2Comm) -> Result<i32> {
         let m = tokens.len();
-        self.forward_layers(tokens, comm)?;
+        self.forward_layers(tokens, comm, true)?;
         let tc = &self.cfg.text_config;
         let d = tc.hidden_size;
         let stream: CudaStream = std::ptr::null_mut();
@@ -983,14 +985,16 @@ impl Dsv41Engine {
             return Ok(self.cfg.bos_token_id);
         }
         let n = tokens.len();
+        let sw = self.cfg.text_config.sliding_window.max(4096);
         let mut idx = 0usize;
         while idx + MAX_BATCH < n {
             let chunk_end = idx + MAX_BATCH;
             let mut chunk = tokens[idx..chunk_end].to_vec();
-            let mut cmd = 1u32;
+            let need_mtp = n.saturating_sub(chunk_end) < sw;
+            let mut cmd = if need_mtp { 1u32 } else { 7u32 };
             comm.broadcast_u32(&mut cmd)?;
             comm.broadcast_i32_vec(&mut chunk)?;
-            self.step_batch_no_head(&chunk, comm)?;
+            self.step_batch_no_head(&chunk, comm, need_mtp)?;
             idx = chunk_end;
         }
         let mut last_chunk = tokens[idx..n].to_vec();

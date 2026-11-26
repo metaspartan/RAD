@@ -493,6 +493,218 @@ void rad_cuda_argmax_f16(
     argmax_f16_stage2_k<<<M, 1, 0, stream>>>(blk_vals, blk_ids, out_val, out_id, n_blks);
 }
 
+__device__ __forceinline__ void dspark_mma_m16n8k16_f32(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)
+    );
+}
+
+__global__ __launch_bounds__(256)
+void mqa_flash_mma16_dspark_f16_k(
+    const half* __restrict__ q,
+    const half* __restrict__ k_ring,
+    const half* __restrict__ kv_blk,
+    const float* __restrict__ attn_sink,
+    half* __restrict__ out,
+    int n_heads,
+    int q0,
+    int max_ctx,
+    int sliding_window,
+    int blk_len,
+    float scale
+) {
+    int h0 = blockIdx.x * 16;
+    int mr = blockIdx.y;
+    int t = threadIdx.x;
+    int warp = t >> 5;
+    int lane = t & 31;
+    int group_id = lane >> 2;
+    int tid = lane & 3;
+
+    int p_start = (sliding_window > 0 && q0 > sliding_window) ? (q0 - sliding_window) : 0;
+
+    __shared__ half s_q[16][512];
+    __shared__ half s_kv[16][520];
+    __shared__ float s_sp[8][16][16];
+    __shared__ half s_p[16][16];
+    __shared__ float s_m[16];
+    __shared__ float s_l[16];
+    __shared__ float s_alpha[16];
+
+    const uint4* q_u4 = reinterpret_cast<const uint4*>(q + ((size_t)mr * n_heads + h0) * 512);
+    uint4* sq_u4 = reinterpret_cast<uint4*>(&s_q[0][0]);
+    for (int i = t; i < 1024; i += 256) {
+        sq_u4[i] = __ldg(q_u4 + i);
+    }
+    if (t < 16) {
+        s_m[t] = attn_sink ? attn_sink[h0 + t] : -1e30f;
+        s_l[t] = attn_sink ? 1.0f : 0.0f;
+    }
+    __syncthreads();
+
+    float o0[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float o1[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float o2[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float o3[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    auto process_tile = [&](int tile_len) {
+        float s00 = 0.0f, s01 = 0.0f, s02 = 0.0f, s03 = 0.0f;
+        float s10 = 0.0f, s11 = 0.0f, s12 = 0.0f, s13 = 0.0f;
+        int k_base = warp * 64;
+        #pragma unroll
+        for (int ks = 0; ks < 64; ks += 16) {
+            int ko0 = k_base + ks + tid * 2;
+            int ko1 = ko0 + 8;
+            uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][ko0]);
+            uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][ko0]);
+            uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][ko1]);
+            uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][ko1]);
+            uint32_t b00 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id][ko0]);
+            uint32_t b01 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id][ko1]);
+            uint32_t b10 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id + 8][ko0]);
+            uint32_t b11 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id + 8][ko1]);
+            dspark_mma_m16n8k16_f32(s00, s01, s02, s03, a0, a1, a2, a3, b00, b01);
+            dspark_mma_m16n8k16_f32(s10, s11, s12, s13, a0, a1, a2, a3, b10, b11);
+        }
+        s_sp[warp][group_id][tid * 2] = s00;
+        s_sp[warp][group_id][tid * 2 + 1] = s01;
+        s_sp[warp][group_id + 8][tid * 2] = s02;
+        s_sp[warp][group_id + 8][tid * 2 + 1] = s03;
+        s_sp[warp][group_id][8 + tid * 2] = s10;
+        s_sp[warp][group_id][8 + tid * 2 + 1] = s11;
+        s_sp[warp][group_id + 8][8 + tid * 2] = s12;
+        s_sp[warp][group_id + 8][8 + tid * 2 + 1] = s13;
+        __syncthreads();
+
+        int r = t >> 4;
+        int c = t & 15;
+        float sc = -1e30f;
+        if (c < tile_len) {
+            float sum = s_sp[0][r][c] + s_sp[1][r][c] + s_sp[2][r][c] + s_sp[3][r][c]
+                      + s_sp[4][r][c] + s_sp[5][r][c] + s_sp[6][r][c] + s_sp[7][r][c];
+            sc = sum * scale;
+        }
+        float rmax = sc;
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 8));
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 4));
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 2));
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 1));
+        float old_m = s_m[r];
+        float new_m = fmaxf(old_m, rmax);
+        float alpha = exp2f((old_m - new_m) * 1.44269504f);
+        float p = (c < tile_len) ? exp2f((sc - new_m) * 1.44269504f) : 0.0f;
+        s_p[r][c] = __float2half(p);
+        float rsum = p;
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 8);
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 4);
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 2);
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 1);
+        if (c == 0) {
+            s_l[r] = s_l[r] * alpha + rsum;
+            s_m[r] = new_m;
+            s_alpha[r] = alpha;
+        }
+        __syncthreads();
+
+        float a0_sc = s_alpha[group_id];
+        float a1_sc = s_alpha[group_id + 8];
+        uint32_t pa0 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2]);
+        uint32_t pa1 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2]);
+        uint32_t pa2 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2 + 8]);
+        uint32_t pa3 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2 + 8]);
+        int col_w = warp * 64;
+        #pragma unroll
+        for (int nb = 0; nb < 8; ++nb) {
+            o0[nb] *= a0_sc;
+            o1[nb] *= a0_sc;
+            o2[nb] *= a1_sc;
+            o3[nb] *= a1_sc;
+            int col = col_w + nb * 8 + group_id;
+            half2 vb0 = __halves2half2(s_kv[tid * 2][col], s_kv[tid * 2 + 1][col]);
+            half2 vb1 = __halves2half2(s_kv[tid * 2 + 8][col], s_kv[tid * 2 + 9][col]);
+            uint32_t b0 = *reinterpret_cast<uint32_t*>(&vb0);
+            uint32_t b1 = *reinterpret_cast<uint32_t*>(&vb1);
+            dspark_mma_m16n8k16_f32(o0[nb], o1[nb], o2[nb], o3[nb], pa0, pa1, pa2, pa3, b0, b1);
+        }
+        __syncthreads();
+    };
+
+    for (int p0 = p_start; p0 < q0; p0 += 16) {
+        int tile_len = q0 - p0;
+        if (tile_len > 16) tile_len = 16;
+        for (int i = t; i < 1024; i += 256) {
+            int r = i >> 6;
+            int c4 = i & 63;
+            if (r < tile_len) {
+                int slot = (p0 + r) % max_ctx;
+                const uint4* src_u4 = reinterpret_cast<const uint4*>(k_ring + (size_t)slot * 512);
+                reinterpret_cast<uint4*>(s_kv[r])[c4] = __ldg(src_u4 + c4);
+            } else {
+                reinterpret_cast<uint4*>(s_kv[r])[c4] = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        __syncthreads();
+        process_tile(tile_len);
+    }
+
+    if (blk_len > 0) {
+        int n_u4 = blk_len * 64;
+        const uint4* src_u4 = reinterpret_cast<const uint4*>(kv_blk);
+        for (int i = t; i < 1024; i += 256) {
+            int r = i >> 6;
+            int c4 = i & 63;
+            reinterpret_cast<uint4*>(s_kv[r])[c4] = (i < n_u4) ? __ldg(src_u4 + i) : make_uint4(0u, 0u, 0u, 0u);
+        }
+        __syncthreads();
+        process_tile(blk_len);
+    }
+
+    int col_w = warp * 64;
+    float inv0 = 1.0f / fmaxf(s_l[group_id], 1e-20f);
+    float inv1 = 1.0f / fmaxf(s_l[group_id + 8], 1e-20f);
+    half* oh0 = out + ((size_t)mr * n_heads + h0 + group_id) * 512 + col_w;
+    half* oh1 = out + ((size_t)mr * n_heads + h0 + group_id + 8) * 512 + col_w;
+    #pragma unroll
+    for (int nb = 0; nb < 8; ++nb) {
+        int c0 = nb * 8 + tid * 2;
+        oh0[c0] = __float2half(o0[nb] * inv0);
+        oh0[c0 + 1] = __float2half(o1[nb] * inv0);
+        oh1[c0] = __float2half(o2[nb] * inv1);
+        oh1[c0 + 1] = __float2half(o3[nb] * inv1);
+    }
+}
+
+void rad_cuda_mqa_attn_sink_dspark_f16(
+    const half* q,
+    const half* k_ring,
+    const half* v_ring,
+    const half* kv_blk,
+    const float* attn_sink,
+    half* out,
+    int M,
+    int n_heads,
+    int q0,
+    int max_ctx,
+    int sliding_window,
+    int head_dim,
+    float scale,
+    cudaStream_t stream
+) {
+    (void)v_ring;
+    (void)head_dim;
+    dim3 grid(n_heads / 16, M);
+    mqa_flash_mma16_dspark_f16_k<<<grid, 256, 0, stream>>>(
+        q, k_ring, kv_blk, attn_sink, out, n_heads, q0, max_ctx, sliding_window, M, scale
+    );
+}
+
 void rad_cuda_add_f16(half* dst, const half* src, int N, cudaStream_t stream) {
     add_f16_k<<<(N + 255) / 256, 256, 0, stream>>>(dst, src, N);
 }

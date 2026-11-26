@@ -764,7 +764,8 @@ pub(crate) fn run_scheduler(
                 let mut max_hit_len = 0usize;
                 for a in &active {
                     let rem_kv = engine.max_ctx.saturating_sub(engine.seq_pos[a.seq] as usize);
-                    if let Some((ng, mlen)) = ngram_lookup_draft_ex(&engine.seq_tokens[a.seq], a.next_tok, max_user_k.min(rem_kv)) {
+                    let u_in_edit = a.last_emits >= 10;
+                    if let Some((ng, mlen)) = ngram_lookup_draft_cfg(&engine.seq_tokens[a.seq], a.next_tok, max_user_k.min(rem_kv), u_in_edit) {
                         let req_mlen = if a.emitted >= 24 && a.last_emits > 0 && a.last_emits <= 16 { 9 } else { 5 };
                         if ng.len() >= 8 && mlen >= req_mlen {
                             hit_count += 1;
