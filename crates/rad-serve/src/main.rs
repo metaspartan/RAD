@@ -470,6 +470,7 @@ async fn main() -> anyhow::Result<()> {
 
     for &dev_id in &gpu_ids {
         rad_hip::set_device(dev_id).map_err(|e| anyhow::anyhow!("hipSetDevice({dev_id}) failed: rc={e}"))?;
+        let _ = rad_hip::set_device_spin();
         let mut engine = InklingEngine::load_multi(Path::new(&opts.model), opts.ctx, opts.max_seqs)?;
         engine.capture_decode_graph()?;
         let drafter = load_drafter(&opts, &mut engine, opts.max_seqs.min(8))?;

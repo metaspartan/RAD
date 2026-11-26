@@ -152,6 +152,11 @@ pub fn set_device(dev: i32) -> Result<(), HipError> {
     if rc == HIP_SUCCESS { Ok(()) } else { Err(rc) }
 }
 
+pub fn set_device_spin() -> Result<(), HipError> {
+    let rc = unsafe { hipSetDeviceFlags(1) };
+    if rc == HIP_SUCCESS { Ok(()) } else { Err(rc) }
+}
+
 pub fn mem_info(dev: i32) -> Result<(usize, usize), HipError> {
     let prev = get_device().unwrap_or(0);
     set_device(dev)?;

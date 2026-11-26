@@ -39,6 +39,7 @@ extern "C" {
     pub fn hipGraphInstantiate(e: *mut *mut core::ffi::c_void, g: *mut core::ffi::c_void, flags: u64) -> HipError;
     pub fn hipGraphLaunch(e: *mut core::ffi::c_void, s: HipStream) -> HipError;
     pub fn hipSetDevice(d: i32) -> HipError;
+    pub fn hipSetDeviceFlags(flags: u32) -> HipError;
     pub fn hipGetDevice(d: *mut i32) -> HipError;
     pub fn hipGetDeviceCount(count: *mut i32) -> HipError;
     pub fn hipDeviceCanAccessPeer(can_access: *mut i32, dev: i32, peer: i32) -> HipError;

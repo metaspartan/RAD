@@ -257,35 +257,101 @@ extern "C" __global__ void loop_ctrl_down_b_k(const float* __restrict__ cur0,
     const float* cur = ((c == 0) ? cur0 : ((c == 1) ? cur1 : cur2)) + (size_t)t * n_embd;
     const float* msg = msgs + ((size_t)c * max_B + t) * n_embd;
     const float* wd = (c == 0) ? wd0 : ((c == 1) ? wd1 : wd2);
-    __shared__ float red[8];
+    __shared__ float red_c[8];
+    __shared__ float red_m[8];
     __shared__ float rc_s, rm_s;
-    int wid = threadIdx.x >> 5;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
     int nw = blockDim.x >> 5;
 
+    if ((n_embd & 3) == 0 && n_embd <= 3072 && blockDim.x == 256) {
+        int e4 = n_embd >> 2;
+        const float4* cur4 = reinterpret_cast<const float4*>(cur);
+        const float4* msg4 = reinterpret_cast<const float4*>(msg);
+        float4 cr[3], mr[3];
+        float sc = 0.0f, sm = 0.0f;
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            int j = tid + p * 256;
+            if (j < e4) {
+                float4 cv = cur4[j];
+                float4 mv = msg4[j];
+                cr[p] = cv;
+                mr[p] = mv;
+                sc = fmaf(cv.x, cv.x, fmaf(cv.y, cv.y, fmaf(cv.z, cv.z, fmaf(cv.w, cv.w, sc))));
+                sm = fmaf(mv.x, mv.x, fmaf(mv.y, mv.y, fmaf(mv.z, mv.z, fmaf(mv.w, mv.w, sm))));
+            }
+        }
+        sc = b_warp_sum32(sc);
+        sm = b_warp_sum32(sm);
+        if (lane == 0) {
+            red_c[wid] = sc;
+            red_m[wid] = sm;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float tc = 0.0f, tm = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                tc += red_c[i];
+                tm += red_m[i];
+            }
+            rc_s = rsqrtf(tc / (float)n_embd + 1e-6f);
+            rm_s = rsqrtf(tm / (float)n_embd + 1e-6f);
+        }
+        __syncthreads();
+
+        const float4* wr4 = reinterpret_cast<const float4*>(wd + (size_t)r * (2 * n_embd));
+        float rc = rc_s;
+        float rm = rm_s;
+        float acc = 0.0f;
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            int j = tid + p * 256;
+            if (j < e4) {
+                float4 wc = wr4[j];
+                float4 wm = wr4[e4 + j];
+                float4 cv = cr[p];
+                float4 mv = mr[p];
+                acc = fmaf(wc.x, cv.x * rc, fmaf(wc.y, cv.y * rc, fmaf(wc.z, cv.z * rc, fmaf(wc.w, cv.w * rc, acc))));
+                acc = fmaf(wm.x, mv.x * rm, fmaf(wm.y, mv.y * rm, fmaf(wm.z, mv.z * rm, fmaf(wm.w, mv.w * rm, acc))));
+            }
+        }
+        acc = b_warp_sum32(acc);
+        if (lane == 0) red_c[wid] = acc;
+        __syncthreads();
+        if (tid == 0) {
+            float tot = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) tot += red_c[i];
+            h_out[((size_t)c * max_B + t) * rank + r] = tot;
+        }
+        return;
+    }
+
     float sc = 0.0f, sm = 0.0f;
-    for (int j = threadIdx.x; j < n_embd; j += blockDim.x) {
+    for (int j = tid; j < n_embd; j += blockDim.x) {
         float vc = cur[j];
         float vm = msg[j];
         sc += vc * vc;
         sm += vm * vm;
     }
     sc = b_warp_sum32(sc);
-    if ((threadIdx.x & 31) == 0) red[wid] = sc;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float tot = 0.0f;
-        for (int i = 0; i < nw; ++i) tot += red[i];
-        rc_s = rsqrtf(tot / (float)n_embd + 1e-6f);
+    sm = b_warp_sum32(sm);
+    if (lane == 0) {
+        red_c[wid] = sc;
+        red_m[wid] = sm;
     }
     __syncthreads();
-
-    sm = b_warp_sum32(sm);
-    if ((threadIdx.x & 31) == 0) red[wid] = sm;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float tot = 0.0f;
-        for (int i = 0; i < nw; ++i) tot += red[i];
-        rm_s = rsqrtf(tot / (float)n_embd + 1e-6f);
+    if (tid == 0) {
+        float tc = 0.0f, tm = 0.0f;
+        for (int i = 0; i < nw; ++i) {
+            tc += red_c[i];
+            tm += red_m[i];
+        }
+        rc_s = rsqrtf(tc / (float)n_embd + 1e-6f);
+        rm_s = rsqrtf(tm / (float)n_embd + 1e-6f);
     }
     __syncthreads();
 
@@ -293,15 +359,15 @@ extern "C" __global__ void loop_ctrl_down_b_k(const float* __restrict__ cur0,
     float rc = rc_s;
     float rm = rm_s;
     float acc = 0.0f;
-    for (int j = threadIdx.x; j < n_embd; j += blockDim.x) {
+    for (int j = tid; j < n_embd; j += blockDim.x) {
         acc += wr[j] * (cur[j] * rc) + wr[n_embd + j] * (msg[j] * rm);
     }
     acc = b_warp_sum32(acc);
-    if ((threadIdx.x & 31) == 0) red[wid] = acc;
+    if (lane == 0) red_c[wid] = acc;
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if (tid == 0) {
         float tot = 0.0f;
-        for (int i = 0; i < nw; ++i) tot += red[i];
+        for (int i = 0; i < nw; ++i) tot += red_c[i];
         h_out[((size_t)c * max_B + t) * rank + r] = tot;
     }
 }
@@ -921,26 +987,48 @@ __global__ void loop_ctrl_up_fast_nt_k(const float* __restrict__ cur0,
     int i = blockIdx.x * 8 + warp;
     int c = blockIdx.y;
     int t0 = blockIdx.z * NT;
-    if (i >= n_embd) return;
     const float* cur_base = (c == 0) ? cur0 : ((c == 1) ? cur1 : cur2);
     const float* msg_base = msgs + (size_t)c * max_B * n_embd;
     const float* h_base = h_in + (size_t)c * max_B * rank;
     const float* wg = (c == 0) ? wg0 : ((c == 1) ? wg1 : wg2);
     const float* wf = (c == 0) ? wf0 : ((c == 1) ? wf1 : wf2);
     float* out_base = (c == 0) ? out0 : ((c == 1) ? out1 : out2);
-    const float* wgi = wg + (size_t)i * rank;
-    const float* wfi = wf + (size_t)i * rank;
+    const float* wgi = wg + (size_t)min(i, n_embd - 1) * rank;
+    const float* wfi = wf + (size_t)min(i, n_embd - 1) * rank;
     float g[NT], f[NT];
 #pragma unroll
     for (int m = 0; m < NT; ++m) { g[m] = 0.0f; f[m] = 0.0f; }
-    for (int r = lane; r < rank; r += 32) {
-        float gv = wgi[r];
-        float fv = wfi[r];
+    if (rank <= 128) {
+        __shared__ float s_h[NT][128];
+        int total_h = NT * rank;
+        for (int idx = threadIdx.x; idx < total_h; idx += 256) {
+            int m = idx / rank;
+            int r = idx - m * rank;
+            s_h[m][r] = h_base[(size_t)(t0 + m) * rank + r];
+        }
+        __syncthreads();
+        if (i >= n_embd) return;
+        for (int r = lane; r < rank; r += 32) {
+            float gv = wgi[r];
+            float fv = wfi[r];
 #pragma unroll
-        for (int m = 0; m < NT; ++m) {
-            float hr = h_base[(size_t)(t0 + m) * rank + r];
-            g[m] = fmaf(gv, hr, g[m]);
-            f[m] = fmaf(fv, hr, f[m]);
+            for (int m = 0; m < NT; ++m) {
+                float hr = s_h[m][r];
+                g[m] = fmaf(gv, hr, g[m]);
+                f[m] = fmaf(fv, hr, f[m]);
+            }
+        }
+    } else {
+        if (i >= n_embd) return;
+        for (int r = lane; r < rank; r += 32) {
+            float gv = wgi[r];
+            float fv = wfi[r];
+#pragma unroll
+            for (int m = 0; m < NT; ++m) {
+                float hr = h_base[(size_t)(t0 + m) * rank + r];
+                g[m] = fmaf(gv, hr, g[m]);
+                f[m] = fmaf(fv, hr, f[m]);
+            }
         }
     }
 #pragma unroll
