@@ -1194,27 +1194,15 @@ impl InklingEngine {
             let kv_n = (self.cfg.n_head_kv * self.cfg.dh * 3) as i32;
             let e_n = (self.cfg.n_embd * 3) as i32;
             let target_s = self.seq_verify_graphs.get(&(seq, b)).map(|vg| vg.stream).unwrap_or(self.stream);
-            let rw_u: [i32; 1] = [0];
-            let rw_seq: [i32; 1] = [seq as i32];
-            let rw_idx: [i32; 1] = [idx];
-            let u_b = unsafe { std::slice::from_raw_parts(rw_u.as_ptr() as *const u8, 4) };
-            let s_b = unsafe { std::slice::from_raw_parts(rw_seq.as_ptr() as *const u8, 4) };
-            let i_b = unsafe { std::slice::from_raw_parts(rw_idx.as_ptr() as *const u8, 4) };
-            self.d_rw_u.copy_from(u_b, Some(target_s)).map_err(he)?;
-            self.d_rw_seq.copy_from(s_b, Some(target_s)).map_err(he)?;
-            self.d_rw_idx.copy_from(i_b, Some(target_s)).map_err(he)?;
             unsafe {
-                ops::ink_rewind_multi_all_slots(
+                ops::ink_rewind_single_all_slots(
                     target_s,
                     self.d_rewind_ptrs.ptr as *const u64,
-                    self.d_rw_u.ptr as *const i32,
-                    self.d_rw_seq.ptr as *const i32,
-                    self.d_rw_idx.ptr as *const i32,
+                    seq as i32,
+                    idx,
                     self.slots.len() as i32,
-                    1,
                     kv_n,
                     e_n,
-                    b as i32,
                 );
             }
             self.seq_pos[seq] -= (b - n_acc) as i32;

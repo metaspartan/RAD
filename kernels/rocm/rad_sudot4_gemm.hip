@@ -979,9 +979,24 @@ extern "C" int ink_gemm_q4_0_sudot4(hipStream_t s, const uint8_t* W, const void*
         else gemm_q4_0_sudot4_nt_k<6><<<dim3((n + 7) / 8, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k);
         return 0;
     }
+    if (B == 5) {
+        if (use8) gemm_q4_0_sudot4_nt8_k<5><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k);
+        else gemm_q4_0_sudot4_nt_k<5><<<dim3((n + 7) / 8, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k);
+        return 0;
+    }
     if (B == 4) {
         if (use8) gemm_q4_0_sudot4_nt8_k<4><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k);
         else gemm_q4_0_sudot4_nt_k<4><<<dim3((n + 7) / 8, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k);
+        return 0;
+    }
+    if (B == 3) {
+        if (use8) gemm_q4_0_sudot4_nt8_k<3><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k);
+        else gemm_q4_0_sudot4_nt_k<3><<<dim3((n + 7) / 8, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k);
+        return 0;
+    }
+    if (B == 2) {
+        if (use8) gemm_q4_0_sudot4_nt8_k<2><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k);
+        else gemm_q4_0_sudot4_nt_k<2><<<dim3((n + 7) / 8, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k);
         return 0;
     }
     gemm_q4_0_sudot4_k<<<dim3((n + 7) / 8, (B + 7) / 8), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k, B);

@@ -1539,6 +1539,32 @@ extern "C" int ink_rewind_multi_all_slots(hipStream_t s, const uint64_t* slot_pt
     return 0;
 }
 
+extern "C" __global__ void rewind_single_all_slots_k(const uint64_t* __restrict__ slot_ptrs,
+                                                     int su, int idx,
+                                                     int kv_n, int e_n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int sl = blockIdx.y;
+    const uint64_t* sp = slot_ptrs + (size_t)sl * 8;
+    if (i < kv_n) {
+        size_t s_off = (size_t)idx * kv_n + i;
+        size_t d_off = (size_t)su * kv_n + i;
+        reinterpret_cast<float*>(sp[1])[d_off] = reinterpret_cast<const float*>(sp[0])[s_off];
+        reinterpret_cast<float*>(sp[3])[d_off] = reinterpret_cast<const float*>(sp[2])[s_off];
+    }
+    if (i < e_n) {
+        size_t s_off = (size_t)idx * e_n + i;
+        size_t d_off = (size_t)su * e_n + i;
+        reinterpret_cast<float*>(sp[5])[d_off] = reinterpret_cast<const float*>(sp[4])[s_off];
+        reinterpret_cast<float*>(sp[7])[d_off] = reinterpret_cast<const float*>(sp[6])[s_off];
+    }
+}
+
+extern "C" int ink_rewind_single_all_slots(hipStream_t s, const uint64_t* slot_ptrs, int su, int idx, int n_slots, int kv_n, int e_n) {
+    int max_n = (kv_n > e_n) ? kv_n : e_n;
+    rewind_single_all_slots_k<<<dim3((max_n + 255) / 256, n_slots), dim3(256), 0, s>>>(slot_ptrs, su, idx, kv_n, e_n);
+    return 0;
+}
+
 extern "C" __global__ void inkling_attn_batch_gated_q8_k(const float* __restrict__ Q,
                                                          const float* __restrict__ R,
                                                          const float* __restrict__ sinks,
