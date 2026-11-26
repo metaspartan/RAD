@@ -144,7 +144,7 @@ impl InklingEngine {
         assert_eq!(n_users, draft_tokens.len());
         assert!(n_users >= 1 && n_users <= 16);
         let k_len = draft_tokens[0].len();
-        assert!(k_len >= 1 && k_len <= 128);
+        assert!(k_len >= 1 && k_len <= self.multi_verify_cap.min(256));
         let total_b = n_users * k_len;
         assert!(total_b <= self.multi_verify_cap);
         let mut flat_toks = Vec::with_capacity(total_b);

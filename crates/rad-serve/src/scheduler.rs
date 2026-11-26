@@ -140,7 +140,9 @@ pub(crate) fn prefill_tail_bucket(n: usize) -> usize {
 }
 
 pub(crate) fn ngram_bucket_len(avail: usize) -> usize {
-    if avail >= 128 { 128 }
+    if avail >= 256 { 256 }
+    else if avail >= 192 { 192 }
+    else if avail >= 128 { 128 }
     else if avail >= 96 { 96 }
     else if avail >= 64 { 64 }
     else if avail >= 48 { 48 }
@@ -258,7 +260,7 @@ pub(crate) fn run_scheduler(
                 Some(job) => {
                     pending.push_back(job);
                     if max_seqs > 1 {
-                        std::thread::sleep(std::time::Duration::from_millis(8));
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                 }
                 None => break,
@@ -598,8 +600,12 @@ pub(crate) fn run_scheduler(
                     let needs_logits = slot.grammar.is_some() || !slot.sampling.is_greedy();
                     let res = (|| -> anyhow::Result<Vec<i32>> {
                         let rem_kv = engine.max_ctx.saturating_sub(pos0 as usize);
-                        let max_ng_k = 128usize.min(rem_kv);
                         let in_edit = slot.last_emits >= 10;
+                        let max_ng_k = if slot.last_emits >= 64 {
+                            engine.multi_verify_cap.min(256).min(rem_kv)
+                        } else {
+                            128usize.min(rem_kv)
+                        };
                         let draft = if let Some((ng, mlen)) = ngram_lookup_draft_cfg(&engine.seq_tokens[seq], slot.next_tok, max_ng_k, in_edit) {
                             if mlen >= 5 {
                                 ng

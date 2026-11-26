@@ -1,7 +1,7 @@
 use anyhow::Result;
 use core::ffi::c_void;
 use rad_cuda::comm::Tp2Comm;
-use rad_cuda::{CudaBuf, CudaCapturedGraph, CudaFail, CudaStream};
+use rad_cuda::{CudaBuf, CudaCapturedGraph, CudaFail, CudaPinnedBuf, CudaStream};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
@@ -15,7 +15,7 @@ use crate::safetensors::SafetensorsIndex;
 use crate::weights::{load_raw_buf_replicated, CompressorWeights, Exl3Linear, LayerWeights};
 
 pub const MAX_BATCH: usize = 2048;
-pub const MAX_DECODE_BATCH: usize = 128;
+pub const MAX_DECODE_BATCH: usize = 256;
 
 pub struct KvCacheLayer {
     pub k_cache: CudaBuf,
@@ -74,8 +74,8 @@ pub struct Dsv41Engine {
     pub d_tok_ids: CudaBuf,
     pub d_arg_vals: CudaBuf,
     pub d_arg_ids: CudaBuf,
-    pub d_best_val: CudaBuf,
-    pub d_best_id: CudaBuf,
+    pub d_best_val: CudaPinnedBuf,
+    pub d_best_id: CudaPinnedBuf,
     pub h_ar_buf: Vec<u16>,
     pub qkv_graphs: HashMap<(usize, usize), CudaCapturedGraph>,
     pub wo_graphs: HashMap<(usize, usize), CudaCapturedGraph>,
@@ -244,8 +244,8 @@ impl Dsv41Engine {
             d_tok_ids: CudaBuf::new(MAX_BATCH * 4).map_err(CudaFail)?,
             d_arg_vals: CudaBuf::new(max_head_m * 256 * 4).map_err(CudaFail)?,
             d_arg_ids: CudaBuf::new(max_head_m * 256 * 4).map_err(CudaFail)?,
-            d_best_val: CudaBuf::new(max_head_m * 4).map_err(CudaFail)?,
-            d_best_id: CudaBuf::new(max_head_m * 4).map_err(CudaFail)?,
+            d_best_val: CudaPinnedBuf::new(max_head_m * 4).map_err(CudaFail)?,
+            d_best_id: CudaPinnedBuf::new(max_head_m * 4).map_err(CudaFail)?,
             h_ar_buf: vec![0u16; MAX_BATCH * d],
             qkv_graphs: HashMap::new(),
             wo_graphs: HashMap::new(),
@@ -825,10 +825,8 @@ impl Dsv41Engine {
             );
         }
         rad_cuda::sync_device().map_err(CudaFail)?;
-        let mut best_vals = vec![0.0f32; m];
-        let mut best_ids = vec![0i32; m];
-        self.d_best_val.copy_to_host(unsafe { std::slice::from_raw_parts_mut(best_vals.as_mut_ptr() as *mut u8, m * 4) }).map_err(CudaFail)?;
-        self.d_best_id.copy_to_host(unsafe { std::slice::from_raw_parts_mut(best_ids.as_mut_ptr() as *mut u8, m * 4) }).map_err(CudaFail)?;
+        let mut best_vals = self.d_best_val.as_f32_slice()[..m].to_vec();
+        let mut best_ids: Vec<i32> = unsafe { std::slice::from_raw_parts(self.d_best_id.ptr as *const i32, m) }.to_vec();
         let offset = (self.rank * self.head.n) as i32;
         for id in &mut best_ids {
             *id += offset;
@@ -861,10 +859,8 @@ impl Dsv41Engine {
             );
         }
         rad_cuda::sync_device().map_err(CudaFail)?;
-        let mut best_vals = [0.0f32; 1];
-        let mut best_ids = [0i32; 1];
-        self.d_best_val.copy_to_host(unsafe { std::slice::from_raw_parts_mut(best_vals.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
-        self.d_best_id.copy_to_host(unsafe { std::slice::from_raw_parts_mut(best_ids.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
+        let mut best_vals = [self.d_best_val.as_f32_slice()[0]];
+        let mut best_ids = [unsafe { *(self.d_best_id.ptr as *const i32) }];
         best_ids[0] += (self.rank * self.head.n) as i32;
         comm.all_reduce_argmax(&mut best_vals, &mut best_ids)?;
         Ok(best_ids[0])
@@ -1205,10 +1201,8 @@ impl Dsv41Engine {
                     );
                 }
                 rad_cuda::sync_device().map_err(CudaFail)?;
-                let mut bval = [0.0f32; 1];
-                let mut bid = [0i32; 1];
-                self.d_best_val.copy_to_host(unsafe { std::slice::from_raw_parts_mut(bval.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
-                self.d_best_id.copy_to_host(unsafe { std::slice::from_raw_parts_mut(bid.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
+                let mut bval = [self.d_best_val.as_f32_slice()[0]];
+                let mut bid = [unsafe { *(self.d_best_id.ptr as *const i32) }];
                 bid[0] += offset;
                 comm.all_reduce_argmax(&mut bval, &mut bid)?;
                 out.push(bid[0]);
@@ -1221,7 +1215,8 @@ impl Dsv41Engine {
     pub fn step_speculative(&mut self, history: &[i32], anchor: i32, comm: &mut Tp2Comm) -> Result<Vec<i32>> {
         static TRACE_SPEC: OnceLock<bool> = OnceLock::new();
         let trace = *TRACE_SPEC.get_or_init(|| std::env::var("RAD_TRACE_SPEC").map(|v| v == "1").unwrap_or(false));
-        let max_k = MAX_DECODE_BATCH.min(self.max_ctx.saturating_sub(self.pos + 1));
+        let max_k_lim = if self.last_acc >= 64 { MAX_DECODE_BATCH } else { 128 };
+        let max_k = max_k_lim.min(self.max_ctx.saturating_sub(self.pos + 1));
         let t_draft = Instant::now();
         let in_edit = self.last_acc >= 10;
         let (mut draft, mode) = if max_k >= 4 {

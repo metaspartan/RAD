@@ -111,7 +111,9 @@ pub fn ngram_draft_cfg(history: &[i32], anchor: i32, max_k: usize, in_edit: bool
         max_k.min(32)
     };
     let avail = (n - pos).min(cap_k);
-    let take = if avail >= 128 {
+    let take = if avail >= 256 {
+        256
+    } else if avail >= 128 {
         128
     } else if avail >= 64 {
         64
