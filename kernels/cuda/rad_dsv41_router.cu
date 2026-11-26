@@ -649,6 +649,201 @@ void rad_cuda_moe_route_sqrtsoftplus(
     moe_topk_select_k<<<M, 256, 0, stream>>>(raw_scores, sel_scores, topk_ids, topk_weights, n_experts, top_k, scaling_factor);
 }
 
+__global__ void mhc_sinkhorn_mix_pre_rmsnorm_f16_k(
+    float* __restrict__ streams,
+    const half* __restrict__ branch_out,
+    const half* __restrict__ peer_branch_out,
+    const float* __restrict__ h_coeff,
+    const float* __restrict__ prev_pre,
+    const __nv_bfloat16* __restrict__ norm_w,
+    half* __restrict__ y_out,
+    int D,
+    int sinkhorn_iters,
+    float rms_eps,
+    float hc_eps
+) {
+    int mr = blockIdx.x;
+    int t = threadIdx.x;
+    __shared__ float s_post[4];
+    __shared__ float s_res[16];
+    __shared__ float s_pre[4];
+    __shared__ float sm[8];
+    if (t == 0) {
+        const float* hc = h_coeff + (size_t)mr * 24;
+        for (int i = 0; i < 4; ++i) {
+            s_post[i] = 2.0f / (1.0f + expf(-hc[4 + i]));
+        }
+        float m[4][4];
+        for (int r = 0; r < 4; ++r) {
+            float rmax = hc[8 + r * 4 + 0];
+            for (int c = 1; c < 4; ++c) {
+                float v = hc[8 + r * 4 + c];
+                if (v > rmax) rmax = v;
+            }
+            float rs = 0.0f;
+            for (int c = 0; c < 4; ++c) {
+                m[r][c] = expf(hc[8 + r * 4 + c] - rmax);
+                rs += m[r][c];
+            }
+            float inv = 1.0f / rs;
+            for (int c = 0; c < 4; ++c) m[r][c] = m[r][c] * inv + hc_eps;
+        }
+        for (int c = 0; c < 4; ++c) {
+            float cs = m[0][c] + m[1][c] + m[2][c] + m[3][c] + hc_eps;
+            float inv = 1.0f / cs;
+            for (int r = 0; r < 4; ++r) m[r][c] *= inv;
+        }
+        for (int it = 1; it < sinkhorn_iters; ++it) {
+            for (int r = 0; r < 4; ++r) {
+                float rs = m[r][0] + m[r][1] + m[r][2] + m[r][3] + hc_eps;
+                float inv = 1.0f / rs;
+                for (int c = 0; c < 4; ++c) m[r][c] *= inv;
+            }
+            for (int c = 0; c < 4; ++c) {
+                float cs = m[0][c] + m[1][c] + m[2][c] + m[3][c] + hc_eps;
+                float inv = 1.0f / cs;
+                for (int r = 0; r < 4; ++r) m[r][c] *= inv;
+            }
+        }
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) s_res[r * 4 + c] = m[r][c];
+        }
+    }
+    if (t < 4) {
+        s_pre[t] = prev_pre ? prev_pre[(size_t)mr * 4 + t] : ((t == 0) ? 1.0f : 0.0f);
+    }
+    __syncthreads();
+    float p0 = s_pre[0], p1 = s_pre[1], p2 = s_pre[2], p3 = s_pre[3];
+    int d4 = D >> 2;
+    float4* sr4 = reinterpret_cast<float4*>(streams + (size_t)mr * 4 * D);
+    const uint2* bo2 = reinterpret_cast<const uint2*>(branch_out + (size_t)mr * D);
+    const uint2* po2 = peer_branch_out ? reinterpret_cast<const uint2*>(peer_branch_out + (size_t)mr * D) : nullptr;
+    float4 vals[6];
+    float ss = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        int i4 = t + k * 256;
+        if (i4 < d4) {
+            float4 x0 = sr4[0 * d4 + i4];
+            float4 x1 = sr4[1 * d4 + i4];
+            float4 x2 = sr4[2 * d4 + i4];
+            float4 x3 = sr4[3 * d4 + i4];
+            uint2 bq = bo2[i4];
+            float2 b0 = __half22float2(*reinterpret_cast<const half2*>(&bq.x));
+            float2 b1 = __half22float2(*reinterpret_cast<const half2*>(&bq.y));
+            if (po2) {
+                uint2 pq = po2[i4];
+                float2 q0 = __half22float2(*reinterpret_cast<const half2*>(&pq.x));
+                float2 q1 = __half22float2(*reinterpret_cast<const half2*>(&pq.y));
+                b0.x += q0.x; b0.y += q0.y;
+                b1.x += q1.x; b1.y += q1.y;
+            }
+            float4 o0, o1, o2, o3;
+            {
+                float m0 = s_res[0], m1 = s_res[4], m2 = s_res[8], m3 = s_res[12], sp = s_post[0];
+                o0.x = m0 * x0.x + m1 * x1.x + m2 * x2.x + m3 * x3.x + sp * b0.x;
+                o0.y = m0 * x0.y + m1 * x1.y + m2 * x2.y + m3 * x3.y + sp * b0.y;
+                o0.z = m0 * x0.z + m1 * x1.z + m2 * x2.z + m3 * x3.z + sp * b1.x;
+                o0.w = m0 * x0.w + m1 * x1.w + m2 * x2.w + m3 * x3.w + sp * b1.y;
+                sr4[0 * d4 + i4] = o0;
+            }
+            {
+                float m0 = s_res[1], m1 = s_res[5], m2 = s_res[9], m3 = s_res[13], sp = s_post[1];
+                o1.x = m0 * x0.x + m1 * x1.x + m2 * x2.x + m3 * x3.x + sp * b0.x;
+                o1.y = m0 * x0.y + m1 * x1.y + m2 * x2.y + m3 * x3.y + sp * b0.y;
+                o1.z = m0 * x0.z + m1 * x1.z + m2 * x2.z + m3 * x3.z + sp * b1.x;
+                o1.w = m0 * x0.w + m1 * x1.w + m2 * x2.w + m3 * x3.w + sp * b1.y;
+                sr4[1 * d4 + i4] = o1;
+            }
+            {
+                float m0 = s_res[2], m1 = s_res[6], m2 = s_res[10], m3 = s_res[14], sp = s_post[2];
+                o2.x = m0 * x0.x + m1 * x1.x + m2 * x2.x + m3 * x3.x + sp * b0.x;
+                o2.y = m0 * x0.y + m1 * x1.y + m2 * x2.y + m3 * x3.y + sp * b0.y;
+                o2.z = m0 * x0.z + m1 * x1.z + m2 * x2.z + m3 * x3.z + sp * b1.x;
+                o2.w = m0 * x0.w + m1 * x1.w + m2 * x2.w + m3 * x3.w + sp * b1.y;
+                sr4[2 * d4 + i4] = o2;
+            }
+            {
+                float m0 = s_res[3], m1 = s_res[7], m2 = s_res[11], m3 = s_res[15], sp = s_post[3];
+                o3.x = m0 * x0.x + m1 * x1.x + m2 * x2.x + m3 * x3.x + sp * b0.x;
+                o3.y = m0 * x0.y + m1 * x1.y + m2 * x2.y + m3 * x3.y + sp * b0.y;
+                o3.z = m0 * x0.z + m1 * x1.z + m2 * x2.z + m3 * x3.z + sp * b1.x;
+                o3.w = m0 * x0.w + m1 * x1.w + m2 * x2.w + m3 * x3.w + sp * b1.y;
+                sr4[3 * d4 + i4] = o3;
+            }
+            float4 v;
+            v.x = p0 * o0.x + p1 * o1.x + p2 * o2.x + p3 * o3.x;
+            v.y = p0 * o0.y + p1 * o1.y + p2 * o2.y + p3 * o3.y;
+            v.z = p0 * o0.z + p1 * o1.z + p2 * o2.z + p3 * o3.z;
+            v.w = p0 * o0.w + p1 * o1.w + p2 * o2.w + p3 * o3.w;
+            vals[k] = v;
+            ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
+        }
+    }
+    int lane = t & 31;
+    int warp = t >> 5;
+    for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, m);
+    if (lane == 0) sm[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < 8) ? sm[lane] : 0.0f;
+        for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+        if (lane == 0) sm[0] = rsqrtf(v / (float)D + rms_eps);
+    }
+    __syncthreads();
+    float inv = sm[0];
+    const uint2* nw2 = reinterpret_cast<const uint2*>(norm_w);
+    uint2* y2 = reinterpret_cast<uint2*>(y_out + (size_t)mr * D);
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        int i4 = t + k * 256;
+        if (i4 < d4) {
+            uint2 wq = __ldg(nw2 + i4);
+            float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wq.x));
+            float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wq.y));
+            float4 v = vals[k];
+            half2 h01 = __float22half2_rn(make_float2(v.x * inv * w01.x, v.y * inv * w01.y));
+            half2 h23 = __float22half2_rn(make_float2(v.z * inv * w23.x, v.w * inv * w23.y));
+            uint2 oq;
+            oq.x = *reinterpret_cast<const uint32_t*>(&h01);
+            oq.y = *reinterpret_cast<const uint32_t*>(&h23);
+            y2[i4] = oq;
+        }
+    }
+}
+
+void rad_cuda_mhc_sinkhorn_pre_coeff_rmsnorm(
+    float* streams,
+    const half* branch_out,
+    const half* peer_branch_out,
+    const float* hc_fn,
+    const float* hc_base,
+    const float* hc_scale,
+    const float* prev_pre,
+    const __nv_bfloat16* norm_w,
+    float* h_coeff,
+    float* next_pre,
+    half* normed_out,
+    int M,
+    int D,
+    int sinkhorn_iters,
+    float rms_eps,
+    float hc_eps,
+    cudaStream_t stream
+) {
+    mhc_sinkhorn_mix_pre_rmsnorm_f16_k<<<M, 256, 0, stream>>>(
+        streams, branch_out, peer_branch_out, h_coeff, prev_pre, norm_w, normed_out, D, sinkhorn_iters, rms_eps, hc_eps
+    );
+    if (M >= 64) {
+        mhc_coeff_proj_24_4tok_k<<<(M + 3) / 4, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, M, D * 4, rms_eps, hc_eps);
+    } else if (M >= 16) {
+        mhc_coeff_proj_24_k<<<M, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, D * 4, rms_eps, hc_eps);
+    } else {
+        dim3 g1(24, M);
+        mhc_coeff_proj_k<<<g1, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, D * 4, rms_eps, hc_eps);
+    }
+}
+
 void rad_cuda_mhc_pre_coeff_rmsnorm(
     const float* streams,
     const float* hc_fn,

@@ -50,6 +50,7 @@ extern "C" {
         trellis_ptrs: *const *const c_void,
         suh_ptrs: *const *const c_void,
         svh_ptrs: *const *const c_void,
+        next_suh_ptrs: *const *const c_void,
         expert_ids: *const i32,
         z_scratch_f32: *mut c_void,
         gate_in: *const c_void,
@@ -330,6 +331,26 @@ extern "C" {
         d: i32,
         top_k: i32,
         scaling_factor: f32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_mhc_sinkhorn_pre_coeff_rmsnorm(
+        streams: *mut c_void,
+        branch_out: *const c_void,
+        peer_branch_out: *const c_void,
+        hc_fn: *const c_void,
+        hc_base: *const c_void,
+        hc_scale: *const c_void,
+        prev_pre: *const c_void,
+        norm_w: *const c_void,
+        h_coeff: *mut c_void,
+        next_pre: *mut c_void,
+        normed_out: *mut c_void,
+        m: i32,
+        d: i32,
+        sinkhorn_iters: i32,
+        rms_eps: f32,
+        hc_eps: f32,
         stream: CudaStream,
     );
 
