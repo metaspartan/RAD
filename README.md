@@ -108,10 +108,10 @@ First CUDA backend (`rad-cuda` + `rad-dsv41`) running **DeepSeek-V4.1-Flash-1017
 | **Tensor Core MQA+CSA2 FlashAttention (`M>=16`)** | **5.59 ms/layer** (**8.2x** @ 4K) | Bank-free `s_kv[16][520]` `mqa_flash_mma16_f16_k` (`mma.sync.aligned.m16n8k16`, `8.06e-6` CSA2 parity vs FP32 CPU) |
 | **ConnectX-7 RoCE v2 RDMA AllReduce & Argmax** | **7 us** (**134x** vs TCP) | Zero-copy `cudaHostAllocMapped` + `libibverbs` (`32 MB` RDMA ring for `M=2048` prefill) + `IBV_SEND_INLINE` RDMA `all_reduce_argmax` |
 | **Tensor Core MoE Router (`384` exp) & 24x-Less-DRAM mHC** | **~35 us** router / **~180 us** mHC | `moe_gate_logits_mma_f16_k` (50x prefill speedup) + single-pass `mhc_coeff_proj_24_k` (8x prefill speedup) |
-| **GPU-Grouped MoE Tensor Core MMA (`M=2..2048`)** | **200 GB/s** (`M=128`) / `m64` prefill | 128-bit `uint4` trellis loads, modulo-free indexing, 256-thread `moe_build_groups_k`, `exl3_moe_mma_grouped_m64_mul1_k` (`M>=512`), **100% bit-exact** parity |
-| **Live 40-Layer TP=2 RDMA Long-Context Prefill (`65K` ctx)** | **640.4 tok/s** (`2K`) / **507.0 tok/s** (`12K`) | **`599.9 tok/s`** at `5.5K` (**2.85x** speedup via `M=2048` + `m64` MoE + FlashMQA + Tensor Core router), **`73.7 ms`** cached TTFT (`162–184 ms` cold) |
+| **GPU-Grouped MoE Tensor Core MMA (`M=2..2048`)** | **200 GB/s** (`M=128`) / `m64` prefill | 128-bit `uint4` trellis loads, modulo-free indexing, 256-thread `moe_build_groups_k`, `exl3_moe_mma_grouped_m64_mul1_k` (`M>=512`), fused `w3 + clamped_swiglu` post-pass, **100% bit-exact** parity |
+| **Live 40-Layer TP=2 RDMA Long-Context Prefill & TTFT (`65K` ctx)** | **640.4 tok/s** (`2K`) / **603.7 tok/s** (`5.5K`) / **507.0 tok/s** (`12K`) | Single-pass `step_batch_last` prefill cuts cold TTFT to **`134.5 ms`** (**`2.0x`** faster than `267.2 ms` vLLM, **`73.7 ms`** cached), `M=2048` + `m64` MoE + FlashMQA + Tensor Core router |
 | **Live 40-Layer TP=2 RDMA Pure Gen (`DSpark MTP` + CUDA Graphs)** | **63.3 tok/s** code (**86.6 tok/s** peak) | `Math=53.4 tok/s`, `Prose=29.2 tok/s`; `M=1/6/64/128/512/1024/2048` QKV/WO/FFN + 3-layer MTP CUDA Graphs, 4-head vectorized `half2` MQA |
-| **Live 40-Layer TP=2 RDMA Hybrid (`K=128` Edit & Cybara 37K)** | **197.3–230+ tok/s** (`99.4 tok/s` Cybara) | `700` chunks in `3.55 s` (`390.0 tok/s` cold pp); live Cybara 3-turn vague-prompt web build & iteration at `37K` ctx: **`99.4 tok/s`** (`8,625` tok, **`96.2–98.6%`** prefix cache hit) |
+| **Live 40-Layer TP=2 RDMA Hybrid (`K=128` Edit & Cybara 37K)** | **188.4–230+ tok/s** (`99.4 tok/s` Cybara) | `700` chunks in `3.55–3.71 s` (`410.3 tok/s` cold `550t` pp); live Cybara 3-turn vague-prompt web build & iteration at `37K` ctx: **`99.4 tok/s`** (`8,625` tok, **`96.2–98.6%`** prefix cache hit) |
 
 ### Supported Models & Weights
 

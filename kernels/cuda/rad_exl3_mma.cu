@@ -464,9 +464,11 @@ __global__ void moe_wht128_post_f32_to_f16_k(
     const float* __restrict__ z_f32,
     const half* const* __restrict__ svh_ptrs,
     const int* __restrict__ expert_ids,
+    const half* __restrict__ gate_in,
     half* __restrict__ y_out,
     int N,
     float scale,
+    float swiglu_limit,
     int expert_start,
     int n_local_experts
 ) {
@@ -495,6 +497,21 @@ __global__ void moe_wht128_post_f32_to_f16_k(
         v1 *= s0.y;
         v2 *= s1.x;
         v3 *= s1.y;
+    }
+    if (gate_in) {
+        uint2 gv = *reinterpret_cast<const uint2*>(gate_in + off);
+        float2 g0 = __half22float2(*reinterpret_cast<const half2*>(&gv.x));
+        float2 g1 = __half22float2(*reinterpret_cast<const half2*>(&gv.y));
+        auto sw = [&](float g, float u) -> float {
+            if (g > swiglu_limit) g = swiglu_limit;
+            if (u > swiglu_limit) u = swiglu_limit;
+            if (u < -swiglu_limit) u = -swiglu_limit;
+            return (g / (1.0f + expf(-g))) * u;
+        };
+        v0 = sw(g0.x, v0);
+        v1 = sw(g0.y, v1);
+        v2 = sw(g1.x, v2);
+        v3 = sw(g1.y, v3);
     }
     half2 h0 = __float22half2_rn(make_float2(v0, v1));
     half2 h1 = __float22half2_rn(make_float2(v2, v3));
@@ -1011,6 +1028,7 @@ void rad_cuda_exl3_moe_mma_f16(
     const half* const* svh_ptrs,
     const int* expert_ids,
     float* z_scratch_f32,
+    const half* gate_in,
     half* y_out,
     int top_k,
     int M,
@@ -1018,6 +1036,7 @@ void rad_cuda_exl3_moe_mma_f16(
     int N,
     int bits,
     float wht_scale,
+    float swiglu_limit,
     int x_per_expert,
     int expert_start,
     int n_local_experts,
@@ -1073,7 +1092,7 @@ void rad_cuda_exl3_moe_mma_f16(
             }
         }
         dim3 post_grid(n_blocks, pairs);
-        moe_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh_ptrs, expert_ids, y_out, N, wht_scale, expert_start, n_local_experts);
+        moe_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh_ptrs, expert_ids, gate_in, y_out, N, wht_scale, swiglu_limit, expert_start, n_local_experts);
         return;
     }
     int split_k = (n_blocks * pairs < 128) ? 4 : ((n_blocks * pairs < 256) ? 2 : 1);
@@ -1092,7 +1111,7 @@ void rad_cuda_exl3_moe_mma_f16(
         case 8: exl3_moe_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, expert_ids, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert, expert_start, n_local_experts); break;
     }
     dim3 post_grid(n_blocks, pairs);
-    moe_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh_ptrs, expert_ids, y_out, N, wht_scale, expert_start, n_local_experts);
+    moe_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh_ptrs, expert_ids, gate_in, y_out, N, wht_scale, swiglu_limit, expert_start, n_local_experts);
 }
 
 void rad_cuda_exl3_batched_group_mma_f16(

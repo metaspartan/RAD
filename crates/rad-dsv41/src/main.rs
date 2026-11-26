@@ -165,6 +165,10 @@ fn worker_loop(eng: &mut Dsv41Engine, comm: &mut Tp2Comm) -> Result<()> {
                 comm.broadcast_u32(&mut nb_val)?;
                 let _ = eng.draft_dspark(a_val as i32, nb_val as usize, comm)?;
             }
+            6 => {
+                comm.broadcast_i32_vec(&mut toks)?;
+                let _ = eng.step_batch_last(&toks, comm)?;
+            }
             99 => break,
             _ => {}
         }

@@ -67,7 +67,6 @@ pub struct Dsv41Engine {
     pub d_topk_ids: CudaBuf,
     pub d_topk_weights: CudaBuf,
     pub d_moe_gate: CudaBuf,
-    pub d_moe_up: CudaBuf,
     pub d_moe_act: CudaBuf,
     pub d_moe_outs: CudaBuf,
     pub d_shared_g: CudaBuf,
@@ -239,7 +238,6 @@ impl Dsv41Engine {
             d_topk_ids: CudaBuf::new(MAX_BATCH * tc.num_experts_per_tok * 4).map_err(CudaFail)?,
             d_topk_weights: CudaBuf::new(MAX_BATCH * tc.num_experts_per_tok * 4).map_err(CudaFail)?,
             d_moe_gate: CudaBuf::new(MAX_BATCH * tc.num_experts_per_tok * tc.moe_intermediate_size * 2).map_err(CudaFail)?,
-            d_moe_up: CudaBuf::new(MAX_BATCH * tc.num_experts_per_tok * tc.moe_intermediate_size * 2).map_err(CudaFail)?,
             d_moe_act: CudaBuf::new(MAX_BATCH * tc.num_experts_per_tok * tc.moe_intermediate_size * 2).map_err(CudaFail)?,
             d_moe_outs: CudaBuf::new(MAX_BATCH * tc.num_experts_per_tok * d * 2).map_err(CudaFail)?,
             d_shared_g: CudaBuf::new(MAX_BATCH * (tc.moe_intermediate_size / world) * 2).map_err(CudaFail)?,
@@ -443,6 +441,7 @@ impl Dsv41Engine {
             lw.d_w1_svh.ptr as *const *const c_void,
             self.d_topk_ids.ptr as *const i32,
             self.d_z_scratch.ptr,
+            std::ptr::null(),
             self.d_moe_gate.ptr,
             tk,
             mi,
@@ -450,6 +449,7 @@ impl Dsv41Engine {
             inter,
             bits,
             self.wht_scale,
+            tc.swiglu_limit,
             0,
             exp_start,
             n_local,
@@ -463,25 +463,19 @@ impl Dsv41Engine {
             lw.d_w3_svh.ptr as *const *const c_void,
             self.d_topk_ids.ptr as *const i32,
             self.d_z_scratch.ptr,
-            self.d_moe_up.ptr,
+            self.d_moe_gate.ptr,
+            self.d_moe_act.ptr,
             tk,
             mi,
             d as i32,
             inter,
             bits,
             self.wht_scale,
+            tc.swiglu_limit,
             0,
             exp_start,
             n_local,
             1,
-            stream,
-        );
-        cuda_ops::rad_cuda_clamped_swiglu_f16(
-            self.d_moe_gate.ptr,
-            self.d_moe_up.ptr,
-            self.d_moe_act.ptr,
-            mi * tk * inter,
-            tc.swiglu_limit,
             stream,
         );
         cuda_ops::rad_cuda_exl3_moe_mma_f16(
@@ -491,6 +485,7 @@ impl Dsv41Engine {
             lw.d_w2_svh.ptr as *const *const c_void,
             self.d_topk_ids.ptr as *const i32,
             self.d_z_scratch.ptr,
+            std::ptr::null(),
             self.d_moe_outs.ptr,
             tk,
             mi,
@@ -498,6 +493,7 @@ impl Dsv41Engine {
             d as i32,
             bits,
             self.wht_scale,
+            tc.swiglu_limit,
             1,
             exp_start,
             n_local,
@@ -829,6 +825,40 @@ impl Dsv41Engine {
         Ok(best_ids)
     }
 
+    pub fn step_batch_last(&mut self, tokens: &[i32], comm: &mut Tp2Comm) -> Result<i32> {
+        let m = tokens.len();
+        self.forward_layers(tokens, comm)?;
+        let tc = &self.cfg.text_config;
+        let d = tc.hidden_size;
+        let stream: CudaStream = std::ptr::null_mut();
+        let last = m - 1;
+        unsafe {
+            let s_last = (self.d_streams.ptr as *const u8).add(last * 4 * d * 4) as *const c_void;
+            let p_last = (self.d_pre_b.ptr as *const u8).add(last * 4 * 4) as *const c_void;
+            cuda_ops::rad_cuda_mhc_pre_mix_only(s_last, p_last, self.d_branch_in.ptr, 1, d as i32, stream);
+            cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, self.final_norm.ptr, self.d_normed.ptr, 1, d as i32, tc.rms_norm_eps, stream);
+            self.exl3_proj(self.d_normed.ptr, &self.head, self.d_logits.ptr, 1, 0, stream);
+            cuda_ops::rad_cuda_argmax_f16(
+                self.d_logits.ptr,
+                self.d_arg_vals.ptr,
+                self.d_arg_ids.ptr,
+                self.d_best_val.ptr,
+                self.d_best_id.ptr,
+                1,
+                self.head.n as i32,
+                stream,
+            );
+        }
+        rad_cuda::sync_device().map_err(CudaFail)?;
+        let mut best_vals = [0.0f32; 1];
+        let mut best_ids = [0i32; 1];
+        self.d_best_val.copy_to_host(unsafe { std::slice::from_raw_parts_mut(best_vals.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
+        self.d_best_id.copy_to_host(unsafe { std::slice::from_raw_parts_mut(best_ids.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
+        best_ids[0] += (self.rank * self.head.n) as i32;
+        comm.all_reduce_argmax(&mut best_vals, &mut best_ids)?;
+        Ok(best_ids[0])
+    }
+
     pub fn step_decode(&mut self, token_id: i32, comm: &mut Tp2Comm) -> Result<i32> {
         let out = self.step_batch(&[token_id], comm)?;
         Ok(out[0])
@@ -922,10 +952,9 @@ impl Dsv41Engine {
             let bits = lw.experts[0].w1.bits as i32;
             let exp_start = lw.expert_start as i32;
             let n_local = lw.experts.len() as i32;
-            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, tk, 1, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 0, stream);
-            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_up.ptr, tk, 1, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 1, stream);
-            cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_moe_gate.ptr, self.d_moe_up.ptr, self.d_moe_act.ptr, tk * inter, tc.swiglu_limit, stream);
-            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_outs.ptr, tk, 1, inter, d as i32, bits, self.wht_scale, 1, exp_start, n_local, 1, stream);
+            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_gate.ptr, tk, 1, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 0, stream);
+            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, self.d_moe_act.ptr, tk, 1, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 1, stream);
+            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_outs.ptr, tk, 1, inter, d as i32, bits, self.wht_scale, tc.swiglu_limit, 1, exp_start, n_local, 1, stream);
             cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, branch_dst, 1, tk, d as i32, stream);
         }
         let _ = sync_t();
@@ -952,8 +981,8 @@ impl Dsv41Engine {
         }
         let n = tokens.len();
         let mut idx = 0usize;
-        while idx + 1 < n {
-            let chunk_end = (idx + MAX_BATCH).min(n - 1);
+        while idx + MAX_BATCH < n {
+            let chunk_end = idx + MAX_BATCH;
             let mut chunk = tokens[idx..chunk_end].to_vec();
             let mut cmd = 1u32;
             comm.broadcast_u32(&mut cmd)?;
@@ -961,12 +990,11 @@ impl Dsv41Engine {
             self.step_batch_no_head(&chunk, comm)?;
             idx = chunk_end;
         }
-        let mut last = vec![tokens[n - 1]];
-        let mut cmd = 2u32;
+        let mut last_chunk = tokens[idx..n].to_vec();
+        let mut cmd = 6u32;
         comm.broadcast_u32(&mut cmd)?;
-        comm.broadcast_i32_vec(&mut last)?;
-        let preds = self.step_batch(&last, comm)?;
-        Ok(preds[0])
+        comm.broadcast_i32_vec(&mut last_chunk)?;
+        self.step_batch_last(&last_chunk, comm)
     }
 
     pub fn draft_dspark(&mut self, anchor: i32, n_blocks: usize, comm: &mut Tp2Comm) -> Result<Vec<i32>> {
@@ -1113,10 +1141,9 @@ impl Dsv41Engine {
                                 self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, mi, 0, gs);
                                 cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_shared_g.ptr, self.d_shared_u.ptr, self.d_shared_g.ptr, mi * (tc.moe_intermediate_size / self.world) as i32, tc.swiglu_limit, gs);
                                 self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, mi, 0, gs);
-                                cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 0, gs);
-                                cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_up.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 1, gs);
-                                cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_moe_gate.ptr, self.d_moe_up.ptr, self.d_moe_act.ptr, mi * tk * inter, tc.swiglu_limit, gs);
-                                cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_outs.ptr, tk, mi, inter, d as i32, bits, self.wht_scale, 1, exp_start, n_local, 1, gs);
+                                cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_gate.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 0, gs);
+                                cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, self.d_moe_act.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 1, gs);
+                                cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_outs.ptr, tk, mi, inter, d as i32, bits, self.wht_scale, tc.swiglu_limit, 1, exp_start, n_local, 1, gs);
                                 cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, gs);
                             })
                         }
@@ -1140,10 +1167,9 @@ impl Dsv41Engine {
                         self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, mi, 0, stream);
                         cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_shared_g.ptr, self.d_shared_u.ptr, self.d_shared_g.ptr, mi * (tc.moe_intermediate_size / self.world) as i32, tc.swiglu_limit, stream);
                         self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, mi, 0, stream);
-                        cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 0, stream);
-                        cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_up.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 1, stream);
-                        cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_moe_gate.ptr, self.d_moe_up.ptr, self.d_moe_act.ptr, mi * tk * inter, tc.swiglu_limit, stream);
-                        cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_outs.ptr, tk, mi, inter, d as i32, bits, self.wht_scale, 1, exp_start, n_local, 1, stream);
+                        cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_gate.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 0, stream);
+                        cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, self.d_moe_act.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 1, stream);
+                        cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_outs.ptr, tk, mi, inter, d as i32, bits, self.wht_scale, tc.swiglu_limit, 1, exp_start, n_local, 1, stream);
                         cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, stream);
                     }
                 }
