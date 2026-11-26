@@ -366,7 +366,7 @@ extern "C" __global__ void dflash2_topk16_part_k(const float* __restrict__ logit
     }
     int i_end4 = i_end & ~3;
     const float4* row_p4 = reinterpret_cast<const float4*>(row_p);
-    for (int i = i_beg + tid * 4; i < i_end4; i += 1024) {
+    for (int i = i_beg + tid * 4; i < i_end4; i += 512) {
         float4 v4 = row_p4[i >> 2];
         float vals[4] = {v4.x, v4.y, v4.z, v4.w};
 #pragma unroll
@@ -384,7 +384,7 @@ extern "C" __global__ void dflash2_topk16_part_k(const float* __restrict__ logit
             }
         }
     }
-    for (int i = i_end4 + tid; i < i_end; i += 256) {
+    for (int i = i_end4 + tid; i < i_end; i += 128) {
         float v = row_p[i];
         if (v > best_v[15]) {
             int pos = 15;
@@ -398,8 +398,8 @@ extern "C" __global__ void dflash2_topk16_part_k(const float* __restrict__ logit
         }
     }
 
-    __shared__ float sm_v[256 * 16];
-    __shared__ int sm_i[256 * 16];
+    __shared__ float sm_v[128 * 16];
+    __shared__ int sm_i[128 * 16];
 #pragma unroll
     for (int k = 0; k < 16; ++k) {
         sm_v[tid * 16 + k] = best_v[k];
@@ -407,7 +407,7 @@ extern "C" __global__ void dflash2_topk16_part_k(const float* __restrict__ logit
     }
     __syncthreads();
 
-    for (int stride = 128; stride > 0; stride >>= 1) {
+    for (int stride = 64; stride > 0; stride >>= 1) {
         if (tid < stride) {
             float mv[16];
             int mi[16];
@@ -593,7 +593,7 @@ extern "C" int ink_dflash2_topk16(hipStream_t s, const float* logits, int* cand_
         float* pvals = nullptr;
         (void)hipGetSymbolAddress((void**)&pids, HIP_SYMBOL(g_df2_topk_i));
         (void)hipGetSymbolAddress((void**)&pvals, HIP_SYMBOL(g_df2_topk_v));
-        dflash2_topk16_part_k<<<dim3(n_rows, n_chunks), dim3(256), 0, s>>>(logits, pids, pvals, vocab_padded, vocab_unpadded, n_chunks);
+        dflash2_topk16_part_k<<<dim3(n_rows, n_chunks), dim3(128), 0, s>>>(logits, pids, pvals, vocab_padded, vocab_unpadded, n_chunks);
         dflash2_topk16_merge_k<<<dim3(n_rows), dim3(256), 0, s>>>(pids, pvals, cand_ids, cand_vals, n_chunks);
         return 0;
     }
