@@ -707,53 +707,68 @@ __global__ void dflash2_qkv_q4_nt_k(const uint8_t* __restrict__ wq,
                                     float* __restrict__ K,
                                     float* __restrict__ V,
                                     int k, int q_dim, int kv_dim) {
-    int grp = threadIdx.x >> 3;
-    int lane8 = threadIdx.x & 7;
+    int tid = threadIdx.x;
+    int grp = tid >> 3;
+    int lane8 = tid & 7;
     int gid = blockIdx.x * 32 + grp;
     int o1 = q_dim;
     int o2 = o1 + kv_dim;
     int o3 = o2 + kv_dim;
-    if (gid >= o3) return;
-    const uint8_t* W;
-    float* Y;
-    int row, n_out;
-    if (gid < o1) { W = wq; Y = Q; row = gid; n_out = q_dim; }
-    else if (gid < o2) { W = wk; Y = K; row = gid - o1; n_out = kv_dim; }
-    else { W = wv; Y = V; row = gid - o2; n_out = kv_dim; }
+    bool valid = (gid < o3);
+    const uint8_t* W = wq;
+    float* Y = Q;
+    int row = 0, n_out = q_dim;
+    if (valid) {
+        if (gid < o1) { W = wq; Y = Q; row = gid; n_out = q_dim; }
+        else if (gid < o2) { W = wk; Y = K; row = gid - o1; n_out = kv_dim; }
+        else { W = wv; Y = V; row = gid - o2; n_out = kv_dim; }
+    }
     int nblk = k >> 5;
     size_t rbytes = q4_soa_row_bytes(nblk);
     const uint8_t* wrow = W + (size_t)row * rbytes;
     const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
     const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
+    __shared__ q8_1_blk sm_x[NT][8];
     float acc[NT];
 #pragma unroll
     for (int m = 0; m < NT; ++m) acc[m] = 0.0f;
-    for (int b = lane8; b < nblk; b += 8) {
-        uint4 q4 = qrow[b];
-        float dw = __half2float(drow[b]);
-        int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu);
-        int32_t w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
-        int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu);
-        int32_t w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
-        int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu);
-        int32_t w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
-        int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu);
-        int32_t w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
-#pragma unroll
-        for (int m = 0; m < NT; ++m) {
-            const q8_1_blk xb = Xq[(size_t)m * nblk + b];
-            int32_t sumi = 0;
-            sumi = __builtin_amdgcn_sudot4(false, w0, true, xb.q[0], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w1, true, xb.q[1], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w2, true, xb.q[2], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w3, true, xb.q[3], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w4, true, xb.q[4], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w5, true, xb.q[5], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w6, true, xb.q[6], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, w7, true, xb.q[7], sumi, false);
-            acc[m] = fmaf(dw * xb.d, (float)(sumi - 8 * xb.s), acc[m]);
+    for (int b0 = 0; b0 < nblk; b0 += 8) {
+        if (tid < NT * 8) {
+            int tm = tid >> 3;
+            int tb = tid & 7;
+            if (b0 + tb < nblk) sm_x[tm][tb] = Xq[(size_t)tm * nblk + b0 + tb];
         }
+        __syncthreads();
+        int b = b0 + lane8;
+        if (valid && b < nblk) {
+            uint4 q4 = qrow[b];
+            float dw = __half2float(drow[b]);
+            int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu);
+            int32_t w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+            int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu);
+            int32_t w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+            int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu);
+            int32_t w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+            int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu);
+            int32_t w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
+#pragma unroll
+            for (int m = 0; m < NT; ++m) {
+                const q8_1_blk xb = sm_x[m][lane8];
+                int32_t sumi = 0;
+                sumi = __builtin_amdgcn_sudot4(false, w0, true, xb.q[0], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w1, true, xb.q[1], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w2, true, xb.q[2], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w3, true, xb.q[3], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w4, true, xb.q[4], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w5, true, xb.q[5], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w6, true, xb.q[6], sumi, false);
+                sumi = __builtin_amdgcn_sudot4(false, w7, true, xb.q[7], sumi, false);
+                acc[m] = fmaf(dw * xb.d, (float)(sumi - 8 * xb.s), acc[m]);
+            }
+        }
+        __syncthreads();
     }
+    if (!valid) return;
 #pragma unroll
     for (int m = 0; m < NT; ++m) {
         float v = s_warp_sum8(acc[m]);
