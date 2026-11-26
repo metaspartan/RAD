@@ -173,18 +173,17 @@ impl InklingEngine {
         self.bsc.d_seq_ids.copy_from(seq_bytes, Some(g.stream)).map_err(he)?;
         self.bsc.d_positions.copy_from(pos_bytes, Some(g.stream)).map_err(he)?;
         g.launch().map_err(he)?;
-        g.sync().map_err(he)?;
-        let mut out_b = vec![0u8; total_b * 4];
+        let mut flat_out = vec![0i32; total_b];
         let rc = unsafe {
-            rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, total_b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
+            rad_hip::hipMemcpyAsync(flat_out.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, total_b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST, g.stream)
         };
         if rc != rad_hip::HIP_SUCCESS { return Err(he(rc)); }
+        g.sync().map_err(he)?;
         for &sid in seq_ids {
             let su = sid as usize;
             self.seq_pos[su] += k_len as i32;
             if su == 0 { self.pos = self.seq_pos[0]; }
         }
-        let flat_out: Vec<i32> = out_b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
         Ok(flat_out.chunks_exact(k_len).map(|c| c.to_vec()).collect())
     }
 

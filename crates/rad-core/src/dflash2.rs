@@ -427,8 +427,12 @@ impl DFlash2Drafter {
         }
         for l in &self.layers {
             let kv_off = seq * self.n_head_kv * l.max_ctx * self.dh;
-            self.gemm_w(s, &l.wk, self.inj_normed.ptr as *const f32, self.inj_xq.ptr, self.inj_k.ptr as *mut f32, kv_dim, e, ci);
-            self.gemm_w(s, &l.wv, self.inj_normed.ptr as *const f32, self.inj_xq.ptr, self.inj_v.ptr as *mut f32, kv_dim, e, ci);
+            if l.wk.ty == WeightType::Q4_0 && l.wv.ty == WeightType::Q4_0 && n_tok <= 8 {
+                ops::ink_dflash2_kv_q4(s, l.wk.buf.ptr as *const u8, l.wv.buf.ptr as *const u8, self.inj_xq.ptr, self.inj_k.ptr as *mut f32, self.inj_v.ptr as *mut f32, kv_dim, e, ci);
+            } else {
+                self.gemm_w(s, &l.wk, self.inj_normed.ptr as *const f32, self.inj_xq.ptr, self.inj_k.ptr as *mut f32, kv_dim, e, ci);
+                self.gemm_w(s, &l.wv, self.inj_normed.ptr as *const f32, self.inj_xq.ptr, self.inj_v.ptr as *mut f32, kv_dim, e, ci);
+            }
             ops::ink_dflash2_rope_norm_ctx_batch_dpos(
                 s,
                 self.inj_k.ptr as *const f32,

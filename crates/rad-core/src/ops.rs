@@ -124,6 +124,7 @@ extern "C" {
     pub fn ink_b1_router_and_q8(s: HipStream, logits: *const f32, bias: *const f32, wtop: *mut f32, itop: *mut i32, x_in: *const f32, xq_out: *mut core::ffi::c_void, route_scale: f32, k: i32) -> i32;
     pub fn ink_moe_router_groups_and_q8(s: HipStream, logits: *const f32, bias: *const f32, scales: *const f32, exp_counts: *mut i32, exp_offsets: *mut i32, tok_sorted: *mut i32, slot_sorted: *mut i32, wt_sorted: *mut f32, x_in: *const f32, xq_out: *mut core::ffi::c_void, route_scale: f32, k: i32, b: i32) -> i32;
     pub fn ink_dflash2_qkv_q4(s: HipStream, wq: *const u8, wk: *const u8, wv: *const u8, xq: *const core::ffi::c_void, q: *mut f32, k_out: *mut f32, v_out: *mut f32, k_dim: i32, q_dim: i32, kv_dim: i32, b: i32) -> i32;
+    pub fn ink_dflash2_kv_q4(s: HipStream, wk: *const u8, wv: *const u8, xq: *const core::ffi::c_void, k_out: *mut f32, v_out: *mut f32, kv_dim: i32, k_dim: i32, b: i32) -> i32;
     pub fn ink_dflash2_gu_swiglu_q8(s: HipStream, wg: *const u8, wu: *const u8, xq: *const core::ffi::c_void, out_q8: *mut core::ffi::c_void, n_ff: i32, k_dim: i32, b: i32) -> i32;
     pub fn ink_dflash2_proj_conv_add_q4(s: HipStream, w: *const u8, xq: *const core::ffi::c_void, dynamic: *const f32, base_kernel: *const f32, x_inout: *mut f32, n_embd: i32, k_dim: i32, group_size: i32, side: i32, b: i32) -> i32;
     pub fn ink_dflash2_topk16(s: HipStream, logits: *const f32, cand_ids: *mut i32, cand_vals: *mut f32, vocab_padded: i32, vocab_unpadded: i32, n_rows: i32) -> i32;
