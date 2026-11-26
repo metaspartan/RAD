@@ -83,6 +83,110 @@ void moe_gate_logits_mma_f16_k(
 }
 
 __global__ __launch_bounds__(256)
+void mhc_coeff_proj_24_4tok_k(
+    const float* __restrict__ streams,
+    const float* __restrict__ hc_fn,
+    const float* __restrict__ hc_base,
+    const float* __restrict__ hc_scale,
+    float* __restrict__ h_coeff,
+    float* __restrict__ next_pre,
+    int M,
+    int D4,
+    float rms_eps,
+    float hc_eps
+) {
+    int m0 = blockIdx.x * 4;
+    int t = threadIdx.x;
+    int lane = t & 31;
+    int warp = t >> 5;
+    int c0 = warp * 3;
+    int d4_vec = D4 >> 2;
+    const float4* fn4 = reinterpret_cast<const float4*>(hc_fn);
+    const float4* sr0 = (m0 + 0 < M) ? reinterpret_cast<const float4*>(streams + (size_t)(m0 + 0) * D4) : nullptr;
+    const float4* sr1 = (m0 + 1 < M) ? reinterpret_cast<const float4*>(streams + (size_t)(m0 + 1) * D4) : nullptr;
+    const float4* sr2 = (m0 + 2 < M) ? reinterpret_cast<const float4*>(streams + (size_t)(m0 + 2) * D4) : nullptr;
+    const float4* sr3 = (m0 + 3 < M) ? reinterpret_cast<const float4*>(streams + (size_t)(m0 + 3) * D4) : nullptr;
+
+    float dot[4][3];
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        dot[r][0] = 0.0f; dot[r][1] = 0.0f; dot[r][2] = 0.0f;
+    }
+    float ss0 = 0.0f, ss1 = 0.0f, ss2 = 0.0f, ss3 = 0.0f;
+
+    for (int i = lane; i < d4_vec; i += 32) {
+        float4 w0 = __ldg(fn4 + (size_t)(c0 + 0) * d4_vec + i);
+        float4 w1 = __ldg(fn4 + (size_t)(c0 + 1) * d4_vec + i);
+        float4 w2 = __ldg(fn4 + (size_t)(c0 + 2) * d4_vec + i);
+        if (sr0) {
+            float4 x = sr0[i];
+            if (warp == 0) ss0 = fmaf(x.x, x.x, fmaf(x.y, x.y, fmaf(x.z, x.z, fmaf(x.w, x.w, ss0))));
+            dot[0][0] = fmaf(x.x, w0.x, fmaf(x.y, w0.y, fmaf(x.z, w0.z, fmaf(x.w, w0.w, dot[0][0]))));
+            dot[0][1] = fmaf(x.x, w1.x, fmaf(x.y, w1.y, fmaf(x.z, w1.z, fmaf(x.w, w1.w, dot[0][1]))));
+            dot[0][2] = fmaf(x.x, w2.x, fmaf(x.y, w2.y, fmaf(x.z, w2.z, fmaf(x.w, w2.w, dot[0][2]))));
+        }
+        if (sr1) {
+            float4 x = sr1[i];
+            if (warp == 0) ss1 = fmaf(x.x, x.x, fmaf(x.y, x.y, fmaf(x.z, x.z, fmaf(x.w, x.w, ss1))));
+            dot[1][0] = fmaf(x.x, w0.x, fmaf(x.y, w0.y, fmaf(x.z, w0.z, fmaf(x.w, w0.w, dot[1][0]))));
+            dot[1][1] = fmaf(x.x, w1.x, fmaf(x.y, w1.y, fmaf(x.z, w1.z, fmaf(x.w, w1.w, dot[1][1]))));
+            dot[1][2] = fmaf(x.x, w2.x, fmaf(x.y, w2.y, fmaf(x.z, w2.z, fmaf(x.w, w2.w, dot[1][2]))));
+        }
+        if (sr2) {
+            float4 x = sr2[i];
+            if (warp == 0) ss2 = fmaf(x.x, x.x, fmaf(x.y, x.y, fmaf(x.z, x.z, fmaf(x.w, x.w, ss2))));
+            dot[2][0] = fmaf(x.x, w0.x, fmaf(x.y, w0.y, fmaf(x.z, w0.z, fmaf(x.w, w0.w, dot[2][0]))));
+            dot[2][1] = fmaf(x.x, w1.x, fmaf(x.y, w1.y, fmaf(x.z, w1.z, fmaf(x.w, w1.w, dot[2][1]))));
+            dot[2][2] = fmaf(x.x, w2.x, fmaf(x.y, w2.y, fmaf(x.z, w2.z, fmaf(x.w, w2.w, dot[2][2]))));
+        }
+        if (sr3) {
+            float4 x = sr3[i];
+            if (warp == 0) ss3 = fmaf(x.x, x.x, fmaf(x.y, x.y, fmaf(x.z, x.z, fmaf(x.w, x.w, ss3))));
+            dot[3][0] = fmaf(x.x, w0.x, fmaf(x.y, w0.y, fmaf(x.z, w0.z, fmaf(x.w, w0.w, dot[3][0]))));
+            dot[3][1] = fmaf(x.x, w1.x, fmaf(x.y, w1.y, fmaf(x.z, w1.z, fmaf(x.w, w1.w, dot[3][1]))));
+            dot[3][2] = fmaf(x.x, w2.x, fmaf(x.y, w2.y, fmaf(x.z, w2.z, fmaf(x.w, w2.w, dot[3][2]))));
+        }
+    }
+
+    __shared__ float s_rsqrt[4];
+    if (warp == 0) {
+        for (int m = 16; m > 0; m >>= 1) {
+            ss0 += __shfl_xor_sync(0xFFFFFFFFu, ss0, m);
+            ss1 += __shfl_xor_sync(0xFFFFFFFFu, ss1, m);
+            ss2 += __shfl_xor_sync(0xFFFFFFFFu, ss2, m);
+            ss3 += __shfl_xor_sync(0xFFFFFFFFu, ss3, m);
+        }
+        if (lane == 0) {
+            s_rsqrt[0] = rsqrtf(ss0 / (float)D4 + rms_eps);
+            s_rsqrt[1] = rsqrtf(ss1 / (float)D4 + rms_eps);
+            s_rsqrt[2] = rsqrtf(ss2 / (float)D4 + rms_eps);
+            s_rsqrt[3] = rsqrtf(ss3 / (float)D4 + rms_eps);
+        }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        if (m0 + r >= M) break;
+        float rsq = s_rsqrt[r];
+        #pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            float d = dot[r][j];
+            for (int m = 16; m > 0; m >>= 1) d += __shfl_xor_sync(0xFFFFFFFFu, d, m);
+            if (lane == 0) {
+                int c = c0 + j;
+                int sc_idx = (c < 4) ? 0 : ((c < 8) ? 1 : 2);
+                float val = (d * rsq) * hc_scale[sc_idx] + hc_base[c];
+                h_coeff[(size_t)(m0 + r) * 24 + c] = val;
+                if (c < 4 && next_pre) {
+                    next_pre[(size_t)(m0 + r) * 4 + c] = 1.0f / (1.0f + expf(-val)) + hc_eps;
+                }
+            }
+        }
+    }
+}
+
+__global__ __launch_bounds__(256)
 void mhc_coeff_proj_24_k(
     const float* __restrict__ streams,
     const float* __restrict__ hc_fn,
@@ -561,7 +665,9 @@ void rad_cuda_mhc_pre_coeff_rmsnorm(
     float hc_eps,
     cudaStream_t stream
 ) {
-    if (M >= 16) {
+    if (M >= 64) {
+        mhc_coeff_proj_24_4tok_k<<<(M + 3) / 4, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, M, D * 4, rms_eps, hc_eps);
+    } else if (M >= 16) {
         mhc_coeff_proj_24_k<<<M, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, D * 4, rms_eps, hc_eps);
     } else {
         dim3 g1(24, M);
@@ -598,7 +704,9 @@ void rad_cuda_mhc_pre_and_coeff(
     float hc_eps,
     cudaStream_t stream
 ) {
-    if (M >= 16) {
+    if (M >= 64) {
+        mhc_coeff_proj_24_4tok_k<<<(M + 3) / 4, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, M, D * 4, rms_eps, hc_eps);
+    } else if (M >= 16) {
         mhc_coeff_proj_24_k<<<M, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, D * 4, rms_eps, hc_eps);
     } else {
         dim3 g1(24, M);
