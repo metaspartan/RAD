@@ -391,7 +391,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
     const uint8_t* wrow = valid ? (W + (size_t)exp_id * exp_bytes + (size_t)row * row_bytes) : W;
     const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
     const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
-    __shared__ q8_1_blk sm_act[4][32];
+    __shared__ q8_1_blk sm_act[8][32];
     bool use_lds = (nblk <= 32);
 
     if (cnt == 1) {
@@ -609,8 +609,6 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
         }
         return;
     }
-    if (!valid) return;
-
     for (int t0 = z_id * 8; t0 < cnt; t0 += z_n * 8) {
         int nt = min(8, cnt - t0);
         int tids[8];
@@ -619,66 +617,78 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
             tids[m] = tok_sorted[off0 + t0 + m];
             sids[m] = slot_sorted[off0 + t0 + m];
         }
+        if (use_lds) {
+            for (int i = tid; i < nt * nblk; i += 128) {
+                int m = i / nblk;
+                int b = i - m * nblk;
+                sm_act[m][b] = act_q[((size_t)tids[m] * n_used + sids[m]) * nblk + b];
+            }
+            __syncthreads();
+        }
         float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-        if (nt == 8) {
-            const q8_1_blk* ap0 = act_q + ((size_t)tids[0] * n_used + sids[0]) * nblk;
-            const q8_1_blk* ap1 = act_q + ((size_t)tids[1] * n_used + sids[1]) * nblk;
-            const q8_1_blk* ap2 = act_q + ((size_t)tids[2] * n_used + sids[2]) * nblk;
-            const q8_1_blk* ap3 = act_q + ((size_t)tids[3] * n_used + sids[3]) * nblk;
-            const q8_1_blk* ap4 = act_q + ((size_t)tids[4] * n_used + sids[4]) * nblk;
-            const q8_1_blk* ap5 = act_q + ((size_t)tids[5] * n_used + sids[5]) * nblk;
-            const q8_1_blk* ap6 = act_q + ((size_t)tids[6] * n_used + sids[6]) * nblk;
-            const q8_1_blk* ap7 = act_q + ((size_t)tids[7] * n_used + sids[7]) * nblk;
-            const q8_1_blk* aps[8] = { ap0, ap1, ap2, ap3, ap4, ap5, ap6, ap7 };
-            for (int b = lane4; b < nblk; b += 4) {
-                uint4 q4 = qrow[b];
-                float dw = __half2float(drow[b]);
-                int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu), w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
-                int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu), w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
-                int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
-                int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
+        if (valid) {
+            if (nt == 8) {
+                const q8_1_blk* aps[8] = {
+                    use_lds ? sm_act[0] : (act_q + ((size_t)tids[0] * n_used + sids[0]) * nblk),
+                    use_lds ? sm_act[1] : (act_q + ((size_t)tids[1] * n_used + sids[1]) * nblk),
+                    use_lds ? sm_act[2] : (act_q + ((size_t)tids[2] * n_used + sids[2]) * nblk),
+                    use_lds ? sm_act[3] : (act_q + ((size_t)tids[3] * n_used + sids[3]) * nblk),
+                    use_lds ? sm_act[4] : (act_q + ((size_t)tids[4] * n_used + sids[4]) * nblk),
+                    use_lds ? sm_act[5] : (act_q + ((size_t)tids[5] * n_used + sids[5]) * nblk),
+                    use_lds ? sm_act[6] : (act_q + ((size_t)tids[6] * n_used + sids[6]) * nblk),
+                    use_lds ? sm_act[7] : (act_q + ((size_t)tids[7] * n_used + sids[7]) * nblk),
+                };
+                for (int b = lane4; b < nblk; b += 4) {
+                    uint4 q4 = qrow[b];
+                    float dw = __half2float(drow[b]);
+                    int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu), w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+                    int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu), w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+                    int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+                    int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
 #pragma unroll
-                for (int m = 0; m < 8; ++m) {
-                    const q8_1_blk ab = aps[m][b];
-                    int32_t sumi = 0;
-                    sumi = __builtin_amdgcn_sudot4(false, w0, true, ab.q[0], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w1, true, ab.q[1], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w2, true, ab.q[2], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w3, true, ab.q[3], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w4, true, ab.q[4], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w5, true, ab.q[5], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w6, true, ab.q[6], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w7, true, ab.q[7], sumi, false);
-                    acc[m] = fmaf(dw * ab.d, (float)(sumi - 8 * ab.s), acc[m]);
+                    for (int m = 0; m < 8; ++m) {
+                        const q8_1_blk ab = aps[m][b];
+                        int32_t sumi = 0;
+                        sumi = __builtin_amdgcn_sudot4(false, w0, true, ab.q[0], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w1, true, ab.q[1], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w2, true, ab.q[2], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w3, true, ab.q[3], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w4, true, ab.q[4], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w5, true, ab.q[5], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w6, true, ab.q[6], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w7, true, ab.q[7], sumi, false);
+                        acc[m] = fmaf(dw * ab.d, (float)(sumi - 8 * ab.s), acc[m]);
+                    }
+                }
+            } else {
+                for (int b = lane4; b < nblk; b += 4) {
+                    uint4 q4 = qrow[b];
+                    float dw = __half2float(drow[b]);
+                    int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu), w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+                    int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu), w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+                    int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+                    int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
+                    for (int m = 0; m < nt; ++m) {
+                        const q8_1_blk ab = use_lds ? sm_act[m][b] : act_q[((size_t)tids[m] * n_used + sids[m]) * nblk + b];
+                        int32_t sumi = 0;
+                        sumi = __builtin_amdgcn_sudot4(false, w0, true, ab.q[0], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w1, true, ab.q[1], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w2, true, ab.q[2], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w3, true, ab.q[3], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w4, true, ab.q[4], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w5, true, ab.q[5], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w6, true, ab.q[6], sumi, false);
+                        sumi = __builtin_amdgcn_sudot4(false, w7, true, ab.q[7], sumi, false);
+                        acc[m] = fmaf(dw * ab.d, (float)(sumi - 8 * ab.s), acc[m]);
+                    }
                 }
             }
-        } else {
-            for (int b = lane4; b < nblk; b += 4) {
-                uint4 q4 = qrow[b];
-                float dw = __half2float(drow[b]);
-                int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu), w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
-                int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu), w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
-                int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
-                int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
-                for (int m = 0; m < nt; ++m) {
-                    const q8_1_blk ab = act_q[((size_t)tids[m] * n_used + sids[m]) * nblk + b];
-                    int32_t sumi = 0;
-                    sumi = __builtin_amdgcn_sudot4(false, w0, true, ab.q[0], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w1, true, ab.q[1], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w2, true, ab.q[2], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w3, true, ab.q[3], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w4, true, ab.q[4], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w5, true, ab.q[5], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w6, true, ab.q[6], sumi, false);
-                    sumi = __builtin_amdgcn_sudot4(false, w7, true, ab.q[7], sumi, false);
-                    acc[m] = fmaf(dw * ab.d, (float)(sumi - 8 * ab.s), acc[m]);
-                }
+            for (int m = 0; m < nt; ++m) {
+                float v = s_warp_sum4(acc[m]) * wt_sorted[off0 + t0 + m];
+                if (lane4 == 0) atomicAdd(&y_out[(size_t)tids[m] * n_embd + row], v);
             }
         }
-        for (int m = 0; m < nt; ++m) {
-            float v = s_warp_sum4(acc[m]) * wt_sorted[off0 + t0 + m];
-            if (lane4 == 0) atomicAdd(&y_out[(size_t)tids[m] * n_embd + row], v);
-        }
+        if (use_lds) __syncthreads();
     }
 }
 
