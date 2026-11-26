@@ -716,7 +716,9 @@ impl DFlash2Drafter {
             }
         }
 
-        ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, self.output_norm.ptr as *const f32, self.hidden.ptr as *mut f32, e, tot_b, self.eps);
+        if n_users > 1 {
+            ops::ink_rmsnorm_batch(s, self.x.ptr as *const f32, self.output_norm.ptr as *const f32, self.hidden.ptr as *mut f32, e, tot_b, self.eps);
+        }
     }
 
     unsafe fn enqueue_head_and_selector(&self, s: HipStream, target: &InklingEngine, n_users: usize, k_len: usize) {
@@ -724,7 +726,18 @@ impl DFlash2Drafter {
         let pred_per_u = k_len - 1;
         let n_pred = (n_users * pred_per_u) as i32;
         let h_pred_ptr: *const f32 = if n_users == 1 {
-            (self.hidden.ptr as *const f32).add(self.n_embd)
+            let hp = (self.hidden.ptr as *mut f32).add(self.n_embd);
+            ops::ink_dflash2_rmsnorm_q8(
+                s,
+                (self.x.ptr as *const f32).add(self.n_embd),
+                self.output_norm.ptr as *const f32,
+                hp,
+                self.xq.ptr,
+                e,
+                n_pred,
+                self.eps,
+            );
+            hp as *const f32
         } else {
             for u in 0..n_users {
                 ops::ink_copy_f32(
@@ -734,10 +747,9 @@ impl DFlash2Drafter {
                     (pred_per_u * self.n_embd) as i32,
                 );
             }
+            ops::ink_quantize_q8_1(s, self.h_pred.ptr as *const f32, self.xq.ptr, e, n_pred);
             self.h_pred.ptr as *const f32
         };
-
-        ops::ink_quantize_q8_1(s, h_pred_ptr, self.xq.ptr, e, n_pred);
         if target.output_is_q4() {
             if n_pred >= 12 {
                 ops::ink_gemm_q4_0_wmma(s, target.output_ptr(), self.xq.ptr, self.logits.ptr as *mut f32, target.cfg.vocab_padded as i32, e, n_pred);

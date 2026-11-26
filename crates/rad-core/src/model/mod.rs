@@ -388,6 +388,7 @@ pub struct InklingEngine {
     d_rw_u: DevBuf,
     d_rw_seq: DevBuf,
     d_rw_idx: DevBuf,
+    h_io_pinned: rad_hip::PinnedBuf,
     last_logits_in_sc: bool,
     b1_sudot4: bool,
 }
@@ -720,6 +721,7 @@ impl InklingEngine {
             d_rw_u,
             d_rw_seq,
             d_rw_idx,
+            h_io_pinned: rad_hip::PinnedBuf::new(4096).map_err(he)?,
             last_logits_in_sc: false,
             b1_sudot4,
         })

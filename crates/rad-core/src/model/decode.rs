@@ -1192,10 +1192,11 @@ impl InklingEngine {
         }
         self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(stream)).map_err(he)?;
         g.launch_on(stream).map_err(he)?;
-        let mut out = vec![0i32; b];
+        let pin_d = self.h_io_pinned.ptr as *mut i32;
+        let pin_v = unsafe { pin_d.add(512) };
         let rc_d = unsafe {
             rad_hip::hipMemcpyAsync(
-                draft_out.as_mut_ptr() as *mut core::ffi::c_void,
+                pin_d as *mut core::ffi::c_void,
                 d_toks_src,
                 b * 4,
                 rad_hip::HIP_MEMCPY_DEVICE_TO_HOST,
@@ -1207,7 +1208,7 @@ impl InklingEngine {
         }
         let rc = unsafe {
             rad_hip::hipMemcpyAsync(
-                out.as_mut_ptr() as *mut core::ffi::c_void,
+                pin_v as *mut core::ffi::c_void,
                 self.bsc.d_out_toks.ptr,
                 b * 4,
                 rad_hip::HIP_MEMCPY_DEVICE_TO_HOST,
@@ -1221,6 +1222,10 @@ impl InklingEngine {
         if rc_s != rad_hip::HIP_SUCCESS {
             return Err(he(rc_s));
         }
+        let out = unsafe {
+            draft_out[..b].copy_from_slice(std::slice::from_raw_parts(pin_d, b));
+            std::slice::from_raw_parts(pin_v, b).to_vec()
+        };
         self.seq_pos[seq] += b as i32;
         if seq == 0 {
             self.pos = self.seq_pos[0];
@@ -1246,10 +1251,10 @@ impl InklingEngine {
         self.bsc.d_toks.copy_from(tok_bytes, Some(stream)).map_err(he)?;
         self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(stream)).map_err(he)?;
         g.launch_on(stream).map_err(he)?;
-        let mut out = vec![0i32; b];
+        let pin_v = self.h_io_pinned.ptr as *mut i32;
         let rc = unsafe {
             rad_hip::hipMemcpyAsync(
-                out.as_mut_ptr() as *mut core::ffi::c_void,
+                pin_v as *mut core::ffi::c_void,
                 self.bsc.d_out_toks.ptr,
                 b * 4,
                 rad_hip::HIP_MEMCPY_DEVICE_TO_HOST,
@@ -1263,6 +1268,7 @@ impl InklingEngine {
         if rc_s != rad_hip::HIP_SUCCESS {
             return Err(he(rc_s));
         }
+        let out = unsafe { std::slice::from_raw_parts(pin_v, b).to_vec() };
         self.seq_pos[seq] += b as i32;
         if seq == 0 {
             self.pos = self.seq_pos[0];
