@@ -129,9 +129,11 @@ __global__ void mma_wht128_post_f32_to_f16_k(
     float swiglu_limit,
     int add_to_y
 ) {
-    int blk = blockIdx.x;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int blk = blockIdx.x * 4 + warp;
+    if (blk * 128 >= N) return;
     int row = blockIdx.y;
-    int lane = threadIdx.x;
     int col = blk * 128 + lane * 4;
     float4 zv = *reinterpret_cast<const float4*>(z_f32 + (size_t)row * N + col);
     float v0 = zv.x, v1 = zv.y, v2 = zv.z, v3 = zv.w;
@@ -570,9 +572,11 @@ __global__ void moe_wht128_post_f32_to_f16_k(
     int expert_start,
     int n_local_experts
 ) {
-    int blk = blockIdx.x;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int blk = blockIdx.x * 4 + warp;
+    if (blk * 128 >= N) return;
     int pair_idx = blockIdx.y;
-    int lane = threadIdx.x;
     int col = blk * 128 + lane * 4;
     size_t off = (size_t)pair_idx * N + col;
     int eid = expert_ids[pair_idx];
@@ -1535,8 +1539,10 @@ __global__ void batched_group_wht128_post_f32_to_f16_k(
     int N,
     float wht_scale
 ) {
-    int lane = threadIdx.x;
-    int block_idx = blockIdx.x;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int block_idx = blockIdx.x * 4 + warp;
+    if (block_idx * 128 >= N) return;
     int row_g = blockIdx.y;
     int g = row_g % G;
     int base = block_idx * 128 + lane * 4;
@@ -1652,8 +1658,8 @@ void rad_cuda_exl3_moe_mma_f16(
                 case 8: exl3_moe_mma_grouped_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
             }
         }
-        dim3 post_grid(n_blocks, pairs);
-        moe_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh_ptrs, use_m64 ? next_suh_ptrs : nullptr, expert_ids, gate_in, y_out, N, wht_scale, swiglu_limit, expert_start, n_local_experts);
+        dim3 post_grid((n_blocks + 3) / 4, pairs);
+        moe_wht128_post_f32_to_f16_k<<<post_grid, 128, 0, stream>>>(z_scratch_f32, svh_ptrs, use_m64 ? next_suh_ptrs : nullptr, expert_ids, gate_in, y_out, N, wht_scale, swiglu_limit, expert_start, n_local_experts);
         return;
     }
     int split_k = (n_blocks * pairs < 128) ? 4 : ((n_blocks * pairs < 256) ? 2 : 1);
@@ -1671,8 +1677,8 @@ void rad_cuda_exl3_moe_mma_f16(
         case 6: exl3_moe_mma_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, expert_ids, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert, expert_start, n_local_experts); break;
         case 8: exl3_moe_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, expert_ids, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert, expert_start, n_local_experts); break;
     }
-    dim3 post_grid(n_blocks, pairs);
-    moe_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh_ptrs, nullptr, expert_ids, gate_in, y_out, N, wht_scale, swiglu_limit, expert_start, n_local_experts);
+    dim3 post_grid((n_blocks + 3) / 4, pairs);
+    moe_wht128_post_f32_to_f16_k<<<post_grid, 128, 0, stream>>>(z_scratch_f32, svh_ptrs, nullptr, expert_ids, gate_in, y_out, N, wht_scale, swiglu_limit, expert_start, n_local_experts);
 }
 
 void rad_cuda_exl3_batched_group_mma_f16(
@@ -1737,8 +1743,8 @@ void rad_cuda_exl3_batched_group_mma_f16(
             case 8: exl3_batched_group_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
         }
     }
-    dim3 post_grid(n_blocks, M * G);
-    batched_group_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh_ptrs, y_out, G, N, wht_scale);
+    dim3 post_grid((n_blocks + 3) / 4, M * G);
+    batched_group_wht128_post_f32_to_f16_k<<<post_grid, 128, 0, stream>>>(z_scratch_f32, svh_ptrs, y_out, G, N, wht_scale);
 }
 
 void rad_cuda_exl3_mma_f16(
@@ -1790,8 +1796,8 @@ void rad_cuda_exl3_mma_f16(
             case 8: exl3_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
         }
     }
-    dim3 post_grid(n_blocks, M);
-    mma_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh, nullptr, nullptr, y, N, wht_scale, 0.0f, add_to_y);
+    dim3 post_grid((n_blocks + 3) / 4, M);
+    mma_wht128_post_f32_to_f16_k<<<post_grid, 128, 0, stream>>>(z_scratch_f32, svh, nullptr, nullptr, y, N, wht_scale, 0.0f, add_to_y);
 }
 
 void rad_cuda_exl3_mma_swiglu_f16(
@@ -1845,8 +1851,8 @@ void rad_cuda_exl3_mma_swiglu_f16(
             case 8: exl3_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
         }
     }
-    dim3 post_grid(n_blocks, M);
-    mma_wht128_post_f32_to_f16_k<<<post_grid, 32, 0, stream>>>(z_scratch_f32, svh, gate_in, next_suh, y, N, wht_scale, swiglu_limit, 0);
+    dim3 post_grid((n_blocks + 3) / 4, M);
+    mma_wht128_post_f32_to_f16_k<<<post_grid, 128, 0, stream>>>(z_scratch_f32, svh, gate_in, next_suh, y, N, wht_scale, swiglu_limit, 0);
 }
 
 }

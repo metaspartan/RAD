@@ -114,7 +114,7 @@ void* rad_rdma_init(const char* dev_name, size_t buf_bytes, RadRdmaInfo* local_i
     qia.cap.max_recv_wr = 32;
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
-    qia.cap.max_inline_data = 256;
+    qia.cap.max_inline_data = 512;
     r->qp = ibv_create_qp(r->pd, &qia);
     if (!r->qp || !r->send_mr || !r->recv_mr) {
         free(r);
@@ -213,23 +213,23 @@ int rad_rdma_exchange_mapped(void* handle, int n_bytes) {
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-    wr.send_flags = IBV_SEND_SIGNALED | ((n_bytes <= 256) ? IBV_SEND_INLINE : 0);
+    wr.send_flags = IBV_SEND_SIGNALED | ((n_bytes <= 512) ? IBV_SEND_INLINE : 0);
     wr.imm_data = (uint32_t)r->seq;
     wr.wr.rdma.remote_addr = r->remote_addr;
     wr.wr.rdma.rkey = r->remote_rkey;
     if (ibv_post_send(r->qp, &wr, &bad_wr) != 0) return -2;
 
     struct ibv_wc wc;
-    while (ibv_poll_cq(r->scq, 1, &wc) == 0) {}
-    if (wc.status != IBV_WC_SUCCESS) return -3;
     while (ibv_poll_cq(r->rcq, 1, &wc) == 0) {}
     if (wc.status != IBV_WC_SUCCESS) return -4;
-
     struct ibv_recv_wr rwr;
     struct ibv_recv_wr* bad_rwr = NULL;
     memset(&rwr, 0, sizeof(rwr));
     rwr.wr_id = wc.wr_id;
     ibv_post_recv(r->qp, &rwr, &bad_rwr);
+
+    while (ibv_poll_cq(r->scq, 1, &wc) == 0) {}
+    if (wc.status != IBV_WC_SUCCESS) return -3;
     return 0;
 }
 
