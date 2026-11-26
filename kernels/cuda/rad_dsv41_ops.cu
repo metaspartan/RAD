@@ -802,6 +802,15 @@ __device__ __forceinline__ void mqa_mma_m16n8k16_f32(
     );
 }
 
+__device__ __forceinline__ void mqa_cp_async_16(void* smem_ptr, const void* gmem_ptr, bool pred) {
+    if (pred) {
+        uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem_addr), "l"(gmem_ptr) : "memory");
+    } else {
+        *reinterpret_cast<uint4*>(smem_ptr) = make_uint4(0u, 0u, 0u, 0u);
+    }
+}
+
 template <int NH_BLK, int Q_TOK>
 __global__ __launch_bounds__(256 * Q_TOK)
 void mqa_flash_mma_f16_k(
@@ -844,8 +853,8 @@ void mqa_flash_mma_f16_k(
     if (p_max > max_ctx) p_max = max_ctx;
 
     extern __shared__ char smem_raw[];
-    half (*s_kv)[520] = reinterpret_cast<half (*)[520]>(smem_raw);
-    float (*s_sp)[NH_BLK][8][16][16] = reinterpret_cast<float (*)[NH_BLK][8][16][16]>(smem_raw + 16640);
+    half (*s_kv_buf)[16][520] = reinterpret_cast<half (*)[16][520]>(smem_raw);
+    float (*s_sp)[NH_BLK][8][16][16] = reinterpret_cast<float (*)[NH_BLK][8][16][16]>(smem_raw + 33280);
     __shared__ half s_p[Q_TOK][NH_BLK][16][16];
     __shared__ float s_m[Q_TOK][NH_BLK][16];
     __shared__ float s_l[Q_TOK][NH_BLK][16];
@@ -881,7 +890,8 @@ void mqa_flash_mma_f16_k(
         }
     }
 
-    auto process_tile = [&](int tile_base, int tile_len, int v_beg, int v_end) {
+    auto process_tile = [&](int buf, int tile_base, int tile_len, int v_beg, int v_end) {
+        half (*s_kv)[520] = s_kv_buf[buf];
         float s00[NH_BLK], s01[NH_BLK], s02[NH_BLK], s03[NH_BLK];
         float s10[NH_BLK], s11[NH_BLK], s12[NH_BLK], s13[NH_BLK];
         #pragma unroll
@@ -979,13 +989,13 @@ void mqa_flash_mma_f16_k(
                 mqa_mma_m16n8k16_f32(o0[hg][nb], o1[hg][nb], o2[hg][nb], o3[hg][nb], pa0[hg], pa1[hg], pa2[hg], pa3[hg], b0, b1);
             }
         }
-        __syncthreads();
     };
 
     constexpr int LD_ITERS = 4 / Q_TOK;
     constexpr int LD_STRIDE = 256 * Q_TOK;
 
     if (p_min < p_max) {
+        int buf = 0;
         int tile_len0 = p_max - p_min;
         if (tile_len0 > 16) tile_len0 = 16;
         int n_u4_0 = tile_len0 * 64;
@@ -993,14 +1003,16 @@ void mqa_flash_mma_f16_k(
         #pragma unroll
         for (int k = 0; k < LD_ITERS; ++k) {
             int i = t + k * LD_STRIDE;
-            reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = (i < n_u4_0) ? __ldg(src0 + i) : make_uint4(0u, 0u, 0u, 0u);
+            mqa_cp_async_16(&reinterpret_cast<uint4*>(s_kv_buf[0][i >> 6])[i & 63], src0 + i, i < n_u4_0);
         }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
         __syncthreads();
         for (int p0 = p_min; p0 < p_max; p0 += 16) {
             int tile_len = p_max - p0;
             if (tile_len > 16) tile_len = 16;
-            uint4 nxt[LD_ITERS];
             bool has_next = (p0 + 16 < p_max);
+            int nbuf = buf ^ 1;
             if (has_next) {
                 int nlen = p_max - (p0 + 16);
                 if (nlen > 16) nlen = 16;
@@ -1009,19 +1021,18 @@ void mqa_flash_mma_f16_k(
                 #pragma unroll
                 for (int k = 0; k < LD_ITERS; ++k) {
                     int i = t + k * LD_STRIDE;
-                    nxt[k] = (i < nu4) ? __ldg(nsrc + i) : make_uint4(0u, 0u, 0u, 0u);
+                    mqa_cp_async_16(&reinterpret_cast<uint4*>(s_kv_buf[nbuf][i >> 6])[i & 63], nsrc + i, i < nu4);
                 }
+                asm volatile("cp.async.commit_group;\n" ::: "memory");
             }
-            process_tile(p0, tile_len, p_start, seq_len);
+            process_tile(buf, p0, tile_len, p_start, seq_len);
             if (has_next) {
-                #pragma unroll
-                for (int k = 0; k < LD_ITERS; ++k) {
-                    int i = t + k * LD_STRIDE;
-                    reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = nxt[k];
-                }
+                asm volatile("cp.async.wait_group 0;\n" ::: "memory");
                 __syncthreads();
+                buf = nbuf;
             }
         }
+        __syncthreads();
     }
 
     if (comp_kv && comp_ratio > 0) {
@@ -1029,20 +1040,23 @@ void mqa_flash_mma_f16_k(
         int c_max = p_start_last / comp_ratio;
         int c_end_wg = p_start / comp_ratio;
         if (c_max > 0) {
+            int buf = 0;
             int tile_len0 = (c_max > 16) ? 16 : c_max;
             int n_u4_0 = tile_len0 * 64;
             const uint4* src0 = reinterpret_cast<const uint4*>(comp_kv);
             #pragma unroll
             for (int k = 0; k < LD_ITERS; ++k) {
                 int i = t + k * LD_STRIDE;
-                reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = (i < n_u4_0) ? __ldg(src0 + i) : make_uint4(0u, 0u, 0u, 0u);
+                mqa_cp_async_16(&reinterpret_cast<uint4*>(s_kv_buf[0][i >> 6])[i & 63], src0 + i, i < n_u4_0);
             }
+            asm volatile("cp.async.commit_group;\n" ::: "memory");
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
             __syncthreads();
             for (int c0 = 0; c0 < c_max; c0 += 16) {
                 int tile_len = c_max - c0;
                 if (tile_len > 16) tile_len = 16;
-                uint4 nxt[LD_ITERS];
                 bool has_next = (c0 + 16 < c_max);
+                int nbuf = buf ^ 1;
                 if (has_next) {
                     int nlen = c_max - (c0 + 16);
                     if (nlen > 16) nlen = 16;
@@ -1051,19 +1065,18 @@ void mqa_flash_mma_f16_k(
                     #pragma unroll
                     for (int k = 0; k < LD_ITERS; ++k) {
                         int i = t + k * LD_STRIDE;
-                        nxt[k] = (i < nu4) ? __ldg(nsrc + i) : make_uint4(0u, 0u, 0u, 0u);
+                        mqa_cp_async_16(&reinterpret_cast<uint4*>(s_kv_buf[nbuf][i >> 6])[i & 63], nsrc + i, i < nu4);
                     }
+                    asm volatile("cp.async.commit_group;\n" ::: "memory");
                 }
-                process_tile(c0, tile_len, 0, c_end_wg);
+                process_tile(buf, c0, tile_len, 0, c_end_wg);
                 if (has_next) {
-                    #pragma unroll
-                    for (int k = 0; k < LD_ITERS; ++k) {
-                        int i = t + k * LD_STRIDE;
-                        reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = nxt[k];
-                    }
+                    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
                     __syncthreads();
+                    buf = nbuf;
                 }
             }
+            __syncthreads();
         }
     }
 
@@ -1528,11 +1541,11 @@ void rad_cuda_mqa_attn_sink_causal_f16(
             }
         }
         if (M >= 64 && (n_heads % 32) == 0) {
-            static bool smem_set = false;
-            size_t smem_bytes = 16640 + 2 * 2 * 8 * 16 * 16 * sizeof(float);
-            if (!smem_set) {
+            static bool smem_set22 = false;
+            size_t smem_bytes = 33280 + 2 * 2 * 8 * 16 * 16 * sizeof(float);
+            if (!smem_set22) {
                 cudaFuncSetAttribute(mqa_flash_mma_f16_k<2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-                smem_set = true;
+                smem_set22 = true;
             }
             dim3 grid(n_heads / 32, (M + 1) / 2);
             mqa_flash_mma_f16_k<2, 2><<<grid, 512, smem_bytes, stream>>>(
@@ -1541,7 +1554,12 @@ void rad_cuda_mqa_attn_sink_causal_f16(
             return;
         }
         if (M >= 16 && (n_heads % 32) == 0) {
-            size_t smem_bytes = 16640 + 2 * 8 * 16 * 16 * sizeof(float);
+            static bool smem_set21 = false;
+            size_t smem_bytes = 33280 + 2 * 8 * 16 * 16 * sizeof(float);
+            if (!smem_set21) {
+                cudaFuncSetAttribute(mqa_flash_mma_f16_k<2, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+                smem_set21 = true;
+            }
             dim3 grid(n_heads / 32, M);
             mqa_flash_mma_f16_k<2, 1><<<grid, 256, smem_bytes, stream>>>(
                 q, k_cache, comp_kv, attn_sink, out, M, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
@@ -1549,7 +1567,7 @@ void rad_cuda_mqa_attn_sink_causal_f16(
             return;
         }
         if (M >= 16 || (M >= 4 && start_pos + M >= 256)) {
-            size_t smem_bytes = 16640 + 8 * 16 * 16 * sizeof(float);
+            size_t smem_bytes = 33280 + 8 * 16 * 16 * sizeof(float);
             dim3 grid(n_heads / 16, M);
             mqa_flash_mma_f16_k<1, 1><<<grid, 256, smem_bytes, stream>>>(
                 q, k_cache, comp_kv, attn_sink, out, M, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
