@@ -33,7 +33,7 @@ void moe_gate_logits_mma_f16_k(
     int warp = t >> 5;
     int e0 = blockIdx.x * 64 + warp * 8;
     int m_base = blockIdx.y * 16;
-    if (e0 >= n_experts || m_base >= M) return;
+    if (m_base >= M) return;
 
     int group_id = lane >> 2;
     int tid = lane & 3;
@@ -42,29 +42,38 @@ void moe_gate_logits_mma_f16_k(
     int k_off0 = tid * 2;
     int k_off1 = k_off0 + 8;
     int e_row = e0 + group_id;
-
-    const half* x0 = (m0 < M) ? (x + (size_t)m0 * D) : nullptr;
-    const half* x1 = (m1 < M) ? (x + (size_t)m1 * D) : nullptr;
     const half* wr = (e_row < n_experts) ? (gate_w + (size_t)e_row * D) : nullptr;
+
+    __shared__ alignas(16) half s_x[16][16];
+    int ld_row = t >> 2;
+    int ld_col = (t & 3) * 4;
+    int ld_m = m_base + ld_row;
 
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
     for (int k = 0; k < D; k += 16) {
-        uint32_t a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u;
-        uint32_t b0 = 0u, b1 = 0u;
-        if (x0) {
-            a0 = __ldg(reinterpret_cast<const uint32_t*>(x0 + k + k_off0));
-            a2 = __ldg(reinterpret_cast<const uint32_t*>(x0 + k + k_off1));
+        if (ld_row < 16) {
+            if (ld_m < M) {
+                *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = *reinterpret_cast<const uint2*>(x + (size_t)ld_m * D + k + ld_col);
+            } else {
+                *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = make_uint2(0u, 0u);
+            }
         }
-        if (x1) {
-            a1 = __ldg(reinterpret_cast<const uint32_t*>(x1 + k + k_off0));
-            a3 = __ldg(reinterpret_cast<const uint32_t*>(x1 + k + k_off1));
+        __syncthreads();
+        if (e0 < n_experts) {
+            uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_x[group_id][k_off0]);
+            uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_x[group_id][k_off1]);
+            uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_x[group_id + 8][k_off0]);
+            uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_x[group_id + 8][k_off1]);
+            uint32_t b0 = 0u, b1 = 0u;
+            if (wr) {
+                b0 = __ldg(reinterpret_cast<const uint32_t*>(wr + k + k_off0));
+                b1 = __ldg(reinterpret_cast<const uint32_t*>(wr + k + k_off1));
+            }
+            router_mma_m16n8k16_f32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
         }
-        if (wr) {
-            b0 = __ldg(reinterpret_cast<const uint32_t*>(wr + k + k_off0));
-            b1 = __ldg(reinterpret_cast<const uint32_t*>(wr + k + k_off1));
-        }
-        router_mma_m16n8k16_f32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+        __syncthreads();
     }
+    if (e0 >= n_experts) return;
 
     auto write_sc = [&](int mr, int ec, float v) {
         if (mr < M && ec < n_experts) {
@@ -834,6 +843,49 @@ void rad_cuda_mhc_sinkhorn_pre_coeff_rmsnorm(
     mhc_sinkhorn_mix_pre_rmsnorm_f16_k<<<M, 256, 0, stream>>>(
         streams, branch_out, peer_branch_out, h_coeff, prev_pre, norm_w, normed_out, D, sinkhorn_iters, rms_eps, hc_eps
     );
+    if (M >= 64) {
+        mhc_coeff_proj_24_4tok_k<<<(M + 3) / 4, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, M, D * 4, rms_eps, hc_eps);
+    } else if (M >= 16) {
+        mhc_coeff_proj_24_k<<<M, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, D * 4, rms_eps, hc_eps);
+    } else {
+        dim3 g1(24, M);
+        mhc_coeff_proj_k<<<g1, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, D * 4, rms_eps, hc_eps);
+    }
+}
+
+void rad_cuda_mhc_sinkhorn_mix_pre_rmsnorm_only(
+    float* streams,
+    const half* branch_out,
+    const half* peer_branch_out,
+    const float* h_coeff,
+    const float* prev_pre,
+    const __nv_bfloat16* norm_w,
+    half* normed_out,
+    int M,
+    int D,
+    int sinkhorn_iters,
+    float rms_eps,
+    float hc_eps,
+    cudaStream_t stream
+) {
+    mhc_sinkhorn_mix_pre_rmsnorm_f16_k<<<M, 256, 0, stream>>>(
+        streams, branch_out, peer_branch_out, h_coeff, prev_pre, norm_w, normed_out, D, sinkhorn_iters, rms_eps, hc_eps
+    );
+}
+
+void rad_cuda_mhc_coeff_proj_only(
+    const float* streams,
+    const float* hc_fn,
+    const float* hc_base,
+    const float* hc_scale,
+    float* h_coeff,
+    float* next_pre,
+    int M,
+    int D,
+    float rms_eps,
+    float hc_eps,
+    cudaStream_t stream
+) {
     if (M >= 64) {
         mhc_coeff_proj_24_4tok_k<<<(M + 3) / 4, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, M, D * 4, rms_eps, hc_eps);
     } else if (M >= 16) {

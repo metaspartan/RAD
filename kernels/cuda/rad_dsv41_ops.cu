@@ -61,10 +61,13 @@ __global__ void clamped_swiglu_f16_k(
 __global__ void moe_weighted_sum_f16_k(
     const half* __restrict__ expert_outs,
     const float* __restrict__ weights,
+    const int* __restrict__ expert_ids,
     const half* __restrict__ shared_out,
     half* __restrict__ dst,
     int top_k,
-    int D
+    int D,
+    int expert_start,
+    int n_local_experts
 ) {
     int mr = blockIdx.y;
     int i4 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -78,8 +81,13 @@ __global__ void moe_weighted_sum_f16_k(
             a0 = s01.x; a1 = s01.y; a2 = s23.x; a3 = s23.y;
         }
         const float* wm = weights + (size_t)mr * top_k;
+        const int* em_id = expert_ids ? (expert_ids + (size_t)mr * top_k) : nullptr;
         const half* em = expert_outs + (size_t)mr * top_k * D;
         for (int k = 0; k < top_k; ++k) {
+            if (em_id) {
+                int le = em_id[k] - expert_start;
+                if (le < 0 || le >= n_local_experts) continue;
+            }
             float w = wm[k];
             uint2 eq = reinterpret_cast<const uint2*>(em + (size_t)k * D)[i4];
             float2 e01 = __half22float2(*reinterpret_cast<const half2*>(&eq.x));
@@ -1198,15 +1206,18 @@ void rad_cuda_clamped_swiglu_f16(
 void rad_cuda_moe_weighted_sum_f16(
     const half* expert_outs,
     const float* weights,
+    const int* expert_ids,
     const half* shared_out,
     half* dst,
     int M,
     int top_k,
     int D,
+    int expert_start,
+    int n_local_experts,
     cudaStream_t stream
 ) {
     dim3 g(((D >> 2) + 255) / 256, M);
-    moe_weighted_sum_f16_k<<<g, 256, 0, stream>>>(expert_outs, weights, shared_out, dst, top_k, D);
+    moe_weighted_sum_f16_k<<<g, 256, 0, stream>>>(expert_outs, weights, expert_ids, shared_out, dst, top_k, D, expert_start, n_local_experts);
 }
 
 void rad_cuda_embed_to_mhc_f16(

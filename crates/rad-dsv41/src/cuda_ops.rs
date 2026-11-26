@@ -121,11 +121,14 @@ extern "C" {
     pub fn rad_cuda_moe_weighted_sum_f16(
         expert_outs: *const c_void,
         weights: *const f32,
+        expert_ids: *const i32,
         shared_out: *const c_void,
         dst: *mut c_void,
         m: i32,
         top_k: i32,
         d: i32,
+        expert_start: i32,
+        n_local_experts: i32,
         stream: CudaStream,
     );
 
@@ -349,6 +352,36 @@ extern "C" {
         m: i32,
         d: i32,
         sinkhorn_iters: i32,
+        rms_eps: f32,
+        hc_eps: f32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_mhc_sinkhorn_mix_pre_rmsnorm_only(
+        streams: *mut c_void,
+        branch_out: *const c_void,
+        peer_branch_out: *const c_void,
+        h_coeff: *const f32,
+        prev_pre: *const c_void,
+        norm_w: *const c_void,
+        normed_out: *mut c_void,
+        m: i32,
+        d: i32,
+        sinkhorn_iters: i32,
+        rms_eps: f32,
+        hc_eps: f32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_mhc_coeff_proj_only(
+        streams: *const c_void,
+        hc_fn: *const c_void,
+        hc_base: *const c_void,
+        hc_scale: *const c_void,
+        h_coeff: *mut c_void,
+        next_pre: *mut c_void,
+        m: i32,
+        d: i32,
         rms_eps: f32,
         hc_eps: f32,
         stream: CudaStream,

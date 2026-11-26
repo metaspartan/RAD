@@ -332,23 +332,39 @@ impl Dsv41Engine {
             }
         }
         let lw = &self.layers[l];
-        let prev_pre = if l == 0 { std::ptr::null() } else { self.d_pre_b.ptr as *const c_void };
-        cuda_ops::rad_cuda_mhc_pre_coeff_rmsnorm(
-            self.d_streams.ptr,
-            lw.hc_attn_fn.ptr,
-            lw.hc_attn_base.ptr,
-            lw.hc_attn_scale.ptr,
-            prev_pre,
-            lw.attn_norm.ptr,
-            self.d_h_coeff.ptr,
-            self.d_pre_a.ptr,
-            self.d_normed.ptr,
-            mi,
-            d as i32,
-            tc.rms_norm_eps,
-            tc.hc_eps,
-            stream,
-        );
+        if l > 0 && self.engram_layers.is_empty() {
+            cuda_ops::rad_cuda_mhc_coeff_proj_only(
+                self.d_streams.ptr,
+                lw.hc_attn_fn.ptr,
+                lw.hc_attn_base.ptr,
+                lw.hc_attn_scale.ptr,
+                self.d_h_coeff.ptr,
+                self.d_pre_a.ptr,
+                mi,
+                d as i32,
+                tc.rms_norm_eps,
+                tc.hc_eps,
+                stream,
+            );
+        } else {
+            let prev_pre = if l == 0 { std::ptr::null() } else { self.d_pre_b.ptr as *const c_void };
+            cuda_ops::rad_cuda_mhc_pre_coeff_rmsnorm(
+                self.d_streams.ptr,
+                lw.hc_attn_fn.ptr,
+                lw.hc_attn_base.ptr,
+                lw.hc_attn_scale.ptr,
+                prev_pre,
+                lw.attn_norm.ptr,
+                self.d_h_coeff.ptr,
+                self.d_pre_a.ptr,
+                self.d_normed.ptr,
+                mi,
+                d as i32,
+                tc.rms_norm_eps,
+                tc.hc_eps,
+                stream,
+            );
+        }
         self.exl3_proj(self.d_normed.ptr, &lw.wq_a, self.d_q_lora.ptr, mi, 0, stream);
         cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_q_lora.ptr, lw.q_norm.ptr, self.d_q_normed.ptr, mi, tc.q_lora_rank as i32, tc.rms_norm_eps, stream);
         self.exl3_proj(self.d_q_normed.ptr, &lw.wq_b, self.d_q.ptr, mi, 0, stream);
@@ -513,11 +529,14 @@ impl Dsv41Engine {
         cuda_ops::rad_cuda_moe_weighted_sum_f16(
             self.d_moe_outs.ptr,
             self.d_topk_weights.ptr as *const f32,
+            self.d_topk_ids.ptr as *const i32,
             self.d_shared_out.ptr,
             branch_dst,
             mi,
             tk,
             d as i32,
+            exp_start,
+            n_local,
             stream,
         );
     }
@@ -767,17 +786,35 @@ impl Dsv41Engine {
             let (b_self2, b_peer2) = self.exchange_branch(m, comm)?;
 
             unsafe {
-                cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(
-                    self.d_streams.ptr,
-                    b_self2,
-                    b_peer2,
-                    self.d_h_coeff.ptr as *const f32,
-                    mi,
-                    d as i32,
-                    tc.hc_sinkhorn_iters as i32,
-                    tc.hc_eps,
-                    stream,
-                );
+                if l + 1 < self.layers.len() && self.engram_layers.is_empty() {
+                    cuda_ops::rad_cuda_mhc_sinkhorn_mix_pre_rmsnorm_only(
+                        self.d_streams.ptr,
+                        b_self2,
+                        b_peer2,
+                        self.d_h_coeff.ptr as *const f32,
+                        self.d_pre_b.ptr,
+                        self.layers[l + 1].attn_norm.ptr,
+                        self.d_normed.ptr,
+                        mi,
+                        d as i32,
+                        tc.hc_sinkhorn_iters as i32,
+                        tc.rms_norm_eps,
+                        tc.hc_eps,
+                        stream,
+                    );
+                } else {
+                    cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(
+                        self.d_streams.ptr,
+                        b_self2,
+                        b_peer2,
+                        self.d_h_coeff.ptr as *const f32,
+                        mi,
+                        d as i32,
+                        tc.hc_sinkhorn_iters as i32,
+                        tc.hc_eps,
+                        stream,
+                    );
+                }
             }
         }
         if update_mtp {
@@ -968,7 +1005,7 @@ impl Dsv41Engine {
             cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, self.d_moe_act.ptr, self.d_moe_outs.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 1, stream);
             let w2_suh_ptr = if mi >= 512 { std::ptr::null() } else { lw.d_w2_suh.ptr as *const *const c_void };
             cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, w2_suh_ptr, lw.d_w2_svh.ptr as *const *const c_void, std::ptr::null(), self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_outs.ptr, self.d_moe_act.ptr, tk, mi, inter, d as i32, bits, self.wht_scale, tc.swiglu_limit, 1, exp_start, n_local, 1, stream);
-            cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, stream);
+            cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_topk_ids.ptr as *const i32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, exp_start, n_local, stream);
         }
         let _ = sync_t();
         let t_moe = t7.elapsed().as_secs_f64() * 1e6;
@@ -1157,7 +1194,7 @@ impl Dsv41Engine {
                                 cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, std::ptr::null(), self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_gate.ptr, std::ptr::null_mut(), tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 0, gs);
                                 cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, std::ptr::null(), self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, self.d_moe_act.ptr, std::ptr::null_mut(), tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 1, gs);
                                 cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, std::ptr::null(), self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_outs.ptr, std::ptr::null_mut(), tk, mi, inter, d as i32, bits, self.wht_scale, tc.swiglu_limit, 1, exp_start, n_local, 1, gs);
-                                cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, gs);
+                                cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_topk_ids.ptr as *const i32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, exp_start, n_local, gs);
                             })
                         }
                         .map_err(CudaFail)?;
@@ -1181,7 +1218,7 @@ impl Dsv41Engine {
                         cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, std::ptr::null(), self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_gate.ptr, std::ptr::null_mut(), tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 0, stream);
                         cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, std::ptr::null(), self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, self.d_moe_act.ptr, std::ptr::null_mut(), tk, mi, d as i32, inter, bits, self.wht_scale, tc.swiglu_limit, 0, exp_start, n_local, 1, stream);
                         cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, std::ptr::null(), self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, std::ptr::null(), self.d_moe_outs.ptr, std::ptr::null_mut(), tk, mi, inter, d as i32, bits, self.wht_scale, tc.swiglu_limit, 1, exp_start, n_local, 1, stream);
-                        cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, stream);
+                        cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_topk_ids.ptr as *const i32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, exp_start, n_local, stream);
                     }
                 }
                 let (b_self2, b_peer2) = self.exchange_branch(blk, comm)?;

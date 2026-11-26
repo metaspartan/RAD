@@ -1761,9 +1761,6 @@ void rad_cuda_exl3_moe_mma_f16(
                     x_in, suh_ptrs, expert_ids, x_rot_scratch, top_k, K, wht_scale, x_per_expert, expert_start, n_local_experts
                 );
             }
-            if (split_k == 1 && x_per_expert && !gate_in) {
-                cudaMemsetAsync(y_out, 0, (size_t)pairs * N * sizeof(half), stream);
-            }
             half* fused_y = (split_k == 1) ? y_out : nullptr;
             switch (bits) {
                 case 2: exl3_moe_mma_grouped_m64_prerot_k<2><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit); break;
