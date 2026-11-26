@@ -348,6 +348,7 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
     let tok_path = cli.model.join("tokenizer.json");
     let tok = Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
     let eos = eng.cfg.eos_token_id;
+    let think_close_id = tok.token_to_id("</think>").map(|id| id as i32);
 
     let mut api_keys = Vec::new();
     if let Some(ref k) = cli.api_key {
@@ -428,10 +429,16 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
             let mut gen_ids: Vec<u32> = Vec::new();
             let mut prev_str = String::new();
             let mut finish_reason = "length";
+            let mut closed_think = !job.enable_thinking;
+            let mut cycle_start = 0usize;
             while gen_ids.len() < job.max_tokens && eng.pos + 1 < eng.max_ctx {
                 if next_tok == eos || job.tx.is_closed() {
                     finish_reason = "stop";
                     break;
+                }
+                if think_close_id == Some(next_tok) && !closed_think {
+                    closed_think = true;
+                    cycle_start = gen_ids.len() + 1;
                 }
                 gen_ids.push(next_tok as u32);
                 m_worker.generated_tokens.fetch_add(1, Ordering::Relaxed);
@@ -465,6 +472,10 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                                 stopped = true;
                                 break;
                             }
+                            if think_close_id == Some(a) && !closed_think {
+                                closed_think = true;
+                                cycle_start = gen_ids.len() + 1;
+                            }
                             gen_ids.push(a as u32);
                             m_worker.generated_tokens.fetch_add(1, Ordering::Relaxed);
                             history.push(a);
@@ -480,7 +491,19 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
                                 }
                             }
                         }
-                        if stopped || rad_http::detect_degenerate_cycle(&gen_ids) {
+                        if stopped {
+                            finish_reason = "stop";
+                            break;
+                        }
+                        if rad_http::detect_degenerate_cycle(&gen_ids[cycle_start..]) {
+                            if !closed_think {
+                                if let Some(tc_id) = think_close_id {
+                                    closed_think = true;
+                                    cycle_start = gen_ids.len() + 1;
+                                    next_tok = tc_id;
+                                    continue;
+                                }
+                            }
                             finish_reason = "stop";
                             break;
                         }

@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 static REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
+static TC_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub struct ServerState {
     pub model_name: String,
@@ -31,6 +32,7 @@ pub struct ServerState {
 pub struct ServeJob {
     pub prompt: String,
     pub max_tokens: usize,
+    pub enable_thinking: bool,
     pub tx: mpsc::UnboundedSender<ServeEvent>,
 }
 
@@ -83,6 +85,19 @@ async fn models(State(st): State<Arc<ServerState>>, headers: HeaderMap) -> Respo
     .into_response()
 }
 
+fn render_tools_block(ts: &[Value]) -> String {
+    let mut s = String::from(
+        "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n",
+    );
+    for t in ts {
+        let schema = t.get("function").unwrap_or(t);
+        s.push_str(&schema.to_string());
+        s.push('\n');
+    }
+    s.push_str("\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n");
+    s
+}
+
 pub fn format_dsv41_prompt(
     messages: &[Value],
     tools: Option<&[Value]>,
@@ -90,111 +105,257 @@ pub fn format_dsv41_prompt(
     reasoning_effort: u32,
 ) -> String {
     let effort = reasoning_effort.clamp(1, 100);
-    let mut out = format!(
-        "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: {effort} (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
-    );
-    let mut sys_text = String::new();
+    let has_tools = tools.map(|t| !t.is_empty()).unwrap_or(false);
+    let drop_thinking = !has_tools;
+
+    struct NormMsg {
+        role: String,
+        parts: Vec<String>,
+        reasoning_content: Option<String>,
+        tool_calls: Option<Vec<Value>>,
+    }
+
+    let mut norm: Vec<NormMsg> = Vec::new();
     for m in messages {
-        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        if role == "system" || role == "developer" {
-            let c = extract_content_str(m);
-            if !c.is_empty() {
-                if !sys_text.is_empty() {
-                    sys_text.push('\n');
+        let role_raw = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let role = if role_raw == "developer" { "system" } else { role_raw };
+        if role == "user" || role == "tool" {
+            let part = if role == "tool" {
+                format!("<tool_result>{}</tool_result>", extract_content_str(m))
+            } else {
+                extract_content_str(m)
+            };
+            if let Some(last) = norm.last_mut() {
+                if last.role == "user" {
+                    last.parts.push(part);
+                    continue;
                 }
-                sys_text.push_str(&c);
             }
+            norm.push(NormMsg {
+                role: "user".to_string(),
+                parts: vec![part],
+                reasoning_content: None,
+                tool_calls: None,
+            });
+        } else {
+            let rc = m
+                .get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let tcs = m
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .filter(|a| !a.is_empty())
+                .cloned();
+            norm.push(NormMsg {
+                role: role.to_string(),
+                parts: vec![extract_content_str(m)],
+                reasoning_content: rc,
+                tool_calls: tcs,
+            });
         }
     }
-    if let Some(ts) = tools {
-        if !ts.is_empty() {
-            if !sys_text.is_empty() {
-                sys_text.push_str("\n\n");
-            }
-            sys_text.push_str("## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\n### Available Tool Schemas\n\n");
-            for t in ts {
-                let schema = t.get("function").unwrap_or(t);
-                sys_text.push_str(&schema.to_string());
-                sys_text.push('\n');
-            }
+
+    let mut last_user: isize = -1;
+    for (idx, m) in norm.iter().enumerate() {
+        if m.role == "user" || (m.role == "system" && idx > 0) {
+            last_user = idx as isize;
         }
     }
-    if !sys_text.is_empty() {
-        out.push_str(&sys_text);
-    }
-    let mut prev_user = false;
-    for m in messages {
-        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-        match role {
-            "system" | "developer" => {}
+
+    let tools_tmpl = tools.filter(|t| !t.is_empty()).map(render_tools_block);
+    let mut out = String::from("<｜begin▁of▁sentence｜>");
+    let total = norm.len();
+
+    for (idx, m) in norm.iter().enumerate() {
+        if idx == 0 && (enable_thinking || m.role == "system") {
+            out.push_str("<｜System｜>");
+        }
+        if idx == 0 && enable_thinking {
+            out.push_str(&format!(
+                "Reasoning Effort: {effort} (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+            ));
+        }
+
+        match m.role.as_str() {
+            "system" => {
+                if idx > 0 {
+                    out.push_str("<｜System｜>");
+                }
+                if let Some(t) = m.parts.first() {
+                    out.push_str(t);
+                }
+                if idx == 0 {
+                    if let Some(ref tt) = tools_tmpl {
+                        out.push_str("\n\n");
+                        out.push_str(tt);
+                    }
+                }
+            }
             "user" => {
-                if !prev_user {
-                    out.push_str("<｜User｜>");
-                    prev_user = true;
+                if idx == 0 {
+                    if let Some(ref tt) = tools_tmpl {
+                        if !enable_thinking {
+                            out.push_str("<｜System｜>");
+                        }
+                        out.push_str(tt);
+                    }
                 }
-                out.push_str(&extract_content_str(m));
+                out.push_str("<｜User｜>");
+                out.push_str(&m.parts.join("\n\n"));
             }
-            "tool" => {
-                if !prev_user {
-                    out.push_str("<｜User｜>");
-                    prev_user = true;
+            "latest_reminder" => {
+                out.push_str("<｜latest_reminder｜>");
+                if let Some(t) = m.parts.first() {
+                    out.push_str(t);
                 }
-                out.push_str("<tool_result>");
-                out.push_str(&extract_content_str(m));
-                out.push_str("</tool_result>");
             }
             "assistant" => {
-                prev_user = false;
-                out.push_str("<｜Assistant｜>");
-                if let Some(rc) = m.get("reasoning_content").and_then(|v| v.as_str()) {
-                    if !rc.is_empty() {
-                        out.push_str("<think>");
+                if enable_thinking && (!drop_thinking || (idx as isize) > last_user) {
+                    if let Some(ref rc) = m.reasoning_content {
                         out.push_str(rc);
-                        out.push_str("</think>");
-                    } else if !enable_thinking {
-                        out.push_str("</think>");
                     }
-                } else if !enable_thinking {
                     out.push_str("</think>");
                 }
-                out.push_str(&extract_content_str(m));
-                if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
-                    if !tcs.is_empty() {
-                        out.push_str("\n\n<｜DSML｜ calls>\n");
-                        for tc in tcs {
-                            let fn_obj = tc.get("function").unwrap_or(tc);
-                            let name = fn_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            out.push_str(&format!("<｜DSML｜ invoke name=\"{name}\">\n"));
-                            let args_val = match fn_obj.get("arguments") {
-                                Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::String(s.clone())),
-                                Some(v) => v.clone(),
-                                None => json!({}),
-                            };
-                            if let Some(obj) = args_val.as_object() {
-                                for (k, v) in obj {
-                                    let (is_str, val_str) = match v {
-                                        Value::String(s) => ("true", s.clone()),
-                                        other => ("false", other.to_string()),
-                                    };
-                                    out.push_str(&format!("<｜DSML｜ parameter name=\"{k}\" string=\"{is_str}\">{val_str}</｜DSML｜ parameter>\n"));
+                if let Some(t) = m.parts.first() {
+                    out.push_str(t);
+                }
+                if let Some(ref tcs) = m.tool_calls {
+                    out.push_str("\n\n<｜DSML｜ calls>\n");
+                    for (ti, tc) in tcs.iter().enumerate() {
+                        let fn_obj = tc.get("function").unwrap_or(tc);
+                        let name = fn_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        out.push_str(&format!("<｜DSML｜ invoke name=\"{name}\">\n"));
+                        let args_val = match fn_obj.get("arguments") {
+                            Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::String(s.clone())),
+                            Some(v) => v.clone(),
+                            None => json!({}),
+                        };
+                        if let Some(obj) = args_val.as_object() {
+                            let n_k = obj.len();
+                            for (ki, (k, v)) in obj.iter().enumerate() {
+                                let (is_str, val_str) = match v {
+                                    Value::String(s) => ("true", s.clone()),
+                                    other => ("false", other.to_string()),
+                                };
+                                out.push_str(&format!("<｜DSML｜ parameter name=\"{k}\" string=\"{is_str}\">{val_str}</｜DSML｜ parameter>"));
+                                if ki + 1 < n_k {
+                                    out.push('\n');
                                 }
                             }
-                            out.push_str("</｜DSML｜ invoke>\n");
+                        } else if let Some(s) = args_val.as_str() {
+                            out.push_str(&format!("<｜DSML｜ parameter name=\"arguments\" string=\"true\">{s}</｜DSML｜ parameter>"));
                         }
-                        out.push_str("</｜DSML｜ calls>");
+                        out.push_str("\n</｜DSML｜ invoke>");
+                        if ti + 1 < tcs.len() {
+                            out.push('\n');
+                        }
                     }
+                    out.push_str("\n</｜DSML｜ calls>");
                 }
                 out.push_str("<｜end▁of▁sentence｜>");
             }
             _ => {}
         }
+
+        let is_last = idx + 1 == total;
+        let next_is_asst = !is_last && matches!(norm[idx + 1].role.as_str(), "assistant" | "latest_reminder");
+        if is_last || next_is_asst {
+            if m.role == "user" || (m.role == "system" && idx > 0) {
+                out.push_str("<｜Assistant｜>");
+                if enable_thinking && (!drop_thinking || (idx as isize) >= last_user) {
+                    out.push_str("<think>");
+                } else {
+                    out.push_str("</think>");
+                }
+            }
+        }
     }
-    if enable_thinking {
-        out.push_str("<｜Assistant｜><think>");
-    } else {
-        out.push_str("<｜Assistant｜></think>");
+
+    if total == 0 {
+        out.push_str("<｜Assistant｜>");
+        if enable_thinking {
+            out.push_str("<think>");
+        } else {
+            out.push_str("</think>");
+        }
     }
     out
+}
+
+fn extract_xml_attr(attrs: &str, key: &str) -> Option<String> {
+    let bytes = attrs.as_bytes();
+    let kbytes = key.as_bytes();
+    let mut i = 0usize;
+    while i + kbytes.len() + 2 <= bytes.len() {
+        if &bytes[i..i + kbytes.len()] == kbytes {
+            let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            let mut j = i + kbytes.len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if prev_ok && j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                    let quote = bytes[j];
+                    let start = j + 1;
+                    if let Some(rel_end) = attrs[start..].find(quote as char) {
+                        return Some(attrs[start..start + rel_end].to_string());
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_dsml_tag(haystack: &str, tag_names: &[&str]) -> Option<(usize, usize, String)> {
+    let prefix = "<｜DSML｜";
+    let mut off = 0usize;
+    while let Some(rel) = haystack[off..].find(prefix) {
+        let pos = off + rel;
+        let after_p = &haystack[pos + prefix.len()..];
+        let trimmed = after_p.trim_start();
+        let ws_len = after_p.len() - trimmed.len();
+        for &tn in tag_names {
+            if let Some(rem) = trimmed.strip_prefix(tn) {
+                let next_ok = rem.is_empty()
+                    || rem.starts_with('>')
+                    || rem.starts_with('/')
+                    || rem.chars().next().map(|c| c.is_whitespace()).unwrap_or(false);
+                if next_ok {
+                    let head_end = pos + prefix.len() + ws_len + tn.len();
+                    return Some((pos, head_end, tn.to_string()));
+                }
+            }
+        }
+        off = pos + prefix.len();
+    }
+    None
+}
+
+fn find_dsml_close(haystack: &str, tag_names: &[&str]) -> Option<(usize, usize)> {
+    let prefix = "</｜DSML｜";
+    let mut off = 0usize;
+    while let Some(rel) = haystack[off..].find(prefix) {
+        let pos = off + rel;
+        let after_p = &haystack[pos + prefix.len()..];
+        let trimmed = after_p.trim_start();
+        for &tn in tag_names {
+            if let Some(rem) = trimmed.strip_prefix(tn) {
+                if let Some(gt) = rem.find('>') {
+                    let end = pos + prefix.len() + (after_p.len() - trimmed.len()) + tn.len() + gt + 1;
+                    return Some((pos, end));
+                }
+            }
+        }
+        off = pos + prefix.len();
+    }
+    None
 }
 
 pub fn split_think_and_dsml(raw: &str) -> (Option<String>, String, Vec<Value>) {
@@ -205,62 +366,92 @@ pub fn split_think_and_dsml(raw: &str) -> (Option<String>, String, Vec<Value>) {
     } else {
         (None, raw)
     };
-    let dsml_open = "<｜DSML｜ calls>";
-    let dsml_close = "</｜DSML｜ calls>";
+    let outer = find_dsml_tag(rest, &["calls", "function_calls"]);
+    let direct_inv = if outer.is_none() {
+        find_dsml_tag(rest, &["invoke", "call"])
+    } else {
+        None
+    };
     let mut tool_calls = Vec::new();
-    let content = if let Some(s) = rest.find(dsml_open) {
-        let before = rest[..s].trim().to_string();
-        let body = &rest[s + dsml_open.len()..];
-        let block = body.find(dsml_close).map(|e| &body[..e]).unwrap_or(body);
-        let inv_open = "<｜DSML｜ invoke name=\"";
-        let inv_close = "</｜DSML｜ invoke>";
+    let content = if outer.is_some() || direct_inv.is_some() {
+        let (cut_pos, block) = if let Some((s, head_end, _)) = outer {
+            let after_head = &rest[head_end..];
+            let body = if let Some(gt) = after_head.find('>') {
+                &after_head[gt + 1..]
+            } else {
+                after_head
+            };
+            let blk = find_dsml_close(body, &["calls", "function_calls"])
+                .map(|(e, _)| &body[..e])
+                .unwrap_or(body);
+            (s, blk)
+        } else {
+            let (s, _, _) = direct_inv.unwrap();
+            (s, &rest[s..])
+        };
+        let before = rest[..cut_pos].trim().to_string();
         let mut cursor = block;
-        let mut idx = 0usize;
-        while let Some(i_start) = cursor.find(inv_open) {
-            let after_name = &cursor[i_start + inv_open.len()..];
-            let Some(q_end) = after_name.find("\">") else { break };
-            let fn_name = after_name[..q_end].to_string();
-            let inv_body_start = &after_name[q_end + 2..];
-            let (inv_body, next_cur) = if let Some(ic) = inv_body_start.find(inv_close) {
-                (&inv_body_start[..ic], &inv_body_start[ic + inv_close.len()..])
+        while let Some((_, head_end, _)) = find_dsml_tag(cursor, &["invoke", "call"]) {
+            let after_head = &cursor[head_end..];
+            let Some(gt) = after_head.find('>') else { break };
+            let attrs = &after_head[..gt];
+            let Some(fn_name) = extract_xml_attr(attrs, "name") else {
+                cursor = &after_head[gt + 1..];
+                continue;
+            };
+            let inv_body_start = &after_head[gt + 1..];
+            let (inv_body, next_cur) = if let Some((ic, ie)) = find_dsml_close(inv_body_start, &["invoke", "call"]) {
+                (&inv_body_start[..ic], &inv_body_start[ie..])
             } else {
                 (inv_body_start, "")
             };
             let mut args_map = serde_json::Map::new();
-            let p_open = "<｜DSML｜ parameter name=\"";
-            let p_close = "</｜DSML｜ parameter>";
             let mut pcur = inv_body;
-            while let Some(ps) = pcur.find(p_open) {
-                let pa = &pcur[ps + p_open.len()..];
-                let Some(pe) = pa.find('"') else { break };
-                let pname = pa[..pe].to_string();
-                let Some(gt) = pa.find('>') else { break };
-                let attr = &pa[..gt];
-                let is_str = !attr.contains("string=\"false\"");
-                let val_start = &pa[gt + 1..];
-                let (vraw, np) = if let Some(pc) = val_start.find(p_close) {
-                    (&val_start[..pc], &val_start[pc + p_close.len()..])
+            while let Some((_, phead_end, _)) = find_dsml_tag(pcur, &["parameter", "param"]) {
+                let pa = &pcur[phead_end..];
+                let Some(pgt) = pa.find('>') else { break };
+                let pattrs = &pa[..pgt];
+                let Some(pname) = extract_xml_attr(pattrs, "name") else {
+                    pcur = &pa[pgt + 1..];
+                    continue;
+                };
+                let is_str = extract_xml_attr(pattrs, "string")
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
+                let val_start = &pa[pgt + 1..];
+                let (vraw, np) = if let Some((pc, pe)) = find_dsml_close(val_start, &["parameter", "param"]) {
+                    (&val_start[..pc], &val_start[pe..])
                 } else {
                     (val_start, "")
                 };
                 let jval = if is_str {
-                    Value::String(vraw.to_string())
+                    let trimmed = vraw.trim();
+                    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+                        serde_json::from_str::<String>(trimmed)
+                            .map(Value::String)
+                            .unwrap_or_else(|_| Value::String(vraw.to_string()))
+                    } else {
+                        Value::String(vraw.to_string())
+                    }
                 } else {
                     serde_json::from_str::<Value>(vraw.trim()).unwrap_or_else(|_| Value::String(vraw.to_string()))
                 };
                 args_map.insert(pname, jval);
                 pcur = np;
             }
+            let tc_id = TC_COUNTER.fetch_add(1, Ordering::Relaxed);
             tool_calls.push(json!({
-                "id": format!("call_rad_{idx}"),
+                "id": format!("call_rad_{tc_id}"),
                 "type": "function",
                 "function": {
                     "name": fn_name,
                     "arguments": Value::Object(args_map).to_string()
                 }
             }));
-            idx += 1;
             cursor = next_cur;
+        }
+        if tool_calls.is_empty() {
+            eprintln!("[rad-dsv41] unparsed DSML block: {:?}", &block[..block.len().min(300)]);
         }
         before
     } else {
@@ -298,7 +489,7 @@ async fn chat_completions(
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     st.metrics.requests_queued.fetch_add(1, Ordering::Relaxed);
-    if st.job_tx.send(ServeJob { prompt, max_tokens, tx }).is_err() {
+    if st.job_tx.send(ServeJob { prompt, max_tokens, enable_thinking, tx }).is_err() {
         st.metrics.requests_queued.fetch_sub(1, Ordering::Relaxed);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "engine closed"}))).into_response();
     }
@@ -310,6 +501,48 @@ async fn chat_completions(
             let mut in_think = enable_thinking;
             let mut raw_acc = String::new();
             let mut in_dsml = false;
+            let mut pending = String::new();
+            let emit_content = |txt: &str, sent_role: &mut bool, sse_tx: &mpsc::UnboundedSender<Result<Event, Infallible>>, req_id: &str, created: u64, model_id: &str| -> bool {
+                if txt.is_empty() {
+                    return true;
+                }
+                let d_obj = if !*sent_role {
+                    *sent_role = true;
+                    json!({"role": "assistant", "content": txt})
+                } else {
+                    json!({"content": txt})
+                };
+                let chunk = json!({
+                    "id": req_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
+                    "choices": [{"index": 0, "delta": d_obj, "finish_reason": null}]
+                });
+                sse_tx.send(Ok(Event::default().data(chunk.to_string()))).is_ok()
+            };
+            let push_content = |s: &str, pending: &mut String, in_dsml: &mut bool, sent_role: &mut bool, sse_tx: &mpsc::UnboundedSender<Result<Event, Infallible>>, req_id: &str, created: u64, model_id: &str| -> bool {
+                pending.push_str(s);
+                if let Some(pos) = pending.find("<｜DSML｜") {
+                    let safe = pending[..pos].to_string();
+                    pending.clear();
+                    *in_dsml = true;
+                    return emit_content(&safe, sent_role, sse_tx, req_id, created, model_id);
+                }
+                let marker = "<｜DSML｜";
+                let mut keep = 0usize;
+                for (bi, _) in pending.char_indices() {
+                    let tail = &pending[bi..];
+                    if tail.len() < marker.len() && marker.starts_with(tail) {
+                        keep = tail.len();
+                        break;
+                    }
+                }
+                let flush_len = pending.len() - keep;
+                if flush_len > 0 {
+                    let safe = pending[..flush_len].to_string();
+                    pending.drain(..flush_len);
+                    return emit_content(&safe, sent_role, sse_tx, req_id, created, model_id);
+                }
+                true
+            };
             while let Some(ev) = rx.recv().await {
                 if sse_tx.is_closed() {
                     break;
@@ -339,17 +572,9 @@ async fn chat_completions(
                                     if sse_tx.send(Ok(Event::default().data(chunk.to_string()))).is_err() { return; }
                                 }
                                 if !c_part.is_empty() {
-                                    let d_obj = if !sent_role {
-                                        sent_role = true;
-                                        json!({"role": "assistant", "content": c_part})
-                                    } else {
-                                        json!({"content": c_part})
-                                    };
-                                    let chunk = json!({
-                                        "id": req_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
-                                        "choices": [{"index": 0, "delta": d_obj, "finish_reason": null}]
-                                    });
-                                    if sse_tx.send(Ok(Event::default().data(chunk.to_string()))).is_err() { return; }
+                                    if !push_content(c_part, &mut pending, &mut in_dsml, &mut sent_role, &sse_tx, &req_id, created, &model_id) {
+                                        return;
+                                    }
                                 }
                             } else {
                                 let d_obj = if !sent_role {
@@ -364,23 +589,17 @@ async fn chat_completions(
                                 });
                                 if sse_tx.send(Ok(Event::default().data(chunk.to_string()))).is_err() { return; }
                             }
-                        } else if raw_acc.contains("<｜DSML｜ calls>") {
-                            in_dsml = true;
                         } else {
-                            let d_obj = if !sent_role {
-                                sent_role = true;
-                                json!({"role": "assistant", "content": delta})
-                            } else {
-                                json!({"content": delta})
-                            };
-                            let chunk = json!({
-                                "id": req_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
-                                "choices": [{"index": 0, "delta": d_obj, "finish_reason": null}]
-                            });
-                            if sse_tx.send(Ok(Event::default().data(chunk.to_string()))).is_err() { return; }
+                            if !push_content(&delta, &mut pending, &mut in_dsml, &mut sent_role, &sse_tx, &req_id, created, &model_id) {
+                                return;
+                            }
                         }
                     }
                     ServeEvent::Done { finish_reason, .. } => {
+                        if !in_dsml && !pending.is_empty() {
+                            let rem = std::mem::take(&mut pending);
+                            let _ = emit_content(&rem, &mut sent_role, &sse_tx, &req_id, created, &model_id);
+                        }
                         let (_, _, tool_calls) = split_think_and_dsml(&raw_acc);
                         let mut fr = finish_reason;
                         if !tool_calls.is_empty() {
@@ -395,9 +614,14 @@ async fn chat_completions(
                                     tc
                                 })
                                 .collect();
+                            let d_obj = if !sent_role {
+                                json!({"role": "assistant", "tool_calls": tc_deltas})
+                            } else {
+                                json!({"tool_calls": tc_deltas})
+                            };
                             let chunk = json!({
                                 "id": req_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
-                                "choices": [{"index": 0, "delta": {"tool_calls": tc_deltas}, "finish_reason": null}]
+                                "choices": [{"index": 0, "delta": d_obj, "finish_reason": null}]
                             });
                             let _ = sse_tx.send(Ok(Event::default().data(chunk.to_string())));
                         }
@@ -492,7 +716,7 @@ mod tests {
 
     #[test]
     fn parses_think_and_dsml_tool_calls() {
-        let raw = "Let me check.\n</think>I will run it.\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"exec\">\n<｜DSML｜ parameter name=\"cmd\" string=\"true\">ls -la</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"timeout\" string=\"false\">30</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let raw = "Let me check.\n</think>I will run it.\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"exec\">\n<｜DSML｜ parameter name=\"cmd\" string=\"true\">\"ls -la\"</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"timeout\" string=\"false\">30</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
         let (rc, content, tcs) = split_think_and_dsml(raw);
         assert_eq!(rc.as_deref(), Some("Let me check."));
         assert_eq!(content, "I will run it.");

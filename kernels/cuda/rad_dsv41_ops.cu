@@ -802,24 +802,14 @@ __device__ __forceinline__ void mqa_mma_m16n8k16_f32(
     );
 }
 
-__device__ __forceinline__ void mqa_cp_async_16(void* smem_ptr, const void* gmem_ptr, bool pred) {
-    if (pred) {
-        uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem_addr), "l"(gmem_ptr) : "memory");
-    } else {
-        *reinterpret_cast<uint4*>(smem_ptr) = make_uint4(0u, 0u, 0u, 0u);
-    }
-}
-
-template <int NH_BLK, int Q_TOK>
-__global__ __launch_bounds__(256 * Q_TOK)
+template <int NH_BLK>
+__global__ __launch_bounds__(256)
 void mqa_flash_mma_f16_k(
     const half* __restrict__ q,
     const half* __restrict__ k_cache,
     const half* __restrict__ comp_kv,
     const float* __restrict__ attn_sink,
     half* __restrict__ out,
-    int M,
     int n_heads,
     int start_pos,
     int max_ctx,
@@ -828,44 +818,30 @@ void mqa_flash_mma_f16_k(
     float scale
 ) {
     int h0 = blockIdx.x * (16 * NH_BLK);
-    int mr0 = blockIdx.y * Q_TOK;
+    int mr = blockIdx.y;
     int t = threadIdx.x;
-    int wg = (Q_TOK == 1) ? 0 : (t >> 8);
-    int lt = t & 255;
-    int warp = lt >> 5;
-    int lane = lt & 31;
+    int warp = t >> 5;
+    int lane = t & 31;
     int group_id = lane >> 2;
     int tid = lane & 3;
-    int mr = mr0 + wg;
-    bool active_wg = (mr < M);
-    int mr_safe = active_wg ? mr : (M - 1);
 
-    int seq_len = start_pos + mr_safe + 1;
+    int seq_len = start_pos + mr + 1;
     if (seq_len > max_ctx) seq_len = max_ctx;
     int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
 
-    int mr_last = mr0 + Q_TOK - 1;
-    if (mr_last >= M) mr_last = M - 1;
-    int seq_len0 = start_pos + mr0 + 1;
-    if (seq_len0 > max_ctx) seq_len0 = max_ctx;
-    int p_min = (sliding_window > 0 && seq_len0 > sliding_window) ? (seq_len0 - sliding_window) : 0;
-    int p_max = start_pos + mr_last + 1;
-    if (p_max > max_ctx) p_max = max_ctx;
-
-    extern __shared__ char smem_raw[];
-    half (*s_kv_buf)[16][520] = reinterpret_cast<half (*)[16][520]>(smem_raw);
-    float (*s_sp)[NH_BLK][8][16][16] = reinterpret_cast<float (*)[NH_BLK][8][16][16]>(smem_raw + 33280);
-    __shared__ half s_p[Q_TOK][NH_BLK][16][16];
-    __shared__ float s_m[Q_TOK][NH_BLK][16];
-    __shared__ float s_l[Q_TOK][NH_BLK][16];
-    __shared__ float s_alpha[Q_TOK][NH_BLK][16];
+    __shared__ half s_kv[16][520];
+    __shared__ float s_sp[NH_BLK][8][16][16];
+    __shared__ half s_p[NH_BLK][16][16];
+    __shared__ float s_m[NH_BLK][16];
+    __shared__ float s_l[NH_BLK][16];
+    __shared__ float s_alpha[NH_BLK][16];
 
     uint32_t qa0[NH_BLK][4], qa1[NH_BLK][4], qa2[NH_BLK][4], qa3[NH_BLK][4];
     int k_base = warp * 64;
     #pragma unroll
     for (int hg = 0; hg < NH_BLK; ++hg) {
-        const half* qr0 = q + ((size_t)mr_safe * n_heads + h0 + hg * 16 + group_id) * 512 + k_base;
-        const half* qr1 = q + ((size_t)mr_safe * n_heads + h0 + hg * 16 + group_id + 8) * 512 + k_base;
+        const half* qr0 = q + ((size_t)mr * n_heads + h0 + hg * 16 + group_id) * 512 + k_base;
+        const half* qr1 = q + ((size_t)mr * n_heads + h0 + hg * 16 + group_id + 8) * 512 + k_base;
         #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
             int c0 = ks * 16 + tid * 2;
@@ -874,9 +850,9 @@ void mqa_flash_mma_f16_k(
             qa2[hg][ks] = __ldg(reinterpret_cast<const uint32_t*>(qr0 + c0 + 8));
             qa3[hg][ks] = __ldg(reinterpret_cast<const uint32_t*>(qr1 + c0 + 8));
         }
-        if (lt < 16) {
-            s_m[wg][hg][lt] = attn_sink ? attn_sink[h0 + hg * 16 + lt] : -1e30f;
-            s_l[wg][hg][lt] = attn_sink ? 1.0f : 0.0f;
+        if (t < 16) {
+            s_m[hg][t] = attn_sink ? attn_sink[h0 + hg * 16 + t] : -1e30f;
+            s_l[hg][t] = attn_sink ? 1.0f : 0.0f;
         }
     }
     __syncthreads();
@@ -890,8 +866,7 @@ void mqa_flash_mma_f16_k(
         }
     }
 
-    auto process_tile = [&](int buf, int tile_base, int tile_len, int v_beg, int v_end) {
-        half (*s_kv)[520] = s_kv_buf[buf];
+    auto process_tile = [&](int tile_len) {
         float s00[NH_BLK], s01[NH_BLK], s02[NH_BLK], s03[NH_BLK];
         float s10[NH_BLK], s11[NH_BLK], s12[NH_BLK], s13[NH_BLK];
         #pragma unroll
@@ -915,27 +890,25 @@ void mqa_flash_mma_f16_k(
         }
         #pragma unroll
         for (int hg = 0; hg < NH_BLK; ++hg) {
-            s_sp[wg][hg][warp][group_id][tid * 2] = s00[hg];
-            s_sp[wg][hg][warp][group_id][tid * 2 + 1] = s01[hg];
-            s_sp[wg][hg][warp][group_id + 8][tid * 2] = s02[hg];
-            s_sp[wg][hg][warp][group_id + 8][tid * 2 + 1] = s03[hg];
-            s_sp[wg][hg][warp][group_id][8 + tid * 2] = s10[hg];
-            s_sp[wg][hg][warp][group_id][8 + tid * 2 + 1] = s11[hg];
-            s_sp[wg][hg][warp][group_id + 8][8 + tid * 2] = s12[hg];
-            s_sp[wg][hg][warp][group_id + 8][8 + tid * 2 + 1] = s13[hg];
+            s_sp[hg][warp][group_id][tid * 2] = s00[hg];
+            s_sp[hg][warp][group_id][tid * 2 + 1] = s01[hg];
+            s_sp[hg][warp][group_id + 8][tid * 2] = s02[hg];
+            s_sp[hg][warp][group_id + 8][tid * 2 + 1] = s03[hg];
+            s_sp[hg][warp][group_id][8 + tid * 2] = s10[hg];
+            s_sp[hg][warp][group_id][8 + tid * 2 + 1] = s11[hg];
+            s_sp[hg][warp][group_id + 8][8 + tid * 2] = s12[hg];
+            s_sp[hg][warp][group_id + 8][8 + tid * 2 + 1] = s13[hg];
         }
         __syncthreads();
 
-        int r = lt >> 4;
-        int c = lt & 15;
-        int pos_c = tile_base + c;
-        bool valid_c = (c < tile_len) && (pos_c >= v_beg) && (pos_c < v_end);
+        int r = t >> 4;
+        int c = t & 15;
         #pragma unroll
         for (int hg = 0; hg < NH_BLK; ++hg) {
             float sc = -1e30f;
-            if (valid_c) {
-                float sum = s_sp[wg][hg][0][r][c] + s_sp[wg][hg][1][r][c] + s_sp[wg][hg][2][r][c] + s_sp[wg][hg][3][r][c]
-                          + s_sp[wg][hg][4][r][c] + s_sp[wg][hg][5][r][c] + s_sp[wg][hg][6][r][c] + s_sp[wg][hg][7][r][c];
+            if (c < tile_len) {
+                float sum = s_sp[hg][0][r][c] + s_sp[hg][1][r][c] + s_sp[hg][2][r][c] + s_sp[hg][3][r][c]
+                          + s_sp[hg][4][r][c] + s_sp[hg][5][r][c] + s_sp[hg][6][r][c] + s_sp[hg][7][r][c];
                 sc = sum * scale;
             }
             float rmax = sc;
@@ -943,20 +916,20 @@ void mqa_flash_mma_f16_k(
             rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 4));
             rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 2));
             rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 1));
-            float old_m = s_m[wg][hg][r];
+            float old_m = s_m[hg][r];
             float new_m = fmaxf(old_m, rmax);
             float alpha = exp2f((old_m - new_m) * 1.44269504f);
-            float p = valid_c ? exp2f((sc - new_m) * 1.44269504f) : 0.0f;
-            s_p[wg][hg][r][c] = __float2half(p);
+            float p = (c < tile_len) ? exp2f((sc - new_m) * 1.44269504f) : 0.0f;
+            s_p[hg][r][c] = __float2half(p);
             float rsum = p;
             rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 8);
             rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 4);
             rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 2);
             rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 1);
             if (c == 0) {
-                s_l[wg][hg][r] = s_l[wg][hg][r] * alpha + rsum;
-                s_m[wg][hg][r] = new_m;
-                s_alpha[wg][hg][r] = alpha;
+                s_l[hg][r] = s_l[hg][r] * alpha + rsum;
+                s_m[hg][r] = new_m;
+                s_alpha[hg][r] = alpha;
             }
         }
         __syncthreads();
@@ -965,12 +938,12 @@ void mqa_flash_mma_f16_k(
         uint32_t pa0[NH_BLK], pa1[NH_BLK], pa2[NH_BLK], pa3[NH_BLK];
         #pragma unroll
         for (int hg = 0; hg < NH_BLK; ++hg) {
-            a0_sc[hg] = s_alpha[wg][hg][group_id];
-            a1_sc[hg] = s_alpha[wg][hg][group_id + 8];
-            pa0[hg] = *reinterpret_cast<const uint32_t*>(&s_p[wg][hg][group_id][tid * 2]);
-            pa1[hg] = *reinterpret_cast<const uint32_t*>(&s_p[wg][hg][group_id + 8][tid * 2]);
-            pa2[hg] = *reinterpret_cast<const uint32_t*>(&s_p[wg][hg][group_id][tid * 2 + 8]);
-            pa3[hg] = *reinterpret_cast<const uint32_t*>(&s_p[wg][hg][group_id + 8][tid * 2 + 8]);
+            a0_sc[hg] = s_alpha[hg][group_id];
+            a1_sc[hg] = s_alpha[hg][group_id + 8];
+            pa0[hg] = *reinterpret_cast<const uint32_t*>(&s_p[hg][group_id][tid * 2]);
+            pa1[hg] = *reinterpret_cast<const uint32_t*>(&s_p[hg][group_id + 8][tid * 2]);
+            pa2[hg] = *reinterpret_cast<const uint32_t*>(&s_p[hg][group_id][tid * 2 + 8]);
+            pa3[hg] = *reinterpret_cast<const uint32_t*>(&s_p[hg][group_id + 8][tid * 2 + 8]);
         }
         int col_w = warp * 64;
         #pragma unroll
@@ -989,103 +962,94 @@ void mqa_flash_mma_f16_k(
                 mqa_mma_m16n8k16_f32(o0[hg][nb], o1[hg][nb], o2[hg][nb], o3[hg][nb], pa0[hg], pa1[hg], pa2[hg], pa3[hg], b0, b1);
             }
         }
+        __syncthreads();
     };
 
-    constexpr int LD_ITERS = 4 / Q_TOK;
-    constexpr int LD_STRIDE = 256 * Q_TOK;
-
-    if (p_min < p_max) {
-        int buf = 0;
-        int tile_len0 = p_max - p_min;
+    if (p_start < seq_len) {
+        int tile_len0 = seq_len - p_start;
         if (tile_len0 > 16) tile_len0 = 16;
         int n_u4_0 = tile_len0 * 64;
-        const uint4* src0 = reinterpret_cast<const uint4*>(k_cache + (size_t)p_min * 512);
+        const uint4* src0 = reinterpret_cast<const uint4*>(k_cache + (size_t)p_start * 512);
         #pragma unroll
-        for (int k = 0; k < LD_ITERS; ++k) {
-            int i = t + k * LD_STRIDE;
-            mqa_cp_async_16(&reinterpret_cast<uint4*>(s_kv_buf[0][i >> 6])[i & 63], src0 + i, i < n_u4_0);
+        for (int k = 0; k < 4; ++k) {
+            int i = t + k * 256;
+            reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = (i < n_u4_0) ? __ldg(src0 + i) : make_uint4(0u, 0u, 0u, 0u);
         }
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
-        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
         __syncthreads();
-        for (int p0 = p_min; p0 < p_max; p0 += 16) {
-            int tile_len = p_max - p0;
+        for (int p0 = p_start; p0 < seq_len; p0 += 16) {
+            int tile_len = seq_len - p0;
             if (tile_len > 16) tile_len = 16;
-            bool has_next = (p0 + 16 < p_max);
-            int nbuf = buf ^ 1;
+            uint4 nxt[4];
+            bool has_next = (p0 + 16 < seq_len);
             if (has_next) {
-                int nlen = p_max - (p0 + 16);
+                int nlen = seq_len - (p0 + 16);
                 if (nlen > 16) nlen = 16;
                 int nu4 = nlen * 64;
                 const uint4* nsrc = reinterpret_cast<const uint4*>(k_cache + (size_t)(p0 + 16) * 512);
                 #pragma unroll
-                for (int k = 0; k < LD_ITERS; ++k) {
-                    int i = t + k * LD_STRIDE;
-                    mqa_cp_async_16(&reinterpret_cast<uint4*>(s_kv_buf[nbuf][i >> 6])[i & 63], nsrc + i, i < nu4);
+                for (int k = 0; k < 4; ++k) {
+                    int i = t + k * 256;
+                    nxt[k] = (i < nu4) ? __ldg(nsrc + i) : make_uint4(0u, 0u, 0u, 0u);
                 }
-                asm volatile("cp.async.commit_group;\n" ::: "memory");
             }
-            process_tile(buf, p0, tile_len, p_start, seq_len);
+            process_tile(tile_len);
             if (has_next) {
-                asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    int i = t + k * 256;
+                    reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = nxt[k];
+                }
                 __syncthreads();
-                buf = nbuf;
             }
         }
-        __syncthreads();
     }
 
     if (comp_kv && comp_ratio > 0) {
-        int p_start_last = (sliding_window > 0 && p_max > sliding_window) ? (p_max - sliding_window) : 0;
-        int c_max = p_start_last / comp_ratio;
-        int c_end_wg = p_start / comp_ratio;
-        if (c_max > 0) {
-            int buf = 0;
-            int tile_len0 = (c_max > 16) ? 16 : c_max;
+        int c_end = seq_len / comp_ratio;
+        if (c_end > 0) {
+            int tile_len0 = (c_end > 16) ? 16 : c_end;
             int n_u4_0 = tile_len0 * 64;
             const uint4* src0 = reinterpret_cast<const uint4*>(comp_kv);
             #pragma unroll
-            for (int k = 0; k < LD_ITERS; ++k) {
-                int i = t + k * LD_STRIDE;
-                mqa_cp_async_16(&reinterpret_cast<uint4*>(s_kv_buf[0][i >> 6])[i & 63], src0 + i, i < n_u4_0);
+            for (int k = 0; k < 4; ++k) {
+                int i = t + k * 256;
+                reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = (i < n_u4_0) ? __ldg(src0 + i) : make_uint4(0u, 0u, 0u, 0u);
             }
-            asm volatile("cp.async.commit_group;\n" ::: "memory");
-            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
             __syncthreads();
-            for (int c0 = 0; c0 < c_max; c0 += 16) {
-                int tile_len = c_max - c0;
+            for (int c0 = 0; c0 < c_end; c0 += 16) {
+                int tile_len = c_end - c0;
                 if (tile_len > 16) tile_len = 16;
-                bool has_next = (c0 + 16 < c_max);
-                int nbuf = buf ^ 1;
+                uint4 nxt[4];
+                bool has_next = (c0 + 16 < c_end);
                 if (has_next) {
-                    int nlen = c_max - (c0 + 16);
+                    int nlen = c_end - (c0 + 16);
                     if (nlen > 16) nlen = 16;
                     int nu4 = nlen * 64;
                     const uint4* nsrc = reinterpret_cast<const uint4*>(comp_kv + (size_t)(c0 + 16) * 512);
                     #pragma unroll
-                    for (int k = 0; k < LD_ITERS; ++k) {
-                        int i = t + k * LD_STRIDE;
-                        mqa_cp_async_16(&reinterpret_cast<uint4*>(s_kv_buf[nbuf][i >> 6])[i & 63], nsrc + i, i < nu4);
+                    for (int k = 0; k < 4; ++k) {
+                        int i = t + k * 256;
+                        nxt[k] = (i < nu4) ? __ldg(nsrc + i) : make_uint4(0u, 0u, 0u, 0u);
                     }
-                    asm volatile("cp.async.commit_group;\n" ::: "memory");
                 }
-                process_tile(buf, c0, tile_len, 0, c_end_wg);
+                process_tile(tile_len);
                 if (has_next) {
-                    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        int i = t + k * 256;
+                        reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = nxt[k];
+                    }
                     __syncthreads();
-                    buf = nbuf;
                 }
             }
-            __syncthreads();
         }
     }
 
-    if (!active_wg) return;
     int col_w = warp * 64;
     #pragma unroll
     for (int hg = 0; hg < NH_BLK; ++hg) {
-        float inv0 = 1.0f / fmaxf(s_l[wg][hg][group_id], 1e-20f);
-        float inv1 = 1.0f / fmaxf(s_l[wg][hg][group_id + 8], 1e-20f);
+        float inv0 = 1.0f / fmaxf(s_l[hg][group_id], 1e-20f);
+        float inv1 = 1.0f / fmaxf(s_l[hg][group_id + 8], 1e-20f);
         half* oh0 = out + ((size_t)mr * n_heads + h0 + hg * 16 + group_id) * 512 + col_w;
         half* oh1 = out + ((size_t)mr * n_heads + h0 + hg * 16 + group_id + 8) * 512 + col_w;
         #pragma unroll
@@ -1128,7 +1092,7 @@ void mqa_flash_mma16_splitkv_f16_k(
     if (seq_len > max_ctx) seq_len = max_ctx;
     int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
     int raw_len = seq_len - p_start;
-    int c_end = (comp_kv && comp_ratio > 0 && p_start > 0) ? (p_start / comp_ratio) : 0;
+    int c_end = (comp_kv && comp_ratio > 0) ? (seq_len / comp_ratio) : 0;
 
     int raw_tiles = (raw_len + 15) >> 4;
     int comp_tiles = (c_end + 15) >> 4;
@@ -1518,8 +1482,9 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     if (head_dim == 512 && k_cache == v_cache && (n_heads % 16) == 0) {
         int eff_len = start_pos + M;
         if (eff_len > max_ctx) eff_len = max_ctx;
-        if (sliding_window > 0 && eff_len > sliding_window) {
-            eff_len = sliding_window + (comp_kv && comp_ratio > 0 ? (eff_len - sliding_window) / comp_ratio : 0);
+        if (sliding_window > 0) {
+            int raw_len = (eff_len > sliding_window) ? sliding_window : eff_len;
+            eff_len = raw_len + (comp_kv && comp_ratio > 0 ? (eff_len / comp_ratio) : 0);
         }
         int base_ctas = (n_heads / 16) * M;
         if (split_scratch && eff_len >= 1024 && M <= 16 && base_ctas < 48) {
@@ -1540,37 +1505,17 @@ void rad_cuda_mqa_attn_sink_causal_f16(
                 return;
             }
         }
-        if (M >= 64 && (n_heads % 32) == 0) {
-            static bool smem_set22 = false;
-            size_t smem_bytes = 33280 + 2 * 2 * 8 * 16 * 16 * sizeof(float);
-            if (!smem_set22) {
-                cudaFuncSetAttribute(mqa_flash_mma_f16_k<2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-                smem_set22 = true;
-            }
-            dim3 grid(n_heads / 32, (M + 1) / 2);
-            mqa_flash_mma_f16_k<2, 2><<<grid, 512, smem_bytes, stream>>>(
-                q, k_cache, comp_kv, attn_sink, out, M, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
-            );
-            return;
-        }
         if (M >= 16 && (n_heads % 32) == 0) {
-            static bool smem_set21 = false;
-            size_t smem_bytes = 33280 + 2 * 8 * 16 * 16 * sizeof(float);
-            if (!smem_set21) {
-                cudaFuncSetAttribute(mqa_flash_mma_f16_k<2, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-                smem_set21 = true;
-            }
             dim3 grid(n_heads / 32, M);
-            mqa_flash_mma_f16_k<2, 1><<<grid, 256, smem_bytes, stream>>>(
-                q, k_cache, comp_kv, attn_sink, out, M, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
+            mqa_flash_mma_f16_k<2><<<grid, 256, 0, stream>>>(
+                q, k_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
             );
             return;
         }
         if (M >= 16 || (M >= 4 && start_pos + M >= 256)) {
-            size_t smem_bytes = 33280 + 8 * 16 * 16 * sizeof(float);
             dim3 grid(n_heads / 16, M);
-            mqa_flash_mma_f16_k<1, 1><<<grid, 256, smem_bytes, stream>>>(
-                q, k_cache, comp_kv, attn_sink, out, M, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
+            mqa_flash_mma_f16_k<1><<<grid, 256, 0, stream>>>(
+                q, k_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
             );
             return;
         }
