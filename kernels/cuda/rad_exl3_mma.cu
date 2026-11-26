@@ -27,8 +27,8 @@ __device__ __forceinline__ void mma_dq4_mul1(const uint32_t* ptr, int t_offset, 
     int i0 = b0 >> 5;
     int i2 = (b2 - 1) >> 5;
     int s2 = ((i2 + 1) << 5) - b2;
-    uint32_t a = ptr[i0 % WORDS];
-    uint32_t b = ptr[i2 % WORDS];
+    uint32_t a = ptr[(i0 >= WORDS) ? (i0 - WORDS) : i0];
+    uint32_t b = ptr[(i2 >= WORDS) ? (i2 - WORDS) : i2];
     uint32_t w3 = mma_fshift(b, a, s2) & 0xffffu;
     uint32_t w2 = mma_fshift(b, a, s2 + BITS) & 0xffffu;
     uint32_t w1 = mma_fshift(b, a, s2 + BITS * 2) & 0xffffu;
@@ -47,8 +47,8 @@ __device__ __forceinline__ void mma_dq2x2_mul1(const uint32_t* ptr, int t_offset
         int i0 = b0 >> 5;
         int i2 = (b2 - 1) >> 5;
         int s2 = ((i2 + 1) << 5) - b2;
-        uint32_t a = ptr[i0 % WORDS];
-        uint32_t b = ptr[i2 % WORDS];
+        uint32_t a = ptr[(i0 >= WORDS) ? (i0 - WORDS) : i0];
+        uint32_t b = ptr[(i2 >= WORDS) ? (i2 - WORDS) : i2];
         uint32_t w1 = mma_fshift(b, a, s2) & 0xffffu;
         uint32_t w0 = mma_fshift(b, a, s2 + BITS) & 0xffffu;
         half2 d = mma_decode_mul1_2(w0, w1);

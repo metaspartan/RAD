@@ -213,7 +213,7 @@ int rad_rdma_exchange_mapped(void* handle, int n_bytes) {
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.send_flags = IBV_SEND_SIGNALED | ((n_bytes <= 256) ? IBV_SEND_INLINE : 0);
     wr.imm_data = (uint32_t)r->seq;
     wr.wr.rdma.remote_addr = r->remote_addr;
     wr.wr.rdma.rkey = r->remote_rkey;
@@ -231,6 +231,16 @@ int rad_rdma_exchange_mapped(void* handle, int n_bytes) {
     rwr.wr_id = wc.wr_id;
     ibv_post_recv(r->qp, &rwr, &bad_rwr);
     return 0;
+}
+
+void* rad_rdma_send_hptr(void* handle) {
+    RadRdmaCtx* r = (RadRdmaCtx*)handle;
+    return r ? (void*)r->send_buf : NULL;
+}
+
+void* rad_rdma_recv_hptr(void* handle) {
+    RadRdmaCtx* r = (RadRdmaCtx*)handle;
+    return r ? (void*)r->recv_buf : NULL;
 }
 
 void rad_rdma_close(void* handle) {

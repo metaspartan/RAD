@@ -18,6 +18,8 @@ extern "C" {
     fn rad_rdma_connect(handle: *mut c_void, remote_info: *const RadRdmaInfo) -> i32;
     fn rad_rdma_send_dptr(handle: *mut c_void) -> *mut c_void;
     fn rad_rdma_recv_dptr(handle: *mut c_void) -> *mut c_void;
+    fn rad_rdma_send_hptr(handle: *mut c_void) -> *mut c_void;
+    fn rad_rdma_recv_hptr(handle: *mut c_void) -> *mut c_void;
     fn rad_rdma_exchange_mapped(handle: *mut c_void, n_bytes: i32) -> i32;
     fn rad_rdma_close(handle: *mut c_void);
 }
@@ -230,12 +232,42 @@ impl Tp2Comm {
     }
 
     pub fn all_reduce_argmax(&mut self, vals: &mut [f32], ids: &mut [i32]) -> std::io::Result<()> {
+        if self.world_size() <= 1 {
+            return Ok(());
+        }
+        let m = vals.len();
+        let n_bytes = m * 8;
+        if !self.rdma.is_null() && n_bytes > 0 {
+            let sh = unsafe { rad_rdma_send_hptr(self.rdma) } as *mut u8;
+            let rh = unsafe { rad_rdma_recv_hptr(self.rdma) } as *const u8;
+            if !sh.is_null() && !rh.is_null() {
+                unsafe {
+                    let sbuf = std::slice::from_raw_parts_mut(sh, n_bytes);
+                    for i in 0..m {
+                        sbuf[i * 8..i * 8 + 4].copy_from_slice(&vals[i].to_le_bytes());
+                        sbuf[i * 8 + 4..i * 8 + 8].copy_from_slice(&ids[i].to_le_bytes());
+                    }
+                }
+                self.rdma_exchange_mapped(n_bytes)?;
+                unsafe {
+                    let rbuf = std::slice::from_raw_parts(rh, n_bytes);
+                    for i in 0..m {
+                        let pv = f32::from_le_bytes(rbuf[i * 8..i * 8 + 4].try_into().unwrap());
+                        let pi = i32::from_le_bytes(rbuf[i * 8 + 4..i * 8 + 8].try_into().unwrap());
+                        if pv > vals[i] {
+                            vals[i] = pv;
+                            ids[i] = pi;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
         let Some(ref mut s) = self.stream else {
             return Ok(());
         };
-        let m = vals.len();
-        let mut send_buf = vec![0u8; m * 8];
-        let mut recv_buf = vec![0u8; m * 8];
+        let mut send_buf = vec![0u8; n_bytes];
+        let mut recv_buf = vec![0u8; n_bytes];
         for i in 0..m {
             send_buf[i * 8..i * 8 + 4].copy_from_slice(&vals[i].to_le_bytes());
             send_buf[i * 8 + 4..i * 8 + 8].copy_from_slice(&ids[i].to_le_bytes());

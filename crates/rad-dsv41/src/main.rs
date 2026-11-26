@@ -161,7 +161,9 @@ fn worker_loop(eng: &mut Dsv41Engine, comm: &mut Tp2Comm) -> Result<()> {
             5 => {
                 let mut a_val = 0u32;
                 comm.broadcast_u32(&mut a_val)?;
-                let _ = eng.draft_dspark(a_val as i32, comm)?;
+                let mut nb_val = 1u32;
+                comm.broadcast_u32(&mut nb_val)?;
+                let _ = eng.draft_dspark(a_val as i32, nb_val as usize, comm)?;
             }
             99 => break,
             _ => {}

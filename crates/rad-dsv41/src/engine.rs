@@ -87,6 +87,7 @@ pub struct Dsv41Engine {
     pub mtp_wo_graphs: HashMap<usize, CudaCapturedGraph>,
     pub mtp_ffn_graphs: HashMap<usize, CudaCapturedGraph>,
     pub last_draft_len: usize,
+    pub dspark_blocks: usize,
     pub pos: usize,
     pub wht_scale: f32,
 }
@@ -258,6 +259,7 @@ impl Dsv41Engine {
             mtp_wo_graphs: HashMap::new(),
             mtp_ffn_graphs: HashMap::new(),
             last_draft_len: 1,
+            dspark_blocks: 1,
             pos: 0,
             wht_scale: 1.0f32 / 128.0f32.sqrt(),
         })
@@ -588,7 +590,7 @@ impl Dsv41Engine {
                     );
                 }
             }
-            let use_graph = (m == 1 || m == 6 || m == 64 || m == 128 || m == 512) && comm.rdma_ptrs().is_some();
+            let use_graph = (m == 1 || m == 6 || m == 11 || m == 16 || m == 64 || m == 128 || m == 256 || m == 512) && comm.rdma_ptrs().is_some();
             if use_graph {
                 let gkey = (l, m);
                 if !self.qkv_graphs.contains_key(&gkey) {
@@ -967,222 +969,228 @@ impl Dsv41Engine {
         Ok(preds[0])
     }
 
-    pub fn draft_dspark(&mut self, anchor: i32, comm: &mut Tp2Comm) -> Result<Vec<i32>> {
+    pub fn draft_dspark(&mut self, anchor: i32, n_blocks: usize, comm: &mut Tp2Comm) -> Result<Vec<i32>> {
         let Some(mtp) = self.mtp.take() else {
             return Ok(vec![anchor]);
         };
         let tc = self.cfg.text_config.clone();
         let d = tc.hidden_size;
         let blk = tc.dspark_block_size.max(2).min(8);
+        let n_blk = n_blocks.max(1).min(3);
         let mi = blk as i32;
         let n_heads_local = tc.num_attention_heads / self.world;
         let groups_local = tc.o_groups / self.world;
         let stream: CudaStream = std::ptr::null_mut();
         let attn_scale = 1.0f32 / (tc.head_dim as f32).sqrt();
         let branch_dst = comm.rdma_ptrs().map(|(s, _)| s).unwrap_or(self.d_branch_out.ptr);
-        let start_pos = self.pos as i32;
-
-        let mut draft_in = vec![tc.dspark_noise_token_id; blk];
-        draft_in[0] = anchor;
-        let tok_bytes = unsafe { std::slice::from_raw_parts(draft_in.as_ptr() as *const u8, blk * 4) };
-        self.d_tok_ids.copy_from(tok_bytes, None).map_err(CudaFail)?;
-
-        unsafe {
-            cuda_ops::rad_cuda_embed_to_mhc_f16(self.embed.ptr, self.d_tok_ids.ptr as *const i32, self.d_streams.ptr, mi, d as i32, stream);
-        }
-
         let use_mtp_graph = comm.rdma_ptrs().is_some();
-        for l in 0..mtp.layers.len() {
-            if use_mtp_graph {
-                if !self.mtp_qkv_graphs.contains_key(&l) {
-                    let g = unsafe {
-                        CudaCapturedGraph::capture(|gs| {
-                            let lw = &mtp.layers[l];
-                            let prev_pre = if l == 0 { std::ptr::null() } else { self.d_pre_b.ptr as *const c_void };
-                            cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_attn_fn.ptr, lw.hc_attn_base.ptr, lw.hc_attn_scale.ptr, prev_pre, self.d_h_coeff.ptr, self.d_pre_a.ptr, self.d_branch_in.ptr, mi, d as i32, tc.rms_norm_eps, tc.hc_eps, gs);
-                            cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.attn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, gs);
-                            self.exl3_proj(self.d_normed.ptr, &lw.wq_a, self.d_q_lora.ptr, mi, 0, gs);
-                            cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_q_lora.ptr, lw.q_norm.ptr, self.d_q_normed.ptr, mi, tc.q_lora_rank as i32, tc.rms_norm_eps, gs);
-                            self.exl3_proj(self.d_q_normed.ptr, &lw.wq_b, self.d_q.ptr, mi, 0, gs);
-                            self.exl3_proj(self.d_normed.ptr, &lw.wkv, self.d_kv.ptr, mi, 0, gs);
-                            cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, lw.kv_norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, gs);
-                        })
-                    }
-                    .map_err(CudaFail)?;
-                    self.mtp_qkv_graphs.insert(l, g);
-                }
-                self.mtp_qkv_graphs.get(&l).unwrap().launch_on(stream).map_err(CudaFail)?;
-            } else {
-                unsafe {
-                    let lw = &mtp.layers[l];
-                    let prev_pre = if l == 0 { std::ptr::null() } else { self.d_pre_b.ptr as *const c_void };
-                    cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_attn_fn.ptr, lw.hc_attn_base.ptr, lw.hc_attn_scale.ptr, prev_pre, self.d_h_coeff.ptr, self.d_pre_a.ptr, self.d_branch_in.ptr, mi, d as i32, tc.rms_norm_eps, tc.hc_eps, stream);
-                    cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.attn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
-                    self.exl3_proj(self.d_normed.ptr, &lw.wq_a, self.d_q_lora.ptr, mi, 0, stream);
-                    cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_q_lora.ptr, lw.q_norm.ptr, self.d_q_normed.ptr, mi, tc.q_lora_rank as i32, tc.rms_norm_eps, stream);
-                    self.exl3_proj(self.d_q_normed.ptr, &lw.wq_b, self.d_q.ptr, mi, 0, stream);
-                    self.exl3_proj(self.d_normed.ptr, &lw.wkv, self.d_kv.ptr, mi, 0, stream);
-                    cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, lw.kv_norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, stream);
-                }
-            }
-            unsafe {
-                let lw = &mtp.layers[l];
-                cuda_ops::rad_cuda_rope_yarn_f16(self.d_q.ptr, self.d_kv_normed.ptr, mi, n_heads_local as i32, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, 1.0f32, stream);
-                let sink_ptr = (lw.attn_sink.ptr as *const f32).add(self.rank * n_heads_local);
-                cuda_ops::rad_cuda_mqa_attn_sink_dspark_f16(self.d_q.ptr, mtp.kv_caches[l].k_cache.ptr, mtp.kv_caches[l].k_cache.ptr, self.d_kv_normed.ptr, sink_ptr, self.d_attn_out.ptr, mi, n_heads_local as i32, start_pos, self.max_ctx as i32, tc.sliding_window as i32, tc.head_dim as i32, attn_scale, stream);
-                cuda_ops::rad_cuda_rope_yarn_f16(self.d_attn_out.ptr, std::ptr::null_mut(), mi, n_heads_local as i32, 0, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, -1.0f32, stream);
-            }
-            if use_mtp_graph {
-                if !self.mtp_wo_graphs.contains_key(&l) {
-                    let g = unsafe {
-                        CudaCapturedGraph::capture(|gs| {
-                            let lw = &mtp.layers[l];
-                            let s0 = &lw.wo_a_slices[0];
-                            cuda_ops::rad_cuda_exl3_batched_group_mma_f16(
-                                self.d_attn_out.ptr,
-                                lw.d_wo_a_trel.ptr as *const *const c_void,
-                                lw.d_wo_a_suh.ptr as *const *const c_void,
-                                lw.d_wo_a_svh.ptr as *const *const c_void,
-                                self.d_z_scratch.ptr,
-                                self.d_wo_mid.ptr,
-                                mi,
-                                groups_local as i32,
-                                s0.k as i32,
-                                s0.n as i32,
-                                s0.bits as i32,
-                                self.wht_scale,
-                                gs,
-                            );
-                            self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, branch_dst, mi, 0, gs);
-                        })
-                    }
-                    .map_err(CudaFail)?;
-                    self.mtp_wo_graphs.insert(l, g);
-                }
-                self.mtp_wo_graphs.get(&l).unwrap().launch_on(stream).map_err(CudaFail)?;
-            } else {
-                unsafe {
-                    let lw = &mtp.layers[l];
-                    let s0 = &lw.wo_a_slices[0];
-                    cuda_ops::rad_cuda_exl3_batched_group_mma_f16(
-                        self.d_attn_out.ptr,
-                        lw.d_wo_a_trel.ptr as *const *const c_void,
-                        lw.d_wo_a_suh.ptr as *const *const c_void,
-                        lw.d_wo_a_svh.ptr as *const *const c_void,
-                        self.d_z_scratch.ptr,
-                        self.d_wo_mid.ptr,
-                        mi,
-                        groups_local as i32,
-                        s0.k as i32,
-                        s0.n as i32,
-                        s0.bits as i32,
-                        self.wht_scale,
-                        stream,
-                    );
-                    self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, branch_dst, mi, 0, stream);
-                }
-            }
-            let (b_self, b_peer) = self.exchange_branch(blk, comm)?;
-            if use_mtp_graph {
-                if !self.mtp_ffn_graphs.contains_key(&l) {
-                    let g = unsafe {
-                        CudaCapturedGraph::capture(|gs| {
-                            let lw = &mtp.layers[l];
-                            cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(self.d_streams.ptr, b_self, b_peer, self.d_h_coeff.ptr as *const f32, mi, d as i32, tc.hc_sinkhorn_iters as i32, tc.hc_eps, gs);
-                            cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_ffn_fn.ptr, lw.hc_ffn_base.ptr, lw.hc_ffn_scale.ptr, self.d_pre_a.ptr, self.d_h_coeff.ptr, self.d_pre_b.ptr, self.d_branch_in.ptr, mi, d as i32, tc.rms_norm_eps, tc.hc_eps, gs);
-                            cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.ffn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, gs);
-                            let tk = tc.dspark_num_experts_per_tok as i32;
-                            let inter = tc.moe_intermediate_size as i32;
-                            let bits = lw.experts[0].w1.bits as i32;
-                            let exp_start = lw.expert_start as i32;
-                            let n_local = lw.experts.len() as i32;
-                            cuda_ops::rad_cuda_moe_route_sqrtsoftplus(self.d_normed.ptr, lw.gate_w.ptr, lw.gate_bias.ptr, self.d_gate_raw.ptr, self.d_gate_sel.ptr, self.d_topk_ids.ptr, self.d_topk_weights.ptr, mi, tc.dspark_n_routed_experts as i32, d as i32, tk, tc.routed_scaling_factor, gs);
-                            self.exl3_proj(self.d_normed.ptr, &lw.shared_w1, self.d_shared_g.ptr, mi, 0, gs);
-                            self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, mi, 0, gs);
-                            cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_shared_g.ptr, self.d_shared_u.ptr, self.d_shared_g.ptr, mi * (tc.moe_intermediate_size / self.world) as i32, tc.swiglu_limit, gs);
-                            self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, mi, 0, gs);
-                            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 0, gs);
-                            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_up.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 1, gs);
-                            cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_moe_gate.ptr, self.d_moe_up.ptr, self.d_moe_act.ptr, mi * tk * inter, tc.swiglu_limit, gs);
-                            cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_outs.ptr, tk, mi, inter, d as i32, bits, self.wht_scale, 1, exp_start, n_local, 1, gs);
-                            cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, gs);
-                        })
-                    }
-                    .map_err(CudaFail)?;
-                    self.mtp_ffn_graphs.insert(l, g);
-                }
-                self.mtp_ffn_graphs.get(&l).unwrap().launch_on(stream).map_err(CudaFail)?;
-            } else {
-                unsafe {
-                    let lw = &mtp.layers[l];
-                    cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(self.d_streams.ptr, b_self, b_peer, self.d_h_coeff.ptr as *const f32, mi, d as i32, tc.hc_sinkhorn_iters as i32, tc.hc_eps, stream);
-                    cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_ffn_fn.ptr, lw.hc_ffn_base.ptr, lw.hc_ffn_scale.ptr, self.d_pre_a.ptr, self.d_h_coeff.ptr, self.d_pre_b.ptr, self.d_branch_in.ptr, mi, d as i32, tc.rms_norm_eps, tc.hc_eps, stream);
-                    cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.ffn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
-                    let tk = tc.dspark_num_experts_per_tok as i32;
-                    let inter = tc.moe_intermediate_size as i32;
-                    let bits = lw.experts[0].w1.bits as i32;
-                    let exp_start = lw.expert_start as i32;
-                    let n_local = lw.experts.len() as i32;
-                    cuda_ops::rad_cuda_moe_route_sqrtsoftplus(self.d_normed.ptr, lw.gate_w.ptr, lw.gate_bias.ptr, self.d_gate_raw.ptr, self.d_gate_sel.ptr, self.d_topk_ids.ptr, self.d_topk_weights.ptr, mi, tc.dspark_n_routed_experts as i32, d as i32, tk, tc.routed_scaling_factor, stream);
-                    self.exl3_proj(self.d_normed.ptr, &lw.shared_w1, self.d_shared_g.ptr, mi, 0, stream);
-                    self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, mi, 0, stream);
-                    cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_shared_g.ptr, self.d_shared_u.ptr, self.d_shared_g.ptr, mi * (tc.moe_intermediate_size / self.world) as i32, tc.swiglu_limit, stream);
-                    self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, mi, 0, stream);
-                    cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 0, stream);
-                    cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_up.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 1, stream);
-                    cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_moe_gate.ptr, self.d_moe_up.ptr, self.d_moe_act.ptr, mi * tk * inter, tc.swiglu_limit, stream);
-                    cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_outs.ptr, tk, mi, inter, d as i32, bits, self.wht_scale, 1, exp_start, n_local, 1, stream);
-                    cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, stream);
-                }
-            }
-            let (b_self2, b_peer2) = self.exchange_branch(blk, comm)?;
-            unsafe {
-                cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(self.d_streams.ptr, b_self2, b_peer2, self.d_h_coeff.ptr as *const f32, mi, d as i32, tc.hc_sinkhorn_iters as i32, tc.hc_eps, stream);
-            }
-        }
-        unsafe {
-            cuda_ops::rad_cuda_mhc_pre_mix_only(self.d_streams.ptr, self.d_pre_b.ptr, self.d_branch_in.ptr, mi, d as i32, stream);
-            cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, mtp.final_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
-            self.exl3_proj(self.d_normed.ptr, &self.head, self.d_logits.ptr, mi, 0, stream);
-        }
         let v_local = self.head.n;
         let m_rank = tc.dspark_markov_rank.max(1) as i32;
         let offset = (self.rank * v_local) as i32;
-        let mut out = Vec::with_capacity(blk + 1);
+        let mut out = Vec::with_capacity(n_blk * blk + 1);
         out.push(anchor);
-        for i in 0..blk {
-            let prev_tok = *out.last().unwrap();
+
+        for b_idx in 0..n_blk {
+            let start_pos = (self.pos + b_idx * blk) as i32;
+            let mut draft_in = vec![tc.dspark_noise_token_id; blk];
+            draft_in[0] = *out.last().unwrap();
+            let tok_bytes = unsafe { std::slice::from_raw_parts(draft_in.as_ptr() as *const u8, blk * 4) };
+            self.d_tok_ids.copy_from(tok_bytes, None).map_err(CudaFail)?;
+
             unsafe {
-                let row_ptr = (self.d_logits.ptr as *const u8).add(i * v_local * 2) as *const c_void;
-                cuda_ops::rad_cuda_markov_bias_add_f16(
-                    row_ptr,
-                    mtp.markov_head.ptr,
-                    mtp.markov_embed.ptr,
-                    prev_tok,
-                    mtp.d_logits_row.ptr,
-                    v_local as i32,
-                    m_rank,
-                    stream,
-                );
-                cuda_ops::rad_cuda_argmax_f16(
-                    mtp.d_logits_row.ptr,
-                    self.d_arg_vals.ptr,
-                    self.d_arg_ids.ptr,
-                    self.d_best_val.ptr,
-                    self.d_best_id.ptr,
-                    1,
-                    v_local as i32,
-                    stream,
-                );
+                cuda_ops::rad_cuda_embed_to_mhc_f16(self.embed.ptr, self.d_tok_ids.ptr as *const i32, self.d_streams.ptr, mi, d as i32, stream);
             }
-            rad_cuda::sync_device().map_err(CudaFail)?;
-            let mut bval = [0.0f32; 1];
-            let mut bid = [0i32; 1];
-            self.d_best_val.copy_to_host(unsafe { std::slice::from_raw_parts_mut(bval.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
-            self.d_best_id.copy_to_host(unsafe { std::slice::from_raw_parts_mut(bid.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
-            bid[0] += offset;
-            comm.all_reduce_argmax(&mut bval, &mut bid)?;
-            out.push(bid[0]);
+
+            for l in 0..mtp.layers.len() {
+                if use_mtp_graph {
+                    if !self.mtp_qkv_graphs.contains_key(&l) {
+                        let g = unsafe {
+                            CudaCapturedGraph::capture(|gs| {
+                                let lw = &mtp.layers[l];
+                                let prev_pre = if l == 0 { std::ptr::null() } else { self.d_pre_b.ptr as *const c_void };
+                                cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_attn_fn.ptr, lw.hc_attn_base.ptr, lw.hc_attn_scale.ptr, prev_pre, self.d_h_coeff.ptr, self.d_pre_a.ptr, self.d_branch_in.ptr, mi, d as i32, tc.rms_norm_eps, tc.hc_eps, gs);
+                                cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.attn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, gs);
+                                self.exl3_proj(self.d_normed.ptr, &lw.wq_a, self.d_q_lora.ptr, mi, 0, gs);
+                                cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_q_lora.ptr, lw.q_norm.ptr, self.d_q_normed.ptr, mi, tc.q_lora_rank as i32, tc.rms_norm_eps, gs);
+                                self.exl3_proj(self.d_q_normed.ptr, &lw.wq_b, self.d_q.ptr, mi, 0, gs);
+                                self.exl3_proj(self.d_normed.ptr, &lw.wkv, self.d_kv.ptr, mi, 0, gs);
+                                cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, lw.kv_norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, gs);
+                            })
+                        }
+                        .map_err(CudaFail)?;
+                        self.mtp_qkv_graphs.insert(l, g);
+                    }
+                    self.mtp_qkv_graphs.get(&l).unwrap().launch_on(stream).map_err(CudaFail)?;
+                } else {
+                    unsafe {
+                        let lw = &mtp.layers[l];
+                        let prev_pre = if l == 0 { std::ptr::null() } else { self.d_pre_b.ptr as *const c_void };
+                        cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_attn_fn.ptr, lw.hc_attn_base.ptr, lw.hc_attn_scale.ptr, prev_pre, self.d_h_coeff.ptr, self.d_pre_a.ptr, self.d_branch_in.ptr, mi, d as i32, tc.rms_norm_eps, tc.hc_eps, stream);
+                        cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.attn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
+                        self.exl3_proj(self.d_normed.ptr, &lw.wq_a, self.d_q_lora.ptr, mi, 0, stream);
+                        cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_q_lora.ptr, lw.q_norm.ptr, self.d_q_normed.ptr, mi, tc.q_lora_rank as i32, tc.rms_norm_eps, stream);
+                        self.exl3_proj(self.d_q_normed.ptr, &lw.wq_b, self.d_q.ptr, mi, 0, stream);
+                        self.exl3_proj(self.d_normed.ptr, &lw.wkv, self.d_kv.ptr, mi, 0, stream);
+                        cuda_ops::rad_cuda_rms_norm_bf16w_f16(self.d_kv.ptr, lw.kv_norm.ptr, self.d_kv_normed.ptr, mi, tc.head_dim as i32, tc.rms_norm_eps, stream);
+                    }
+                }
+                unsafe {
+                    let lw = &mtp.layers[l];
+                    cuda_ops::rad_cuda_rope_yarn_f16(self.d_q.ptr, self.d_kv_normed.ptr, mi, n_heads_local as i32, 1, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, 1.0f32, stream);
+                    let sink_ptr = (lw.attn_sink.ptr as *const f32).add(self.rank * n_heads_local);
+                    cuda_ops::rad_cuda_mqa_attn_sink_dspark_f16(self.d_q.ptr, mtp.kv_caches[l].k_cache.ptr, mtp.kv_caches[l].k_cache.ptr, self.d_kv_normed.ptr, sink_ptr, self.d_attn_out.ptr, mi, n_heads_local as i32, start_pos, self.max_ctx as i32, tc.sliding_window as i32, tc.head_dim as i32, attn_scale, stream);
+                    if b_idx + 1 < n_blk {
+                        cuda_ops::rad_cuda_kv_scatter_f16(self.d_kv_normed.ptr, self.d_kv_normed.ptr, mtp.kv_caches[l].k_cache.ptr, mtp.kv_caches[l].k_cache.ptr, mi, start_pos, self.max_ctx as i32, tc.head_dim as i32, stream);
+                    }
+                    cuda_ops::rad_cuda_rope_yarn_f16(self.d_attn_out.ptr, std::ptr::null_mut(), mi, n_heads_local as i32, 0, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, -1.0f32, stream);
+                }
+                if use_mtp_graph {
+                    if !self.mtp_wo_graphs.contains_key(&l) {
+                        let g = unsafe {
+                            CudaCapturedGraph::capture(|gs| {
+                                let lw = &mtp.layers[l];
+                                let s0 = &lw.wo_a_slices[0];
+                                cuda_ops::rad_cuda_exl3_batched_group_mma_f16(
+                                    self.d_attn_out.ptr,
+                                    lw.d_wo_a_trel.ptr as *const *const c_void,
+                                    lw.d_wo_a_suh.ptr as *const *const c_void,
+                                    lw.d_wo_a_svh.ptr as *const *const c_void,
+                                    self.d_z_scratch.ptr,
+                                    self.d_wo_mid.ptr,
+                                    mi,
+                                    groups_local as i32,
+                                    s0.k as i32,
+                                    s0.n as i32,
+                                    s0.bits as i32,
+                                    self.wht_scale,
+                                    gs,
+                                );
+                                self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, branch_dst, mi, 0, gs);
+                            })
+                        }
+                        .map_err(CudaFail)?;
+                        self.mtp_wo_graphs.insert(l, g);
+                    }
+                    self.mtp_wo_graphs.get(&l).unwrap().launch_on(stream).map_err(CudaFail)?;
+                } else {
+                    unsafe {
+                        let lw = &mtp.layers[l];
+                        let s0 = &lw.wo_a_slices[0];
+                        cuda_ops::rad_cuda_exl3_batched_group_mma_f16(
+                            self.d_attn_out.ptr,
+                            lw.d_wo_a_trel.ptr as *const *const c_void,
+                            lw.d_wo_a_suh.ptr as *const *const c_void,
+                            lw.d_wo_a_svh.ptr as *const *const c_void,
+                            self.d_z_scratch.ptr,
+                            self.d_wo_mid.ptr,
+                            mi,
+                            groups_local as i32,
+                            s0.k as i32,
+                            s0.n as i32,
+                            s0.bits as i32,
+                            self.wht_scale,
+                            stream,
+                        );
+                        self.exl3_proj(self.d_wo_mid.ptr, &lw.wo_b, branch_dst, mi, 0, stream);
+                    }
+                }
+                let (b_self, b_peer) = self.exchange_branch(blk, comm)?;
+                if use_mtp_graph {
+                    if !self.mtp_ffn_graphs.contains_key(&l) {
+                        let g = unsafe {
+                            CudaCapturedGraph::capture(|gs| {
+                                let lw = &mtp.layers[l];
+                                cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(self.d_streams.ptr, b_self, b_peer, self.d_h_coeff.ptr as *const f32, mi, d as i32, tc.hc_sinkhorn_iters as i32, tc.hc_eps, gs);
+                                cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_ffn_fn.ptr, lw.hc_ffn_base.ptr, lw.hc_ffn_scale.ptr, self.d_pre_a.ptr, self.d_h_coeff.ptr, self.d_pre_b.ptr, self.d_branch_in.ptr, mi, d as i32, tc.rms_norm_eps, tc.hc_eps, gs);
+                                cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.ffn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, gs);
+                                let tk = tc.dspark_num_experts_per_tok as i32;
+                                let inter = tc.moe_intermediate_size as i32;
+                                let bits = lw.experts[0].w1.bits as i32;
+                                let exp_start = lw.expert_start as i32;
+                                let n_local = lw.experts.len() as i32;
+                                cuda_ops::rad_cuda_moe_route_sqrtsoftplus(self.d_normed.ptr, lw.gate_w.ptr, lw.gate_bias.ptr, self.d_gate_raw.ptr, self.d_gate_sel.ptr, self.d_topk_ids.ptr, self.d_topk_weights.ptr, mi, tc.dspark_n_routed_experts as i32, d as i32, tk, tc.routed_scaling_factor, gs);
+                                self.exl3_proj(self.d_normed.ptr, &lw.shared_w1, self.d_shared_g.ptr, mi, 0, gs);
+                                self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, mi, 0, gs);
+                                cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_shared_g.ptr, self.d_shared_u.ptr, self.d_shared_g.ptr, mi * (tc.moe_intermediate_size / self.world) as i32, tc.swiglu_limit, gs);
+                                self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, mi, 0, gs);
+                                cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 0, gs);
+                                cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_up.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 1, gs);
+                                cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_moe_gate.ptr, self.d_moe_up.ptr, self.d_moe_act.ptr, mi * tk * inter, tc.swiglu_limit, gs);
+                                cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_outs.ptr, tk, mi, inter, d as i32, bits, self.wht_scale, 1, exp_start, n_local, 1, gs);
+                                cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, gs);
+                            })
+                        }
+                        .map_err(CudaFail)?;
+                        self.mtp_ffn_graphs.insert(l, g);
+                    }
+                    self.mtp_ffn_graphs.get(&l).unwrap().launch_on(stream).map_err(CudaFail)?;
+                } else {
+                    unsafe {
+                        let lw = &mtp.layers[l];
+                        cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(self.d_streams.ptr, b_self, b_peer, self.d_h_coeff.ptr as *const f32, mi, d as i32, tc.hc_sinkhorn_iters as i32, tc.hc_eps, stream);
+                        cuda_ops::rad_cuda_mhc_pre_and_coeff(self.d_streams.ptr, lw.hc_ffn_fn.ptr, lw.hc_ffn_base.ptr, lw.hc_ffn_scale.ptr, self.d_pre_a.ptr, self.d_h_coeff.ptr, self.d_pre_b.ptr, self.d_branch_in.ptr, mi, d as i32, tc.rms_norm_eps, tc.hc_eps, stream);
+                        cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, lw.ffn_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
+                        let tk = tc.dspark_num_experts_per_tok as i32;
+                        let inter = tc.moe_intermediate_size as i32;
+                        let bits = lw.experts[0].w1.bits as i32;
+                        let exp_start = lw.expert_start as i32;
+                        let n_local = lw.experts.len() as i32;
+                        cuda_ops::rad_cuda_moe_route_sqrtsoftplus(self.d_normed.ptr, lw.gate_w.ptr, lw.gate_bias.ptr, self.d_gate_raw.ptr, self.d_gate_sel.ptr, self.d_topk_ids.ptr, self.d_topk_weights.ptr, mi, tc.dspark_n_routed_experts as i32, d as i32, tk, tc.routed_scaling_factor, stream);
+                        self.exl3_proj(self.d_normed.ptr, &lw.shared_w1, self.d_shared_g.ptr, mi, 0, stream);
+                        self.exl3_proj(self.d_normed.ptr, &lw.shared_w3, self.d_shared_u.ptr, mi, 0, stream);
+                        cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_shared_g.ptr, self.d_shared_u.ptr, self.d_shared_g.ptr, mi * (tc.moe_intermediate_size / self.world) as i32, tc.swiglu_limit, stream);
+                        self.exl3_proj(self.d_shared_g.ptr, &lw.shared_w2, self.d_shared_out.ptr, mi, 0, stream);
+                        cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w1_trel.ptr as *const *const c_void, lw.d_w1_suh.ptr as *const *const c_void, lw.d_w1_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_gate.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 0, stream);
+                        cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_normed.ptr, lw.d_w3_trel.ptr as *const *const c_void, lw.d_w3_suh.ptr as *const *const c_void, lw.d_w3_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_up.ptr, tk, mi, d as i32, inter, bits, self.wht_scale, 0, exp_start, n_local, 1, stream);
+                        cuda_ops::rad_cuda_clamped_swiglu_f16(self.d_moe_gate.ptr, self.d_moe_up.ptr, self.d_moe_act.ptr, mi * tk * inter, tc.swiglu_limit, stream);
+                        cuda_ops::rad_cuda_exl3_moe_mma_f16(self.d_moe_act.ptr, lw.d_w2_trel.ptr as *const *const c_void, lw.d_w2_suh.ptr as *const *const c_void, lw.d_w2_svh.ptr as *const *const c_void, self.d_topk_ids.ptr as *const i32, self.d_z_scratch.ptr, self.d_moe_outs.ptr, tk, mi, inter, d as i32, bits, self.wht_scale, 1, exp_start, n_local, 1, stream);
+                        cuda_ops::rad_cuda_moe_weighted_sum_f16(self.d_moe_outs.ptr, self.d_topk_weights.ptr as *const f32, self.d_shared_out.ptr, branch_dst, mi, tk, d as i32, stream);
+                    }
+                }
+                let (b_self2, b_peer2) = self.exchange_branch(blk, comm)?;
+                unsafe {
+                    cuda_ops::rad_cuda_mhc_sinkhorn_mix_f16(self.d_streams.ptr, b_self2, b_peer2, self.d_h_coeff.ptr as *const f32, mi, d as i32, tc.hc_sinkhorn_iters as i32, tc.hc_eps, stream);
+                }
+            }
+            unsafe {
+                cuda_ops::rad_cuda_mhc_pre_mix_only(self.d_streams.ptr, self.d_pre_b.ptr, self.d_branch_in.ptr, mi, d as i32, stream);
+                cuda_ops::rad_cuda_rms_norm_f32_bf16w_f16(self.d_branch_in.ptr, mtp.final_norm.ptr, self.d_normed.ptr, mi, d as i32, tc.rms_norm_eps, stream);
+                self.exl3_proj(self.d_normed.ptr, &self.head, self.d_logits.ptr, mi, 0, stream);
+            }
+            for i in 0..blk {
+                let prev_tok = *out.last().unwrap();
+                unsafe {
+                    let row_ptr = (self.d_logits.ptr as *const u8).add(i * v_local * 2) as *const c_void;
+                    cuda_ops::rad_cuda_markov_bias_add_f16(
+                        row_ptr,
+                        mtp.markov_head.ptr,
+                        mtp.markov_embed.ptr,
+                        prev_tok,
+                        mtp.d_logits_row.ptr,
+                        v_local as i32,
+                        m_rank,
+                        stream,
+                    );
+                    cuda_ops::rad_cuda_argmax_f16(
+                        mtp.d_logits_row.ptr,
+                        self.d_arg_vals.ptr,
+                        self.d_arg_ids.ptr,
+                        self.d_best_val.ptr,
+                        self.d_best_id.ptr,
+                        1,
+                        v_local as i32,
+                        stream,
+                    );
+                }
+                rad_cuda::sync_device().map_err(CudaFail)?;
+                let mut bval = [0.0f32; 1];
+                let mut bid = [0i32; 1];
+                self.d_best_val.copy_to_host(unsafe { std::slice::from_raw_parts_mut(bval.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
+                self.d_best_id.copy_to_host(unsafe { std::slice::from_raw_parts_mut(bid.as_mut_ptr() as *mut u8, 4) }).map_err(CudaFail)?;
+                bid[0] += offset;
+                comm.all_reduce_argmax(&mut bval, &mut bid)?;
+                out.push(bid[0]);
+            }
         }
         self.mtp = Some(mtp);
         Ok(out)
@@ -1197,11 +1205,14 @@ impl Dsv41Engine {
             if let Some(ng) = ngram_draft(history, anchor, max_k) {
                 (ng, "ngram")
             } else if self.mtp.is_some() {
+                let n_blk = 1usize;
                 let mut dcmd = 5u32;
                 comm.broadcast_u32(&mut dcmd)?;
                 let mut a_val = anchor as u32;
                 comm.broadcast_u32(&mut a_val)?;
-                (self.draft_dspark(anchor, comm)?, "dspark")
+                let mut nb_val = n_blk as u32;
+                comm.broadcast_u32(&mut nb_val)?;
+                (self.draft_dspark(anchor, n_blk, comm)?, "dspark")
             } else {
                 (vec![anchor], "single")
             }
@@ -1226,6 +1237,15 @@ impl Dsv41Engine {
                 k_acc += 1;
                 if i + 1 < draft.len() && pred != draft[i + 1] {
                     break;
+                }
+            }
+            if mode == "dspark" {
+                if k_acc == draft.len() {
+                    self.dspark_blocks = (self.dspark_blocks + 1).min(3);
+                } else if k_acc <= 3 {
+                    self.dspark_blocks = 1;
+                } else if k_acc + 2 < draft.len() {
+                    self.dspark_blocks = self.dspark_blocks.saturating_sub(1).max(1);
                 }
             }
             if trace && self.rank == 0 {
