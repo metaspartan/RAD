@@ -124,19 +124,19 @@ impl InklingEngine {
         self.bsc.d_seq_ids.copy_from(seq_bytes, Some(g.stream)).map_err(he)?;
         self.bsc.d_positions.copy_from(pos_bytes, Some(g.stream)).map_err(he)?;
         g.launch().map_err(he)?;
-        g.sync().map_err(he)?;
-        let mut out_b = vec![0u8; b * 4];
+        let mut out = vec![0i32; b];
         let rc = unsafe {
-            rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
+            rad_hip::hipMemcpyAsync(out.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST, g.stream)
         };
         if rc != rad_hip::HIP_SUCCESS { return Err(he(rc)); }
+        g.sync().map_err(he)?;
         for (idx, &sid) in seq_ids.iter().enumerate() {
             let su = sid as usize;
             self.seq_pos[su] += 1;
             self.seq_tokens[su].push(tokens[idx]);
             if su == 0 { self.pos = self.seq_pos[0]; }
         }
-        Ok(out_b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect())
+        Ok(out)
     }
 
     pub fn verify_multi(&mut self, seq_ids: &[i32], draft_tokens: &[Vec<i32>]) -> Result<Vec<Vec<i32>>> {

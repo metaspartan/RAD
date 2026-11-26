@@ -1082,14 +1082,14 @@ impl InklingEngine {
         self.bsc.d_toks.copy_from(tok_bytes, Some(g.stream)).map_err(he)?;
         self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(g.stream)).map_err(he)?;
         g.launch().map_err(he)?;
-        g.sync().map_err(he)?;
-        let mut out_b = vec![0u8; b * 4];
+        let mut out = vec![0i32; b];
         let rc = unsafe {
-            rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
+            rad_hip::hipMemcpyAsync(out.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST, g.stream)
         };
         if rc != rad_hip::HIP_SUCCESS { return Err(he(rc)); }
+        g.sync().map_err(he)?;
         self.pos += b as i32;
-        Ok(out_b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect())
+        Ok(out)
     }
 
     pub fn prefill_tokens(&mut self, tokens: &[i32]) -> Result<i32> {
@@ -1178,14 +1178,14 @@ impl InklingEngine {
         self.bsc.d_toks.copy_from(tok_bytes, Some(g.stream)).map_err(he)?;
         self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(g.stream)).map_err(he)?;
         g.launch().map_err(he)?;
-        g.sync().map_err(he)?;
-        let mut out_b = vec![0u8; b * 4];
+        let mut out = vec![0i32; b];
         let rc = unsafe {
-            rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
+            rad_hip::hipMemcpyAsync(out.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST, g.stream)
         };
         if rc != rad_hip::HIP_SUCCESS { return Err(he(rc)); }
+        g.sync().map_err(he)?;
         self.seq_pos[seq] += b as i32;
-        Ok(out_b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect())
+        Ok(out)
     }
 
     pub fn rewind_verify_seq_to(&mut self, seq: usize, n_acc: usize, b: usize) -> Result<()> {
