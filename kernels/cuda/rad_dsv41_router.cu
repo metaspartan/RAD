@@ -324,13 +324,21 @@ __global__ void mhc_pre_mix_f16_k(
         }
     }
     __syncthreads();
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < D) {
-        const float* sr = streams + (size_t)mr * 4 * D;
-        branch_in[(size_t)mr * D + i] = s_pre[0] * sr[0 * D + i] +
-                                        s_pre[1] * sr[1 * D + i] +
-                                        s_pre[2] * sr[2 * D + i] +
-                                        s_pre[3] * sr[3 * D + i];
+    int i4 = blockIdx.x * blockDim.x + threadIdx.x;
+    int d4 = D >> 2;
+    if (i4 < d4) {
+        const float4* sr4 = reinterpret_cast<const float4*>(streams + (size_t)mr * 4 * D);
+        float4 a = sr4[0 * d4 + i4];
+        float4 b = sr4[1 * d4 + i4];
+        float4 c = sr4[2 * d4 + i4];
+        float4 d = sr4[3 * d4 + i4];
+        float p0 = s_pre[0], p1 = s_pre[1], p2 = s_pre[2], p3 = s_pre[3];
+        float4 outv;
+        outv.x = p0 * a.x + p1 * b.x + p2 * c.x + p3 * d.x;
+        outv.y = p0 * a.y + p1 * b.y + p2 * c.y + p3 * d.y;
+        outv.z = p0 * a.z + p1 * b.z + p2 * c.z + p3 * d.z;
+        outv.w = p0 * a.w + p1 * b.w + p2 * c.w + p3 * d.w;
+        reinterpret_cast<float4*>(branch_in + (size_t)mr * D)[i4] = outv;
     }
 }
 
@@ -453,7 +461,7 @@ void rad_cuda_mhc_pre_and_coeff(
         dim3 g1(24, M);
         mhc_coeff_proj_k<<<g1, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, D * 4, rms_eps, hc_eps);
     }
-    dim3 g2((D + 255) / 256, M);
+    dim3 g2(((D >> 2) + 255) / 256, M);
     mhc_pre_mix_f16_k<<<g2, 256, 0, stream>>>(streams, prev_pre, branch_in, D);
 }
 
@@ -465,7 +473,7 @@ void rad_cuda_mhc_pre_mix_only(
     int D,
     cudaStream_t stream
 ) {
-    dim3 g2((D + 255) / 256, M);
+    dim3 g2(((D >> 2) + 255) / 256, M);
     mhc_pre_mix_f16_k<<<g2, 256, 0, stream>>>(streams, prev_pre, branch_in, D);
 }
 

@@ -275,22 +275,34 @@ __global__ void mhc_sinkhorn_mix_f16_k(
         }
     }
     __syncthreads();
-    int i = blockIdx.x * blockDim.x + t;
-    if (i < D) {
-        float* sr = streams + (size_t)mr * 4 * D;
-        float x0 = sr[0 * D + i];
-        float x1 = sr[1 * D + i];
-        float x2 = sr[2 * D + i];
-        float x3 = sr[3 * D + i];
-        float b = __half2float(branch_out[(size_t)mr * D + i]);
+    int i4 = blockIdx.x * blockDim.x + t;
+    int d4 = D >> 2;
+    if (i4 < d4) {
+        float4* sr4 = reinterpret_cast<float4*>(streams + (size_t)mr * 4 * D);
+        float4 x0 = sr4[0 * d4 + i4];
+        float4 x1 = sr4[1 * d4 + i4];
+        float4 x2 = sr4[2 * d4 + i4];
+        float4 x3 = sr4[3 * d4 + i4];
+        const half2* bo2 = reinterpret_cast<const half2*>(branch_out + (size_t)mr * D);
+        float2 b0 = __half22float2(bo2[i4 * 2]);
+        float2 b1 = __half22float2(bo2[i4 * 2 + 1]);
         if (peer_branch_out) {
-            b += __half2float(peer_branch_out[(size_t)mr * D + i]);
+            const half2* po2 = reinterpret_cast<const half2*>(peer_branch_out + (size_t)mr * D);
+            float2 p0 = __half22float2(po2[i4 * 2]);
+            float2 p1 = __half22float2(po2[i4 * 2 + 1]);
+            b0.x += p0.x; b0.y += p0.y;
+            b1.x += p1.x; b1.y += p1.y;
         }
         #pragma unroll
         for (int r = 0; r < 4; ++r) {
-            sr[r * D + i] = s_res[0 * 4 + r] * x0 + s_res[1 * 4 + r] * x1 +
-                            s_res[2 * 4 + r] * x2 + s_res[3 * 4 + r] * x3 +
-                            s_post[r] * b;
+            float m0 = s_res[0 * 4 + r], m1 = s_res[1 * 4 + r], m2 = s_res[2 * 4 + r], m3 = s_res[3 * 4 + r];
+            float sp = s_post[r];
+            float4 outv;
+            outv.x = m0 * x0.x + m1 * x1.x + m2 * x2.x + m3 * x3.x + sp * b0.x;
+            outv.y = m0 * x0.y + m1 * x1.y + m2 * x2.y + m3 * x3.y + sp * b0.y;
+            outv.z = m0 * x0.z + m1 * x1.z + m2 * x2.z + m3 * x3.z + sp * b1.x;
+            outv.w = m0 * x0.w + m1 * x1.w + m2 * x2.w + m3 * x3.w + sp * b1.y;
+            sr4[r * d4 + i4] = outv;
         }
     }
 }
@@ -1042,7 +1054,7 @@ void rad_cuda_mhc_sinkhorn_mix_f16(
     float eps,
     cudaStream_t stream
 ) {
-    dim3 grid((D + 255) / 256, M);
+    dim3 grid(((D >> 2) + 255) / 256, M);
     mhc_sinkhorn_mix_f16_k<<<grid, 256, 0, stream>>>(
         streams, branch_out, peer_branch_out, h_coeff, D, sinkhorn_iters, eps
     );

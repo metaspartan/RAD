@@ -27,6 +27,8 @@ struct Cli {
     api_key: Option<String>,
     #[arg(long)]
     model: Option<String>,
+    #[arg(long)]
+    display_name: Option<String>,
     #[arg(long, default_value_t = 1024)]
     max_tokens: usize,
     #[arg(long, default_value_t = 0.0)]
@@ -194,6 +196,11 @@ async fn run_scripted_capture(
             } else if !app.health.model.is_empty() {
                 app.model = app.health.model.clone();
             }
+            if let Some(dn) = step.get("display_name").and_then(|v| v.as_str()) {
+                app.display_name = dn.to_string();
+            } else {
+                app.display_name = app.model.clone();
+            }
             if let Some(m) = fetch_metrics(client, &app.base_url, cur_api_key.as_deref()).await {
                 app.metrics = m;
             }
@@ -345,6 +352,7 @@ async fn handle_slash_command(
         "/model" => {
             if let Some(m) = parts.get(1) {
                 app.model = m.to_string();
+                app.display_name = m.to_string();
                 app.status_msg = format!("Model = {m}");
             } else {
                 let models = fetch_models(client, &app.base_url, api_key.as_deref()).await;
@@ -362,6 +370,7 @@ async fn handle_slash_command(
                 app.health = fetch_health(client, &app.base_url, api_key.as_deref()).await;
                 if !app.health.model.is_empty() {
                     app.model = app.health.model.clone();
+                    app.display_name = app.model.clone();
                 }
                 if let Some(m) = fetch_metrics(client, &app.base_url, api_key.as_deref()).await {
                     app.metrics = m;
@@ -417,9 +426,11 @@ async fn main() -> Result<()> {
         return run_one_shot(&client, &cli, model, prompt).await;
     }
 
+    let display_name = cli.display_name.clone().unwrap_or_else(|| model.clone());
     let mut app = AppState::new(
         cli.url.clone(),
         model,
+        display_name,
         cli.max_tokens,
         cli.temp,
         cli.think,

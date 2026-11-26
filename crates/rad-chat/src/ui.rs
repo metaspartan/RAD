@@ -16,6 +16,7 @@ pub struct DisplayTurn {
 pub struct AppState {
     pub base_url: String,
     pub model: String,
+    pub display_name: String,
     pub health: ServerHealth,
     pub metrics: ServerMetrics,
     pub turns: Vec<DisplayTurn>,
@@ -40,6 +41,7 @@ impl AppState {
     pub fn new(
         base_url: String,
         model: String,
+        display_name: String,
         max_tokens: usize,
         temperature: f32,
         enable_thinking: bool,
@@ -48,6 +50,7 @@ impl AppState {
         Self {
             base_url,
             model,
+            display_name,
             health: ServerHealth::default(),
             metrics: ServerMetrics::default(),
             turns: Vec::new(),
@@ -125,7 +128,7 @@ fn draw_header(f: &mut Frame, app: &AppState, area: Rect) {
         Span::raw(" "),
         Span::styled("●", Style::default().fg(dot_color)),
         Span::styled(
-            format!(" {} ", app.model),
+            format!(" {} ", app.display_name),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
         Span::styled("│ ", Style::default().fg(Color::DarkGray)),
@@ -193,12 +196,12 @@ fn draw_chat(f: &mut Frame, app: &mut AppState, area: Rect) {
         } else {
             let badge = if app.streaming && is_last {
                 Span::styled(
-                    format!("⚡ {}  ({:.1} tok/s) ", app.model, app.live_tok_s),
+                    format!("⚡ {}  ({:.1} tok/s) ", app.display_name, app.live_tok_s),
                     Style::default().fg(Color::Rgb(74, 222, 128)).add_modifier(Modifier::BOLD),
                 )
             } else {
                 Span::styled(
-                    format!("◆ {} ", app.model),
+                    format!("◆ {} ", app.display_name),
                     Style::default().fg(Color::Rgb(167, 139, 250)).add_modifier(Modifier::BOLD),
                 )
             };
