@@ -1435,6 +1435,91 @@ void rad_cuda_mqa_attn_sink_dspark_f16(
     );
 }
 
+__device__ __forceinline__ void router_warp_wht128_f32(float& v0, float& v1, float& v2, float& v3, int lane, float scale) {
+    float a0 = v0 + v1, a1 = v0 - v1;
+    float a2 = v2 + v3, a3 = v2 - v3;
+    v0 = a0 + a2; v1 = a1 + a3;
+    v2 = a0 - a2; v3 = a1 - a3;
+    #pragma unroll
+    for (int mask = 1; mask < 32; mask <<= 1) {
+        float sign = (lane & mask) ? -1.0f : 1.0f;
+        float p0 = __shfl_xor_sync(0xFFFFFFFFu, v0, mask);
+        float p1 = __shfl_xor_sync(0xFFFFFFFFu, v1, mask);
+        float p2 = __shfl_xor_sync(0xFFFFFFFFu, v2, mask);
+        float p3 = __shfl_xor_sync(0xFFFFFFFFu, v3, mask);
+        v0 = p0 + sign * v0;
+        v1 = p1 + sign * v1;
+        v2 = p2 + sign * v2;
+        v3 = p3 + sign * v3;
+    }
+    v0 *= scale; v1 *= scale; v2 *= scale; v3 *= scale;
+}
+
+__global__ void rms_norm_bf16w_wht128_f16_k(
+    const half* __restrict__ x,
+    const __nv_bfloat16* __restrict__ norm_w,
+    const half* __restrict__ suh,
+    half* __restrict__ y_rot,
+    int D,
+    float eps,
+    float wht_scale
+) {
+    int mr = blockIdx.x;
+    int t = threadIdx.x;
+    int warp = t >> 5;
+    int lane = t & 31;
+    int n_warps = blockDim.x >> 5;
+    int col = warp * 128 + lane * 4;
+    const half* xr = x + (size_t)mr * D;
+    uint2 xq = *reinterpret_cast<const uint2*>(xr + col);
+    float2 x01 = __half22float2(*reinterpret_cast<const half2*>(&xq.x));
+    float2 x23 = __half22float2(*reinterpret_cast<const half2*>(&xq.y));
+    float ss = x01.x * x01.x + x01.y * x01.y + x23.x * x23.x + x23.y * x23.y;
+    for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, m);
+    __shared__ float sm[32];
+    if (lane == 0) sm[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < n_warps) ? sm[lane] : 0.0f;
+        for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+        if (lane == 0) sm[0] = rsqrtf(v / (float)D + eps);
+    }
+    __syncthreads();
+    float inv = sm[0];
+    uint2 nw = __ldg(reinterpret_cast<const uint2*>(norm_w + col));
+    float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&nw.x));
+    float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&nw.y));
+    float v0 = x01.x * inv * w01.x;
+    float v1 = x01.y * inv * w01.y;
+    float v2 = x23.x * inv * w23.x;
+    float v3 = x23.y * inv * w23.y;
+    if (suh) {
+        uint2 sq = __ldg(reinterpret_cast<const uint2*>(suh + col));
+        float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
+        float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
+        v0 *= s01.x; v1 *= s01.y; v2 *= s23.x; v3 *= s23.y;
+    }
+    router_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
+    half2 h01 = __float22half2_rn(make_float2(v0, v1));
+    half2 h23 = __float22half2_rn(make_float2(v2, v3));
+    *reinterpret_cast<uint2*>(y_rot + (size_t)mr * D + col) = make_uint2(*reinterpret_cast<const uint32_t*>(&h01), *reinterpret_cast<const uint32_t*>(&h23));
+}
+
+void rad_cuda_rms_norm_bf16w_wht128_f16(
+    const half* x,
+    const __nv_bfloat16* norm_w,
+    const half* suh,
+    half* y_rot,
+    int M,
+    int D,
+    float eps,
+    float wht_scale,
+    cudaStream_t stream
+) {
+    int threads = (D / 128) * 32;
+    rms_norm_bf16w_wht128_f16_k<<<M, threads, 0, stream>>>(x, norm_w, suh, y_rot, D, eps, wht_scale);
+}
+
 void rad_cuda_add_f16(half* dst, const half* src, int N, cudaStream_t stream) {
     add_f16_k<<<(N + 255) / 256, 256, 0, stream>>>(dst, src, N);
 }

@@ -35,6 +35,7 @@ extern "C" {
         svh: *const c_void,
         z_scratch_f32: *mut c_void,
         gate_in: *const c_void,
+        next_suh: *const c_void,
         y: *mut c_void,
         m: i32,
         k: i32,
@@ -439,6 +440,18 @@ extern "C" {
         branch_in: *mut c_void,
         m: i32,
         d: i32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_rms_norm_bf16w_wht128_f16(
+        x: *const c_void,
+        norm_w: *const c_void,
+        suh: *const c_void,
+        y_rot: *mut c_void,
+        m: i32,
+        d: i32,
+        eps: f32,
+        wht_scale: f32,
         stream: CudaStream,
     );
 
