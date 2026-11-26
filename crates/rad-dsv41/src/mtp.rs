@@ -73,7 +73,7 @@ impl DsparkMtp {
     }
 }
 
-pub fn ngram_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<i32>> {
+pub fn ngram_draft_cfg(history: &[i32], anchor: i32, max_k: usize, in_edit: bool) -> Option<Vec<i32>> {
     let n = history.len();
     if n < 16 || max_k < 16 {
         return None;
@@ -101,7 +101,9 @@ pub fn ngram_draft(history: &[i32], anchor: i32, max_k: usize) -> Option<Vec<i32
         i -= 1;
     }
     let pos = best_pos?;
-    let cap_k = if best_len >= 10 {
+    let cap_k = if in_edit {
+        max_k
+    } else if best_len >= 10 {
         max_k
     } else if best_len >= 7 {
         max_k.min(64)
@@ -134,7 +136,7 @@ mod tests {
     fn ngram_draft_matches_repeated_suffix() {
         let mut h: Vec<i32> = (1..40).collect();
         h.extend_from_slice(&[5, 6, 7, 8, 9]);
-        let d = ngram_draft(&h, 10, 32).expect("should match");
+        let d = ngram_draft_cfg(&h, 10, 32, false).expect("should match");
         assert_eq!(d.len(), 32);
         assert_eq!(&d[..5], &[10, 11, 12, 13, 14]);
     }

@@ -850,8 +850,8 @@ void mqa_flash_mma16_f16_k(
         rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 1));
         float old_m = s_m[r];
         float new_m = fmaxf(old_m, rmax);
-        float alpha = expf(old_m - new_m);
-        float p = (c < tile_len) ? expf(sc - new_m) : 0.0f;
+        float alpha = exp2f((old_m - new_m) * 1.44269504f);
+        float p = (c < tile_len) ? exp2f((sc - new_m) * 1.44269504f) : 0.0f;
         s_p[r][c] = __float2half(p);
         float rsum = p;
         rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 8);
@@ -932,6 +932,223 @@ void mqa_flash_mma16_f16_k(
         oh1[c0] = __float2half(o2[nb] * inv1);
         oh1[c0 + 1] = __float2half(o3[nb] * inv1);
     }
+}
+
+__global__ __launch_bounds__(256)
+void mqa_flash_mma16_splitkv_f16_k(
+    const half* __restrict__ q,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ comp_kv,
+    const float* __restrict__ attn_sink,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_ml,
+    int n_heads,
+    int start_pos,
+    int max_ctx,
+    int sliding_window,
+    int comp_ratio,
+    float scale,
+    int n_splits
+) {
+    int h0 = blockIdx.x * 16;
+    int mr = blockIdx.y;
+    int sp = blockIdx.z;
+    int t = threadIdx.x;
+    int warp = t >> 5;
+    int lane = t & 31;
+    int group_id = lane >> 2;
+    int tid = lane & 3;
+
+    int seq_len = start_pos + mr + 1;
+    if (seq_len > max_ctx) seq_len = max_ctx;
+    int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
+    int raw_len = seq_len - p_start;
+    int c_end = (comp_kv && comp_ratio > 0 && p_start > 0) ? (p_start / comp_ratio) : 0;
+
+    int raw_tiles = (raw_len + 15) >> 4;
+    int comp_tiles = (c_end + 15) >> 4;
+    int tot_tiles = raw_tiles + comp_tiles;
+    int t_beg = (tot_tiles * sp) / n_splits;
+    int t_end = (tot_tiles * (sp + 1)) / n_splits;
+
+    __shared__ half s_q[16][512];
+    __shared__ half s_kv[16][520];
+    __shared__ float s_sp[8][16][16];
+    __shared__ half s_p[16][16];
+    __shared__ float s_m[16];
+    __shared__ float s_l[16];
+    __shared__ float s_alpha[16];
+
+    const uint4* q_u4 = reinterpret_cast<const uint4*>(q + ((size_t)mr * n_heads + h0) * 512);
+    uint4* sq_u4 = reinterpret_cast<uint4*>(&s_q[0][0]);
+    for (int i = t; i < 1024; i += 256) {
+        sq_u4[i] = __ldg(q_u4 + i);
+    }
+    if (t < 16) {
+        s_m[t] = (sp == 0 && attn_sink) ? attn_sink[h0 + t] : -1e30f;
+        s_l[t] = (sp == 0 && attn_sink) ? 1.0f : 0.0f;
+    }
+    __syncthreads();
+
+    float o0[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float o1[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float o2[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float o3[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int ti = t_beg; ti < t_end; ++ti) {
+        int tile_len;
+        const uint4* src_u4;
+        if (ti < raw_tiles) {
+            int p0 = p_start + ti * 16;
+            tile_len = seq_len - p0;
+            if (tile_len > 16) tile_len = 16;
+            src_u4 = reinterpret_cast<const uint4*>(k_cache + (size_t)p0 * 512);
+        } else {
+            int c0 = (ti - raw_tiles) * 16;
+            tile_len = c_end - c0;
+            if (tile_len > 16) tile_len = 16;
+            src_u4 = reinterpret_cast<const uint4*>(comp_kv + (size_t)c0 * 512);
+        }
+        int n_u4 = tile_len * 64;
+        for (int i = t; i < 1024; i += 256) {
+            int r = i >> 6;
+            int c4 = i & 63;
+            reinterpret_cast<uint4*>(s_kv[r])[c4] = (i < n_u4) ? __ldg(src_u4 + i) : make_uint4(0u, 0u, 0u, 0u);
+        }
+        __syncthreads();
+
+        float s00 = 0.0f, s01 = 0.0f, s02 = 0.0f, s03 = 0.0f;
+        float s10 = 0.0f, s11 = 0.0f, s12 = 0.0f, s13 = 0.0f;
+        int k_base = warp * 64;
+        #pragma unroll
+        for (int ks = 0; ks < 64; ks += 16) {
+            int ko0 = k_base + ks + tid * 2;
+            int ko1 = ko0 + 8;
+            uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][ko0]);
+            uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][ko0]);
+            uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][ko1]);
+            uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][ko1]);
+            uint32_t b00 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id][ko0]);
+            uint32_t b01 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id][ko1]);
+            uint32_t b10 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id + 8][ko0]);
+            uint32_t b11 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id + 8][ko1]);
+            mqa_mma_m16n8k16_f32(s00, s01, s02, s03, a0, a1, a2, a3, b00, b01);
+            mqa_mma_m16n8k16_f32(s10, s11, s12, s13, a0, a1, a2, a3, b10, b11);
+        }
+        s_sp[warp][group_id][tid * 2] = s00;
+        s_sp[warp][group_id][tid * 2 + 1] = s01;
+        s_sp[warp][group_id + 8][tid * 2] = s02;
+        s_sp[warp][group_id + 8][tid * 2 + 1] = s03;
+        s_sp[warp][group_id][8 + tid * 2] = s10;
+        s_sp[warp][group_id][8 + tid * 2 + 1] = s11;
+        s_sp[warp][group_id + 8][8 + tid * 2] = s12;
+        s_sp[warp][group_id + 8][8 + tid * 2 + 1] = s13;
+        __syncthreads();
+
+        int r = t >> 4;
+        int c = t & 15;
+        float sc = -1e30f;
+        if (c < tile_len) {
+            float sum = s_sp[0][r][c] + s_sp[1][r][c] + s_sp[2][r][c] + s_sp[3][r][c]
+                      + s_sp[4][r][c] + s_sp[5][r][c] + s_sp[6][r][c] + s_sp[7][r][c];
+            sc = sum * scale;
+        }
+        float rmax = sc;
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 8));
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 4));
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 2));
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 1));
+        float old_m = s_m[r];
+        float new_m = fmaxf(old_m, rmax);
+        float alpha = exp2f((old_m - new_m) * 1.44269504f);
+        float p = (c < tile_len) ? exp2f((sc - new_m) * 1.44269504f) : 0.0f;
+        s_p[r][c] = __float2half(p);
+        float rsum = p;
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 8);
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 4);
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 2);
+        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 1);
+        if (c == 0) {
+            s_l[r] = s_l[r] * alpha + rsum;
+            s_m[r] = new_m;
+            s_alpha[r] = alpha;
+        }
+        __syncthreads();
+
+        float a0_sc = s_alpha[group_id];
+        float a1_sc = s_alpha[group_id + 8];
+        uint32_t pa0 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2]);
+        uint32_t pa1 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2]);
+        uint32_t pa2 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2 + 8]);
+        uint32_t pa3 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2 + 8]);
+        int col_w = warp * 64;
+        #pragma unroll
+        for (int nb = 0; nb < 8; ++nb) {
+            o0[nb] *= a0_sc;
+            o1[nb] *= a0_sc;
+            o2[nb] *= a1_sc;
+            o3[nb] *= a1_sc;
+            int col = col_w + nb * 8 + group_id;
+            half2 vb0 = __halves2half2(s_kv[tid * 2][col], s_kv[tid * 2 + 1][col]);
+            half2 vb1 = __halves2half2(s_kv[tid * 2 + 8][col], s_kv[tid * 2 + 9][col]);
+            uint32_t b0 = *reinterpret_cast<uint32_t*>(&vb0);
+            uint32_t b1 = *reinterpret_cast<uint32_t*>(&vb1);
+            mqa_mma_m16n8k16_f32(o0[nb], o1[nb], o2[nb], o3[nb], pa0, pa1, pa2, pa3, b0, b1);
+        }
+        __syncthreads();
+    }
+
+    int col_w = warp * 64;
+    size_t base0 = (((size_t)mr * n_heads + h0 + group_id) * n_splits + sp) * 512 + col_w;
+    size_t base1 = (((size_t)mr * n_heads + h0 + group_id + 8) * n_splits + sp) * 512 + col_w;
+    float* po0 = partial_o + base0;
+    float* po1 = partial_o + base1;
+    #pragma unroll
+    for (int nb = 0; nb < 8; ++nb) {
+        int c0 = nb * 8 + tid * 2;
+        po0[c0] = o0[nb];
+        po0[c0 + 1] = o1[nb];
+        po1[c0] = o2[nb];
+        po1[c0 + 1] = o3[nb];
+    }
+    if (t < 16) {
+        size_t ml_idx = (((size_t)mr * n_heads + h0 + t) * n_splits + sp) * 2;
+        partial_ml[ml_idx] = s_m[t];
+        partial_ml[ml_idx + 1] = s_l[t];
+    }
+}
+
+__global__ void mqa_splitkv_reduce_f16_k(
+    const float* __restrict__ partial_o,
+    const float* __restrict__ partial_ml,
+    half* __restrict__ out,
+    int n_heads,
+    int n_splits
+) {
+    int h = blockIdx.x;
+    int mr = blockIdx.y;
+    int t = threadIdx.x;
+    size_t ml_base = ((size_t)mr * n_heads + h) * n_splits * 2;
+    float g_m = -1e30f;
+    for (int sp = 0; sp < n_splits; ++sp) {
+        float m = partial_ml[ml_base + sp * 2];
+        if (m > g_m) g_m = m;
+    }
+    float g_l = 0.0f;
+    float a0 = 0.0f, a1 = 0.0f;
+    size_t o_base = ((size_t)mr * n_heads + h) * n_splits * 512;
+    for (int sp = 0; sp < n_splits; ++sp) {
+        float m = partial_ml[ml_base + sp * 2];
+        float l = partial_ml[ml_base + sp * 2 + 1];
+        float w = (l > 0.0f) ? exp2f((m - g_m) * 1.44269504f) : 0.0f;
+        g_l += l * w;
+        const float* po = partial_o + o_base + (size_t)sp * 512;
+        a0 += po[t * 2] * w;
+        a1 += po[t * 2 + 1] * w;
+    }
+    float inv = 1.0f / fmaxf(g_l, 1e-20f);
+    half2* oh2 = reinterpret_cast<half2*>(out + ((size_t)mr * n_heads + h) * 512);
+    oh2[t] = __float22half2_rn(make_float2(a0 * inv, a1 * inv));
 }
 
 extern "C" {
@@ -1087,6 +1304,7 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     const half* comp_kv,
     const float* attn_sink,
     half* out,
+    float* split_scratch,
     int M,
     int n_heads,
     int start_pos,
@@ -1097,12 +1315,38 @@ void rad_cuda_mqa_attn_sink_causal_f16(
     float scale,
     cudaStream_t stream
 ) {
-    if (head_dim == 512 && k_cache == v_cache && (n_heads % 16) == 0 && (M >= 16 || (M >= 4 && start_pos + M >= 256))) {
-        dim3 grid(n_heads / 16, M);
-        mqa_flash_mma16_f16_k<<<grid, 256, 0, stream>>>(
-            q, k_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
-        );
-        return;
+    if (head_dim == 512 && k_cache == v_cache && (n_heads % 16) == 0) {
+        int eff_len = start_pos + M;
+        if (eff_len > max_ctx) eff_len = max_ctx;
+        if (sliding_window > 0 && eff_len > sliding_window) {
+            eff_len = sliding_window + (comp_kv && comp_ratio > 0 ? (eff_len - sliding_window) / comp_ratio : 0);
+        }
+        int base_ctas = (n_heads / 16) * M;
+        if (split_scratch && eff_len >= 1024 && M <= 16 && base_ctas < 48) {
+            int n_splits = (48 + base_ctas - 1) / base_ctas;
+            if (n_splits > 8) n_splits = 8;
+            if (n_splits > 1) {
+                size_t o_elems = (size_t)M * n_heads * n_splits * 512;
+                float* partial_ml = split_scratch + o_elems;
+                dim3 g1(n_heads / 16, M, n_splits);
+                mqa_flash_mma16_splitkv_f16_k<<<g1, 256, 0, stream>>>(
+                    q, k_cache, comp_kv, attn_sink, split_scratch, partial_ml,
+                    n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale, n_splits
+                );
+                dim3 g2(n_heads, M);
+                mqa_splitkv_reduce_f16_k<<<g2, 256, 0, stream>>>(
+                    split_scratch, partial_ml, out, n_heads, n_splits
+                );
+                return;
+            }
+        }
+        if (M >= 16 || (M >= 4 && start_pos + M >= 256)) {
+            dim3 grid(n_heads / 16, M);
+            mqa_flash_mma16_f16_k<<<grid, 256, 0, stream>>>(
+                q, k_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
+            );
+            return;
+        }
     }
     if (head_dim == 512 && M >= 16 && (n_heads % 8) == 0) {
         dim3 grid(n_heads / 8, M);

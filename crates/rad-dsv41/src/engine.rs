@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::config::DeepseekV41Config;
 use crate::cuda_ops;
 use crate::engram::{EngramHost, EngramLayerWeights};
-use crate::mtp::{ngram_draft, DsparkMtp};
+use crate::mtp::{ngram_draft_cfg, DsparkMtp};
 use crate::safetensors::SafetensorsIndex;
 use crate::weights::{load_raw_buf_replicated, CompressorWeights, Exl3Linear, LayerWeights};
 
@@ -86,6 +86,7 @@ pub struct Dsv41Engine {
     pub mtp_wo_graphs: HashMap<usize, CudaCapturedGraph>,
     pub mtp_ffn_graphs: HashMap<usize, CudaCapturedGraph>,
     pub last_draft_len: usize,
+    pub last_acc: usize,
     pub dspark_blocks: usize,
     pub pos: usize,
     pub wht_scale: f32,
@@ -257,6 +258,7 @@ impl Dsv41Engine {
             mtp_wo_graphs: HashMap::new(),
             mtp_ffn_graphs: HashMap::new(),
             last_draft_len: 1,
+            last_acc: 0,
             dspark_blocks: 1,
             pos: 0,
             wht_scale: 1.0f32 / 128.0f32.sqrt(),
@@ -690,6 +692,7 @@ impl Dsv41Engine {
                     comp_ptr,
                     sink_ptr,
                     self.d_attn_out.ptr,
+                    self.d_z_scratch.ptr,
                     mi,
                     n_heads_local as i32,
                     start_pos,
@@ -906,7 +909,7 @@ impl Dsv41Engine {
         let t2 = std::time::Instant::now();
         unsafe {
             let sink_ptr = (lw.attn_sink.ptr as *const f32).add(self.rank * n_heads_local);
-            cuda_ops::rad_cuda_mqa_attn_sink_causal_f16(self.d_q.ptr, self.kv_caches[0].k_cache.ptr, self.kv_caches[0].k_cache.ptr, std::ptr::null(), sink_ptr, self.d_attn_out.ptr, 1, n_heads_local as i32, start_pos, self.max_ctx as i32, 0, 0, tc.head_dim as i32, attn_scale, stream);
+            cuda_ops::rad_cuda_mqa_attn_sink_causal_f16(self.d_q.ptr, self.kv_caches[0].k_cache.ptr, self.kv_caches[0].k_cache.ptr, std::ptr::null(), sink_ptr, self.d_attn_out.ptr, self.d_z_scratch.ptr, 1, n_heads_local as i32, start_pos, self.max_ctx as i32, 0, 0, tc.head_dim as i32, attn_scale, stream);
             cuda_ops::rad_cuda_rope_yarn_f16(self.d_attn_out.ptr, std::ptr::null_mut(), 1, n_heads_local as i32, 0, tc.head_dim as i32, tc.qk_rope_head_dim as i32, start_pos, tc.rope_theta, 0, -1.0f32, stream);
         }
         let _ = sync_t();
@@ -1220,8 +1223,9 @@ impl Dsv41Engine {
         let trace = *TRACE_SPEC.get_or_init(|| std::env::var("RAD_TRACE_SPEC").map(|v| v == "1").unwrap_or(false));
         let max_k = MAX_DECODE_BATCH.min(self.max_ctx.saturating_sub(self.pos + 1));
         let t_draft = Instant::now();
+        let in_edit = self.last_acc >= 10;
         let (mut draft, mode) = if max_k >= 4 {
-            if let Some(ng) = ngram_draft(history, anchor, max_k) {
+            if let Some(ng) = ngram_draft_cfg(history, anchor, max_k, in_edit) {
                 (ng, "ngram")
             } else if self.mtp.is_some() {
                 let n_blk = 1usize;
@@ -1273,6 +1277,7 @@ impl Dsv41Engine {
                     draft.len()
                 );
             }
+            self.last_acc = k_acc;
             let new_pos = start_pos + k_acc;
             self.pos = new_pos;
             if let Some(ref mut mtp) = self.mtp {

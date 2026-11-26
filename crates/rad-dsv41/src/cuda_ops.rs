@@ -172,6 +172,7 @@ extern "C" {
         comp_kv: *const c_void,
         attn_sink: *const f32,
         out: *mut c_void,
+        split_scratch: *mut c_void,
         m: i32,
         n_heads: i32,
         start_pos: i32,
