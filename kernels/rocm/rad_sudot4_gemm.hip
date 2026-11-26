@@ -1416,9 +1416,9 @@ extern "C" __global__ void dflash2_kv_q4_k(const uint8_t* __restrict__ Wk,
                                            float* __restrict__ K_out,
                                            float* __restrict__ V_out,
                                            int kv_dim, int k_dim, int B) {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * 8 + warp;
+    int grp = threadIdx.x >> 3;
+    int lane8 = threadIdx.x & 7;
+    int row = blockIdx.x * 32 + grp;
     if (row >= kv_dim) return;
     int is_v = blockIdx.y;
     const uint8_t* W = is_v ? Wv : Wk;
@@ -1431,21 +1431,39 @@ extern "C" __global__ void dflash2_kv_q4_k(const uint8_t* __restrict__ Wk,
     float acc[8];
 #pragma unroll
     for (int t = 0; t < 8; ++t) acc[t] = 0.0f;
-    for (int b = lane; b < nblk; b += 32) {
-        uint4 qw = qrow[b];
+    for (int b = lane8; b < nblk; b += 8) {
+        uint4 q4 = qrow[b];
         float dw = __half2float(drow[b]);
+        int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu);
+        int32_t w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+        int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu);
+        int32_t w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+        int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu);
+        int32_t w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+        int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu);
+        int32_t w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
         for (int t = 0; t < B; ++t) {
-            acc[t] += dot_q4_soa_q8_1_blk(qw, dw, Xq[(size_t)t * nblk + b]);
+            const q8_1_blk xb = Xq[(size_t)t * nblk + b];
+            int32_t sumi = 0;
+            sumi = __builtin_amdgcn_sudot4(false, w0, true, xb.q[0], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w1, true, xb.q[1], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w2, true, xb.q[2], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w3, true, xb.q[3], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w4, true, xb.q[4], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w5, true, xb.q[5], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w6, true, xb.q[6], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w7, true, xb.q[7], sumi, false);
+            acc[t] = fmaf(dw * xb.d, (float)(sumi - 8 * xb.s), acc[t]);
         }
     }
     for (int t = 0; t < B; ++t) {
-        float v = s_warp_sum32(acc[t]);
-        if (lane == 0) Y[(size_t)t * kv_dim + row] = v;
+        float v = s_warp_sum8(acc[t]);
+        if (lane8 == 0) Y[(size_t)t * kv_dim + row] = v;
     }
 }
 
 extern "C" int ink_dflash2_kv_q4(hipStream_t s, const uint8_t* wk, const uint8_t* wv, const void* xq, float* k_out, float* v_out, int kv_dim, int k_dim, int b) {
-    dflash2_kv_q4_k<<<dim3((kv_dim + 7) / 8, 2), dim3(256), 0, s>>>(wk, wv, (const q8_1_blk*)xq, k_out, v_out, kv_dim, k_dim, b);
+    dflash2_kv_q4_k<<<dim3((kv_dim + 31) / 32, 2), dim3(256), 0, s>>>(wk, wv, (const q8_1_blk*)xq, k_out, v_out, kv_dim, k_dim, b);
     return 0;
 }
 
