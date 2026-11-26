@@ -267,11 +267,17 @@ __global__ __launch_bounds__(256)
 void exl3_mma_m64_mul1_k(
     const half* __restrict__ x_rot,
     const uint16_t* __restrict__ trellis,
+    const half* __restrict__ svh,
+    const half* __restrict__ gate_in,
+    half* __restrict__ y_out,
     float* __restrict__ z_f32,
     int M,
     int K,
     int N,
-    int split_k
+    int split_k,
+    float wht_scale,
+    float swiglu_limit,
+    int add_to_y
 ) {
     constexpr int PACKED_U16 = 16 * BITS;
     constexpr int PACKED_U32 = 8 * BITS;
@@ -291,6 +297,7 @@ void exl3_mma_m64_mul1_k(
 
     __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
     __shared__ alignas(16) half s_x[64][16];
+    __shared__ alignas(16) float s_z[16][128];
 
     float c0[4][4];
     float c1[4][4];
@@ -343,6 +350,59 @@ void exl3_mma_m64_mul1_k(
             }
         }
         __syncthreads();
+    }
+
+    if (split_k == 1 && y_out != nullptr) {
+        int col = blockIdx.x * 128 + lane * 4;
+        float sv0 = 1.0f, sv1 = 1.0f, sv2 = 1.0f, sv3 = 1.0f;
+        if (svh) {
+            uint2 sq = __ldg(reinterpret_cast<const uint2*>(svh + col));
+            float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
+            float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
+            sv0 = s01.x; sv1 = s01.y; sv2 = s23.x; sv3 = s23.y;
+        }
+        int w_col = warp * 16 + tid_in_grp * 2;
+        for (int r = 0; r < 4; ++r) {
+            if (m_base + r * 16 >= M) break;
+            s_z[group_id][w_col + 0] = c0[r][0]; s_z[group_id][w_col + 1] = c0[r][1];
+            s_z[group_id][w_col + 8] = c1[r][0]; s_z[group_id][w_col + 9] = c1[r][1];
+            s_z[group_id + 8][w_col + 0] = c0[r][2]; s_z[group_id + 8][w_col + 1] = c0[r][3];
+            s_z[group_id + 8][w_col + 8] = c1[r][2]; s_z[group_id + 8][w_col + 9] = c1[r][3];
+            __syncthreads();
+            #pragma unroll
+            for (int sub = 0; sub < 2; ++sub) {
+                int lr = warp + sub * 8;
+                int mr = m_base + r * 16 + lr;
+                if (mr < M) {
+                    size_t off = (size_t)mr * N + col;
+                    float4 zv = *reinterpret_cast<const float4*>(&s_z[lr][lane * 4]);
+                    float v0 = zv.x, v1 = zv.y, v2 = zv.z, v3 = zv.w;
+                    if (wht_scale > 0.0f) mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
+                    v0 *= sv0; v1 *= sv1; v2 *= sv2; v3 *= sv3;
+                    if (gate_in) {
+                        uint2 gq = *reinterpret_cast<const uint2*>(gate_in + off);
+                        float2 g01 = __half22float2(*reinterpret_cast<const half2*>(&gq.x));
+                        float2 g23 = __half22float2(*reinterpret_cast<const half2*>(&gq.y));
+                        auto act = [&](float g, float u) -> float {
+                            float gc = fminf(g, swiglu_limit);
+                            float uc = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
+                            return (gc / (1.0f + expf(-gc))) * uc;
+                        };
+                        v0 = act(g01.x, v0); v1 = act(g01.y, v1); v2 = act(g23.x, v2); v3 = act(g23.y, v3);
+                    } else if (add_to_y) {
+                        uint2 yq = *reinterpret_cast<const uint2*>(y_out + off);
+                        float2 y01 = __half22float2(*reinterpret_cast<const half2*>(&yq.x));
+                        float2 y23 = __half22float2(*reinterpret_cast<const half2*>(&yq.y));
+                        v0 += y01.x; v1 += y01.y; v2 += y23.x; v3 += y23.y;
+                    }
+                    half2 h01 = __float22half2_rn(make_float2(fmaxf(fminf(v0, 65000.0f), -65000.0f), fmaxf(fminf(v1, 65000.0f), -65000.0f)));
+                    half2 h23 = __float22half2_rn(make_float2(fmaxf(fminf(v2, 65000.0f), -65000.0f), fmaxf(fminf(v3, 65000.0f), -65000.0f)));
+                    *reinterpret_cast<uint2*>(y_out + off) = make_uint2(*reinterpret_cast<const uint32_t*>(&h01), *reinterpret_cast<const uint32_t*>(&h23));
+                }
+            }
+            __syncthreads();
+        }
+        return;
     }
 
     if (n_tile >= N_tiles) return;
@@ -654,6 +714,10 @@ __global__ __launch_bounds__(256)
 void exl3_moe_mma_grouped_m64_prerot_k(
     const half* __restrict__ x_rot,
     const uint16_t* const* __restrict__ trellis_ptrs,
+    const half* const* __restrict__ svh_ptrs,
+    const half* const* __restrict__ next_suh_ptrs,
+    const half* __restrict__ gate_in,
+    half* __restrict__ y_out,
     const int* __restrict__ sorted_pairs,
     const int* __restrict__ grp_eids,
     const int* __restrict__ grp_offs,
@@ -662,7 +726,9 @@ void exl3_moe_mma_grouped_m64_prerot_k(
     float* __restrict__ z_f32,
     int K,
     int N,
-    int split_k
+    int split_k,
+    float wht_scale,
+    float swiglu_limit
 ) {
     constexpr int PACKED_U16 = 16 * BITS;
     constexpr int PACKED_U32 = 8 * BITS;
@@ -687,6 +753,7 @@ void exl3_moe_mma_grouped_m64_prerot_k(
 
     __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
     __shared__ alignas(16) half s_x[64][16];
+    __shared__ alignas(16) float s_z[16][128];
     __shared__ int s_pair_ids[64];
     if (t < g_len) {
         s_pair_ids[t] = sorted_pairs[g_off + t];
@@ -743,6 +810,76 @@ void exl3_moe_mma_grouped_m64_prerot_k(
             }
         }
         __syncthreads();
+    }
+
+    if (split_k == 1 && y_out != nullptr) {
+        int col = blockIdx.x * 128 + lane * 4;
+        float sv0 = 1.0f, sv1 = 1.0f, sv2 = 1.0f, sv3 = 1.0f;
+        if (svh_ptrs && svh_ptrs[local_eid]) {
+            uint2 sv = __ldg(reinterpret_cast<const uint2*>(svh_ptrs[local_eid] + col));
+            float2 s0 = __half22float2(*reinterpret_cast<const half2*>(&sv.x));
+            float2 s1 = __half22float2(*reinterpret_cast<const half2*>(&sv.y));
+            sv0 = s0.x; sv1 = s0.y; sv2 = s1.x; sv3 = s1.y;
+        }
+        float ns0 = 1.0f, ns1 = 1.0f, ns2 = 1.0f, ns3 = 1.0f;
+        if (next_suh_ptrs && next_suh_ptrs[local_eid]) {
+            uint2 nq = __ldg(reinterpret_cast<const uint2*>(next_suh_ptrs[local_eid] + col));
+            float2 n0 = __half22float2(*reinterpret_cast<const half2*>(&nq.x));
+            float2 n1 = __half22float2(*reinterpret_cast<const half2*>(&nq.y));
+            ns0 = n0.x; ns1 = n0.y; ns2 = n1.x; ns3 = n1.y;
+        }
+        int w_col = warp * 16 + tid_in_grp * 2;
+        for (int r = 0; r < 4; ++r) {
+            if (r * 16 >= g_len) break;
+            s_z[group_id][w_col + 0] = c0[r][0];
+            s_z[group_id][w_col + 1] = c0[r][1];
+            s_z[group_id][w_col + 8] = c1[r][0];
+            s_z[group_id][w_col + 9] = c1[r][1];
+            s_z[group_id + 8][w_col + 0] = c0[r][2];
+            s_z[group_id + 8][w_col + 1] = c0[r][3];
+            s_z[group_id + 8][w_col + 8] = c1[r][2];
+            s_z[group_id + 8][w_col + 9] = c1[r][3];
+            __syncthreads();
+            #pragma unroll
+            for (int sub = 0; sub < 2; ++sub) {
+                int lr = warp + sub * 8;
+                int row = r * 16 + lr;
+                if (row < g_len) {
+                    int pid = s_pair_ids[row];
+                    size_t off = (size_t)pid * N + col;
+                    float4 zv = *reinterpret_cast<const float4*>(&s_z[lr][lane * 4]);
+                    float v0 = zv.x, v1 = zv.y, v2 = zv.z, v3 = zv.w;
+                    if (wht_scale > 0.0f) {
+                        mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
+                    }
+                    v0 *= sv0; v1 *= sv1; v2 *= sv2; v3 *= sv3;
+                    if (gate_in) {
+                        uint2 gv = *reinterpret_cast<const uint2*>(gate_in + off);
+                        float2 g0 = __half22float2(*reinterpret_cast<const half2*>(&gv.x));
+                        float2 g1 = __half22float2(*reinterpret_cast<const half2*>(&gv.y));
+                        auto sw = [&](float g_v, float u_v) -> float {
+                            if (g_v > swiglu_limit) g_v = swiglu_limit;
+                            if (u_v > swiglu_limit) u_v = swiglu_limit;
+                            if (u_v < -swiglu_limit) u_v = -swiglu_limit;
+                            return (g_v / (1.0f + expf(-g_v))) * u_v;
+                        };
+                        v0 = sw(g0.x, v0);
+                        v1 = sw(g0.y, v1);
+                        v2 = sw(g1.x, v2);
+                        v3 = sw(g1.y, v3);
+                    }
+                    if (next_suh_ptrs) {
+                        v0 *= ns0; v1 *= ns1; v2 *= ns2; v3 *= ns3;
+                        mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
+                    }
+                    half2 h0 = __float22half2_rn(make_float2(v0, v1));
+                    half2 h1 = __float22half2_rn(make_float2(v2, v3));
+                    *reinterpret_cast<uint2*>(y_out + off) = make_uint2(*reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1));
+                }
+            }
+            __syncthreads();
+        }
+        return;
     }
 
     if (n_tile >= N_tiles) return;
@@ -929,115 +1066,6 @@ void exl3_moe_mma_grouped_m64_mul1_k(
                 atomicAdd(z1 + 0, c0[r][2]); atomicAdd(z1 + 1, c0[r][3]);
                 atomicAdd(z1 + 8, c1[r][2]); atomicAdd(z1 + 9, c1[r][3]);
             }
-        }
-    }
-}
-
-template <int BITS>
-__global__ __launch_bounds__(256)
-void exl3_moe_mma_grouped_m16_prerot_k(
-    const half* __restrict__ x_rot,
-    const uint16_t* const* __restrict__ trellis_ptrs,
-    const int* __restrict__ sorted_pairs,
-    const int* __restrict__ grp_eids,
-    const int* __restrict__ grp_offs,
-    const int* __restrict__ grp_lens,
-    const int* __restrict__ num_groups,
-    float* __restrict__ z_f32,
-    int K,
-    int N,
-    int split_k
-) {
-    constexpr int PACKED_U16 = 16 * BITS;
-    constexpr int PACKED_U32 = 8 * BITS;
-    constexpr int PACKED_U4 = 2 * BITS;
-    int g = blockIdx.y;
-    if (g >= num_groups[0]) return;
-    int t = threadIdx.x;
-    int lane = t & 31;
-    int warp = t >> 5;
-    int n_tile = blockIdx.x * 8 + warp;
-    int sk = blockIdx.z;
-    int N_tiles = N >> 4;
-    int K_tiles = K >> 4;
-
-    int local_eid = grp_eids[g];
-    int g_off = grp_offs[g];
-    int g_len = grp_lens[g];
-    const uint16_t* trellis = trellis_ptrs[local_eid];
-
-    int kt_start = (K_tiles * sk) / split_k;
-    int kt_end = (K_tiles * (sk + 1)) / split_k;
-
-    __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
-    __shared__ alignas(16) half s_x[16][16];
-    __shared__ int s_pair_ids[16];
-    if (t < g_len) {
-        s_pair_ids[t] = sorted_pairs[g_off + t];
-    }
-    __syncthreads();
-
-    float c00 = 0.0f, c01 = 0.0f, c02 = 0.0f, c03 = 0.0f;
-    float c10 = 0.0f, c11 = 0.0f, c12 = 0.0f, c13 = 0.0f;
-
-    int group_id = lane >> 2;
-    int tid_in_grp = lane & 3;
-    int k_off0 = tid_in_grp * 2;
-    int k_off1 = k_off0 + 8;
-    int ld_row = t >> 2;
-    int ld_col = (t & 3) * 4;
-    int ld_pid = (ld_row < g_len) ? s_pair_ids[ld_row] : -1;
-    uint4* s_u4 = reinterpret_cast<uint4*>(s_packed[warp]);
-
-    for (int kt = kt_start; kt < kt_end; ++kt) {
-        int kb = kt * 16;
-        if (ld_row < 16) {
-            if (ld_pid >= 0) {
-                *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = *reinterpret_cast<const uint2*>(x_rot + (size_t)ld_pid * K + kb + ld_col);
-            } else {
-                *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = make_uint2(0u, 0u);
-            }
-        }
-        if (n_tile < N_tiles && lane < PACKED_U4) {
-            const uint4* g_u4 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
-            s_u4[lane] = __ldg(g_u4 + lane);
-        }
-        __syncthreads();
-
-        if (n_tile < N_tiles) {
-            uint32_t b00, b01, b10, b11;
-            mma_dq8_mul1<BITS>(s_packed[warp], lane * 8, b00, b01, b10, b11);
-
-            uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_x[group_id][k_off0]);
-            uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_x[group_id][k_off1]);
-            uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_x[group_id + 8][k_off0]);
-            uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_x[group_id + 8][k_off1]);
-            mma_m16n8k16_f32(c00, c01, c02, c03, a0, a1, a2, a3, b00, b01);
-            mma_m16n8k16_f32(c10, c11, c12, c13, a0, a1, a2, a3, b10, b11);
-        }
-        __syncthreads();
-    }
-
-    if (n_tile >= N_tiles) return;
-    int col_base = n_tile * 16 + tid_in_grp * 2;
-    if (group_id < g_len) {
-        int pid0 = s_pair_ids[group_id];
-        float* z0 = z_f32 + (size_t)pid0 * N + col_base;
-        if (split_k == 1) {
-            z0[0] = c00; z0[1] = c01; z0[8] = c10; z0[9] = c11;
-        } else {
-            atomicAdd(z0 + 0, c00); atomicAdd(z0 + 1, c01);
-            atomicAdd(z0 + 8, c10); atomicAdd(z0 + 9, c11);
-        }
-    }
-    if (group_id + 8 < g_len) {
-        int pid1 = s_pair_ids[group_id + 8];
-        float* z1 = z_f32 + (size_t)pid1 * N + col_base;
-        if (split_k == 1) {
-            z1[0] = c02; z1[1] = c03; z1[8] = c12; z1[9] = c13;
-        } else {
-            atomicAdd(z1 + 0, c02); atomicAdd(z1 + 1, c03);
-            atomicAdd(z1 + 8, c12); atomicAdd(z1 + 9, c13);
         }
     }
 }
@@ -1343,12 +1371,15 @@ __global__ __launch_bounds__(256)
 void exl3_batched_group_mma_m64_prerot_k(
     const half* __restrict__ x_rot,
     const uint16_t* const* __restrict__ trellis_ptrs,
+    const half* const* __restrict__ svh_ptrs,
+    half* __restrict__ y_out,
     float* __restrict__ z_f32,
     int M,
     int G,
     int K,
     int N,
-    int split_k
+    int split_k,
+    float wht_scale
 ) {
     constexpr int PACKED_U16 = 16 * BITS;
     constexpr int PACKED_U32 = 8 * BITS;
@@ -1374,6 +1405,7 @@ void exl3_batched_group_mma_m64_prerot_k(
 
     __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
     __shared__ alignas(16) half s_x[64][16];
+    __shared__ alignas(16) float s_z[16][128];
 
     float c0[4][4];
     float c1[4][4];
@@ -1425,6 +1457,38 @@ void exl3_batched_group_mma_m64_prerot_k(
             }
         }
         __syncthreads();
+    }
+
+    if (split_k == 1 && y_out != nullptr) {
+        int col = blockIdx.x * 128 + lane * 4;
+        uint2 sq = __ldg(reinterpret_cast<const uint2*>(svh_ptrs[g] + col));
+        float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
+        float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
+        int w_col = warp * 16 + tid_in_grp * 2;
+        for (int r = 0; r < 4; ++r) {
+            if (r * 16 >= m_len) break;
+            s_z[group_id][w_col + 0] = c0[r][0]; s_z[group_id][w_col + 1] = c0[r][1];
+            s_z[group_id][w_col + 8] = c1[r][0]; s_z[group_id][w_col + 9] = c1[r][1];
+            s_z[group_id + 8][w_col + 0] = c0[r][2]; s_z[group_id + 8][w_col + 1] = c0[r][3];
+            s_z[group_id + 8][w_col + 8] = c1[r][2]; s_z[group_id + 8][w_col + 9] = c1[r][3];
+            __syncthreads();
+            #pragma unroll
+            for (int sub = 0; sub < 2; ++sub) {
+                int lr = warp + sub * 8;
+                int row = r * 16 + lr;
+                if (row < m_len) {
+                    float4 zv = *reinterpret_cast<const float4*>(&s_z[lr][lane * 4]);
+                    float v0 = zv.x, v1 = zv.y, v2 = zv.z, v3 = zv.w;
+                    mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
+                    v0 *= s01.x; v1 *= s01.y; v2 *= s23.x; v3 *= s23.y;
+                    half2 h01 = __float22half2_rn(make_float2(fminf(fmaxf(v0, -65504.0f), 65504.0f), fminf(fmaxf(v1, -65504.0f), 65504.0f)));
+                    half2 h23 = __float22half2_rn(make_float2(fminf(fmaxf(v2, -65504.0f), 65504.0f), fminf(fmaxf(v3, -65504.0f), 65504.0f)));
+                    *reinterpret_cast<uint2*>(y_out + (size_t)((m0 + row) * G + g) * N + col) = make_uint2(*reinterpret_cast<const uint32_t*>(&h01), *reinterpret_cast<const uint32_t*>(&h23));
+                }
+            }
+            __syncthreads();
+        }
+        return;
     }
 
     if (n_tile >= N_tiles) return;
@@ -1697,13 +1761,20 @@ void rad_cuda_exl3_moe_mma_f16(
                     x_in, suh_ptrs, expert_ids, x_rot_scratch, top_k, K, wht_scale, x_per_expert, expert_start, n_local_experts
                 );
             }
+            if (split_k == 1 && x_per_expert && !gate_in) {
+                cudaMemsetAsync(y_out, 0, (size_t)pairs * N * sizeof(half), stream);
+            }
+            half* fused_y = (split_k == 1) ? y_out : nullptr;
             switch (bits) {
-                case 2: exl3_moe_mma_grouped_m64_prerot_k<2><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k); break;
-                case 3: exl3_moe_mma_grouped_m64_prerot_k<3><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k); break;
-                case 4: exl3_moe_mma_grouped_m64_prerot_k<4><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k); break;
-                case 5: exl3_moe_mma_grouped_m64_prerot_k<5><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k); break;
-                case 6: exl3_moe_mma_grouped_m64_prerot_k<6><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k); break;
-                case 8: exl3_moe_mma_grouped_m64_prerot_k<8><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k); break;
+                case 2: exl3_moe_mma_grouped_m64_prerot_k<2><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit); break;
+                case 3: exl3_moe_mma_grouped_m64_prerot_k<3><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit); break;
+                case 4: exl3_moe_mma_grouped_m64_prerot_k<4><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit); break;
+                case 5: exl3_moe_mma_grouped_m64_prerot_k<5><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit); break;
+                case 6: exl3_moe_mma_grouped_m64_prerot_k<6><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit); break;
+                case 8: exl3_moe_mma_grouped_m64_prerot_k<8><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit); break;
+            }
+            if (split_k == 1) {
+                return;
             }
         } else if (use_m64) {
             switch (bits) {
@@ -1780,14 +1851,16 @@ void rad_cuda_exl3_batched_group_mma_f16(
         batched_group_wht128_pre_mul_f16_k<<<pre_grid, 32, 0, stream>>>(
             x_in, suh_ptrs, x_rot_scratch, G, K, wht_scale
         );
+        half* fused_y = (split_k == 1) ? y_out : nullptr;
         switch (bits) {
-            case 2: exl3_batched_group_mma_m64_prerot_k<2><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, z_scratch_f32, M, G, K, N, split_k); break;
-            case 3: exl3_batched_group_mma_m64_prerot_k<3><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, z_scratch_f32, M, G, K, N, split_k); break;
-            case 4: exl3_batched_group_mma_m64_prerot_k<4><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, z_scratch_f32, M, G, K, N, split_k); break;
-            case 5: exl3_batched_group_mma_m64_prerot_k<5><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, z_scratch_f32, M, G, K, N, split_k); break;
-            case 6: exl3_batched_group_mma_m64_prerot_k<6><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, z_scratch_f32, M, G, K, N, split_k); break;
-            case 8: exl3_batched_group_mma_m64_prerot_k<8><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, z_scratch_f32, M, G, K, N, split_k); break;
+            case 2: exl3_batched_group_mma_m64_prerot_k<2><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
+            case 3: exl3_batched_group_mma_m64_prerot_k<3><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
+            case 4: exl3_batched_group_mma_m64_prerot_k<4><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
+            case 5: exl3_batched_group_mma_m64_prerot_k<5><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
+            case 6: exl3_batched_group_mma_m64_prerot_k<6><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
+            case 8: exl3_batched_group_mma_m64_prerot_k<8><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
         }
+        if (split_k == 1) return;
     } else if (use_m64) {
         switch (bits) {
             case 2: exl3_batched_group_mma_m64_mul1_k<2><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
@@ -1840,14 +1913,16 @@ void rad_cuda_exl3_mma_f16(
     }
     dim3 grid(n_blocks, m_blocks, split_k);
     if (use_m64) {
+        half* fused_y = (split_k == 1) ? y : nullptr;
         switch (bits) {
-            case 2: exl3_mma_m64_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 3: exl3_mma_m64_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 4: exl3_mma_m64_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 5: exl3_mma_m64_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 6: exl3_mma_m64_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 8: exl3_mma_m64_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 2: exl3_mma_m64_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
+            case 3: exl3_mma_m64_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
+            case 4: exl3_mma_m64_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
+            case 5: exl3_mma_m64_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
+            case 6: exl3_mma_m64_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
+            case 8: exl3_mma_m64_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
         }
+        if (split_k == 1) return;
     } else {
         switch (bits) {
             case 2: exl3_mma_m16_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
@@ -1892,14 +1967,16 @@ void rad_cuda_exl3_mma_swiglu_f16(
     }
     dim3 grid(n_blocks, m_blocks, split_k);
     if (use_m64) {
+        half* fused_y = (split_k == 1) ? y : nullptr;
         switch (bits) {
-            case 2: exl3_mma_m64_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 3: exl3_mma_m64_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 4: exl3_mma_m64_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 5: exl3_mma_m64_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 6: exl3_mma_m64_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 8: exl3_mma_m64_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
+            case 2: exl3_mma_m64_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
+            case 3: exl3_mma_m64_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
+            case 4: exl3_mma_m64_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
+            case 5: exl3_mma_m64_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
+            case 6: exl3_mma_m64_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
+            case 8: exl3_mma_m64_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
         }
+        if (split_k == 1) return;
     } else {
         switch (bits) {
             case 2: exl3_mma_m16_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
