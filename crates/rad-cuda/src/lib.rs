@@ -191,6 +191,66 @@ impl Drop for CudaCapturedGraph {
     }
 }
 
+pub struct CudaAuxStream {
+    pub stream: CudaStream,
+    ev_fork: CudaEvent,
+    ev_join: CudaEvent,
+}
+unsafe impl Send for CudaAuxStream {}
+unsafe impl Sync for CudaAuxStream {}
+
+impl CudaAuxStream {
+    pub fn new() -> Result<Self, CudaError> {
+        let mut stream = std::ptr::null_mut();
+        let rc = unsafe { cudaStreamCreateWithFlags(&mut stream, CUDA_STREAM_NON_BLOCKING) };
+        if rc != CUDA_SUCCESS {
+            return Err(rc);
+        }
+        let mut ev_fork = std::ptr::null_mut();
+        let rc = unsafe { cudaEventCreateWithFlags(&mut ev_fork, CUDA_EVENT_DISABLE_TIMING) };
+        if rc != CUDA_SUCCESS {
+            unsafe { cudaStreamDestroy(stream) };
+            return Err(rc);
+        }
+        let mut ev_join = std::ptr::null_mut();
+        let rc = unsafe { cudaEventCreateWithFlags(&mut ev_join, CUDA_EVENT_DISABLE_TIMING) };
+        if rc != CUDA_SUCCESS {
+            unsafe {
+                cudaEventDestroy(ev_fork);
+                cudaStreamDestroy(stream);
+            }
+            return Err(rc);
+        }
+        Ok(Self { stream, ev_fork, ev_join })
+    }
+
+    pub unsafe fn fork(&self, main_stream: CudaStream) {
+        cudaEventRecord(self.ev_fork, main_stream);
+        cudaStreamWaitEvent(self.stream, self.ev_fork, 0);
+    }
+
+    pub unsafe fn join(&self, main_stream: CudaStream) {
+        cudaEventRecord(self.ev_join, self.stream);
+        cudaStreamWaitEvent(main_stream, self.ev_join, 0);
+    }
+}
+
+impl Drop for CudaAuxStream {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.ev_join.is_null() {
+                cudaEventDestroy(self.ev_join);
+            }
+            if !self.ev_fork.is_null() {
+                cudaEventDestroy(self.ev_fork);
+            }
+            if !self.stream.is_null() {
+                cudaStreamDestroy(self.stream);
+            }
+        }
+    }
+}
+
 pub fn device_count() -> Result<i32, CudaError> {
     let mut n = 0i32;
     let rc = unsafe { cudaGetDeviceCount(&mut n) };
