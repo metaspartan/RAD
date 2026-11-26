@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <stdint.h>
 #include <math.h>
 
@@ -308,6 +309,110 @@ __global__ void mhc_coeff_proj_k(
     }
 }
 
+__global__ void mhc_pre_mix_rmsnorm_f16_k(
+    const float* __restrict__ streams,
+    const float* __restrict__ prev_pre,
+    const __nv_bfloat16* __restrict__ norm_w,
+    half* __restrict__ y_out,
+    int D,
+    float eps
+) {
+    int mr = blockIdx.x;
+    int t = threadIdx.x;
+    __shared__ float s_pre[4];
+    __shared__ float sm[8];
+    if (t < 4) {
+        if (prev_pre) {
+            s_pre[t] = prev_pre[(size_t)mr * 4 + t];
+        } else {
+            s_pre[t] = (t == 0) ? 1.0f : 0.0f;
+        }
+    }
+    __syncthreads();
+    float p0 = s_pre[0], p1 = s_pre[1], p2 = s_pre[2], p3 = s_pre[3];
+    int d4 = D >> 2;
+    const float4* sr4 = reinterpret_cast<const float4*>(streams + (size_t)mr * 4 * D);
+    float4 vals[6];
+    float ss = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        int i4 = t + k * 256;
+        if (i4 < d4) {
+            float4 a = sr4[0 * d4 + i4];
+            float4 b = sr4[1 * d4 + i4];
+            float4 c = sr4[2 * d4 + i4];
+            float4 d = sr4[3 * d4 + i4];
+            float4 v;
+            v.x = p0 * a.x + p1 * b.x + p2 * c.x + p3 * d.x;
+            v.y = p0 * a.y + p1 * b.y + p2 * c.y + p3 * d.y;
+            v.z = p0 * a.z + p1 * b.z + p2 * c.z + p3 * d.z;
+            v.w = p0 * a.w + p1 * b.w + p2 * c.w + p3 * d.w;
+            vals[k] = v;
+            ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
+        }
+    }
+    for (int i4 = t + 6 * 256; i4 < d4; i4 += 256) {
+        float4 a = sr4[0 * d4 + i4];
+        float4 b = sr4[1 * d4 + i4];
+        float4 c = sr4[2 * d4 + i4];
+        float4 d = sr4[3 * d4 + i4];
+        float vx = p0 * a.x + p1 * b.x + p2 * c.x + p3 * d.x;
+        float vy = p0 * a.y + p1 * b.y + p2 * c.y + p3 * d.y;
+        float vz = p0 * a.z + p1 * b.z + p2 * c.z + p3 * d.z;
+        float vw = p0 * a.w + p1 * b.w + p2 * c.w + p3 * d.w;
+        ss = fmaf(vx, vx, fmaf(vy, vy, fmaf(vz, vz, fmaf(vw, vw, ss))));
+    }
+    int lane = t & 31;
+    int warp = t >> 5;
+    for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, m);
+    if (lane == 0) sm[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < 8) ? sm[lane] : 0.0f;
+        for (int m = 4; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, m);
+        if (lane == 0) sm[0] = rsqrtf(v / (float)D + eps);
+    }
+    __syncthreads();
+    float inv = sm[0];
+    const uint2* nw2 = reinterpret_cast<const uint2*>(norm_w);
+    uint2* y2 = reinterpret_cast<uint2*>(y_out + (size_t)mr * D);
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        int i4 = t + k * 256;
+        if (i4 < d4) {
+            uint2 wq = __ldg(nw2 + i4);
+            float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wq.x));
+            float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wq.y));
+            float4 v = vals[k];
+            half2 h01 = __float22half2_rn(make_float2(v.x * inv * w01.x, v.y * inv * w01.y));
+            half2 h23 = __float22half2_rn(make_float2(v.z * inv * w23.x, v.w * inv * w23.y));
+            uint2 oq;
+            oq.x = *reinterpret_cast<const uint32_t*>(&h01);
+            oq.y = *reinterpret_cast<const uint32_t*>(&h23);
+            y2[i4] = oq;
+        }
+    }
+    for (int i4 = t + 6 * 256; i4 < d4; i4 += 256) {
+        float4 a = sr4[0 * d4 + i4];
+        float4 b = sr4[1 * d4 + i4];
+        float4 c = sr4[2 * d4 + i4];
+        float4 d = sr4[3 * d4 + i4];
+        float vx = p0 * a.x + p1 * b.x + p2 * c.x + p3 * d.x;
+        float vy = p0 * a.y + p1 * b.y + p2 * c.y + p3 * d.y;
+        float vz = p0 * a.z + p1 * b.z + p2 * c.z + p3 * d.z;
+        float vw = p0 * a.w + p1 * b.w + p2 * c.w + p3 * d.w;
+        uint2 wq = __ldg(nw2 + i4);
+        float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wq.x));
+        float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wq.y));
+        half2 h01 = __float22half2_rn(make_float2(vx * inv * w01.x, vy * inv * w01.y));
+        half2 h23 = __float22half2_rn(make_float2(vz * inv * w23.x, vw * inv * w23.y));
+        uint2 oq;
+        oq.x = *reinterpret_cast<const uint32_t*>(&h01);
+        oq.y = *reinterpret_cast<const uint32_t*>(&h23);
+        y2[i4] = oq;
+    }
+}
+
 __global__ void mhc_pre_mix_f16_k(
     const float* __restrict__ streams,
     const float* __restrict__ prev_pre,
@@ -438,6 +543,44 @@ void rad_cuda_moe_route_sqrtsoftplus(
         moe_gate_logits_f16_k<<<g1, 256, 0, stream>>>(x, gate_w, gate_bias, raw_scores, sel_scores, n_experts, D);
     }
     moe_topk_select_k<<<M, 256, 0, stream>>>(raw_scores, sel_scores, topk_ids, topk_weights, n_experts, top_k, scaling_factor);
+}
+
+void rad_cuda_mhc_pre_coeff_rmsnorm(
+    const float* streams,
+    const float* hc_fn,
+    const float* hc_base,
+    const float* hc_scale,
+    const float* prev_pre,
+    const __nv_bfloat16* norm_w,
+    float* h_coeff,
+    float* next_pre,
+    half* normed_out,
+    int M,
+    int D,
+    float rms_eps,
+    float hc_eps,
+    cudaStream_t stream
+) {
+    if (M >= 16) {
+        mhc_coeff_proj_24_k<<<M, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, D * 4, rms_eps, hc_eps);
+    } else {
+        dim3 g1(24, M);
+        mhc_coeff_proj_k<<<g1, 256, 0, stream>>>(streams, hc_fn, hc_base, hc_scale, h_coeff, next_pre, D * 4, rms_eps, hc_eps);
+    }
+    mhc_pre_mix_rmsnorm_f16_k<<<M, 256, 0, stream>>>(streams, prev_pre, norm_w, normed_out, D, rms_eps);
+}
+
+void rad_cuda_mhc_pre_mix_rmsnorm_only(
+    const float* streams,
+    const float* prev_pre,
+    const __nv_bfloat16* norm_w,
+    half* normed_out,
+    int M,
+    int D,
+    float rms_eps,
+    cudaStream_t stream
+) {
+    mhc_pre_mix_rmsnorm_f16_k<<<M, 256, 0, stream>>>(streams, prev_pre, norm_w, normed_out, D, rms_eps);
 }
 
 void rad_cuda_mhc_pre_and_coeff(

@@ -67,15 +67,34 @@ __global__ void moe_weighted_sum_f16_k(
     int D
 ) {
     int mr = blockIdx.y;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < D) {
-        float acc = shared_out ? __half2float(shared_out[(size_t)mr * D + i]) : 0.0f;
+    int i4 = blockIdx.x * blockDim.x + threadIdx.x;
+    int d4 = D >> 2;
+    if (i4 < d4) {
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        if (shared_out) {
+            uint2 sq = reinterpret_cast<const uint2*>(shared_out + (size_t)mr * D)[i4];
+            float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
+            float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
+            a0 = s01.x; a1 = s01.y; a2 = s23.x; a3 = s23.y;
+        }
         const float* wm = weights + (size_t)mr * top_k;
         const half* em = expert_outs + (size_t)mr * top_k * D;
         for (int k = 0; k < top_k; ++k) {
-            acc += wm[k] * __half2float(em[(size_t)k * D + i]);
+            float w = wm[k];
+            uint2 eq = reinterpret_cast<const uint2*>(em + (size_t)k * D)[i4];
+            float2 e01 = __half22float2(*reinterpret_cast<const half2*>(&eq.x));
+            float2 e23 = __half22float2(*reinterpret_cast<const half2*>(&eq.y));
+            a0 = fmaf(w, e01.x, a0);
+            a1 = fmaf(w, e01.y, a1);
+            a2 = fmaf(w, e23.x, a2);
+            a3 = fmaf(w, e23.y, a3);
         }
-        dst[(size_t)mr * D + i] = __float2half(acc);
+        half2 h01 = __float22half2_rn(make_float2(a0, a1));
+        half2 h23 = __float22half2_rn(make_float2(a2, a3));
+        uint2 oq;
+        oq.x = *reinterpret_cast<const uint32_t*>(&h01);
+        oq.y = *reinterpret_cast<const uint32_t*>(&h23);
+        reinterpret_cast<uint2*>(dst + (size_t)mr * D)[i4] = oq;
     }
 }
 
@@ -1186,7 +1205,7 @@ void rad_cuda_moe_weighted_sum_f16(
     int D,
     cudaStream_t stream
 ) {
-    dim3 g((D + 255) / 256, M);
+    dim3 g(((D >> 2) + 255) / 256, M);
     moe_weighted_sum_f16_k<<<g, 256, 0, stream>>>(expert_outs, weights, shared_out, dst, top_k, D);
 }
 

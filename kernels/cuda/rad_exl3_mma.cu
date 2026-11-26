@@ -635,7 +635,7 @@ void exl3_moe_mma_grouped_m64_mul1_k(
     int kb_end = (K_blocks128 * (sk + 1)) / split_k;
 
     __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
-    __shared__ half s_x128[64][128];
+    __shared__ alignas(16) half s_x128[64][128];
     __shared__ int s_pair_ids[64];
     if (t < g_len) {
         s_pair_ids[t] = sorted_pairs[g_off + t];
@@ -666,15 +666,23 @@ void exl3_moe_mma_grouped_m64_mul1_k(
             int mr = pid / top_k;
             const half* x_src = x_per_expert ? (x_in + (size_t)pid * K) : (x_in + (size_t)mr * K);
             int base = kb + lane * 4;
-            float v0 = __half2float(x_src[base + 0]) * (suh ? __half2float(suh[base + 0]) : 1.0f);
-            float v1 = __half2float(x_src[base + 1]) * (suh ? __half2float(suh[base + 1]) : 1.0f);
-            float v2 = __half2float(x_src[base + 2]) * (suh ? __half2float(suh[base + 2]) : 1.0f);
-            float v3 = __half2float(x_src[base + 3]) * (suh ? __half2float(suh[base + 3]) : 1.0f);
+            uint2 xq = *reinterpret_cast<const uint2*>(x_src + base);
+            float2 x01 = __half22float2(*reinterpret_cast<const half2*>(&xq.x));
+            float2 x23 = __half22float2(*reinterpret_cast<const half2*>(&xq.y));
+            float v0 = x01.x, v1 = x01.y, v2 = x23.x, v3 = x23.y;
+            if (suh) {
+                uint2 sq = __ldg(reinterpret_cast<const uint2*>(suh + base));
+                float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
+                float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
+                v0 *= s01.x; v1 *= s01.y; v2 *= s23.x; v3 *= s23.y;
+            }
             mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
-            s_x128[r][lane * 4 + 0] = __float2half(v0);
-            s_x128[r][lane * 4 + 1] = __float2half(v1);
-            s_x128[r][lane * 4 + 2] = __float2half(v2);
-            s_x128[r][lane * 4 + 3] = __float2half(v3);
+            half2 h01 = __float22half2_rn(make_float2(v0, v1));
+            half2 h23 = __float22half2_rn(make_float2(v2, v3));
+            uint2 oq;
+            oq.x = *reinterpret_cast<const uint32_t*>(&h01);
+            oq.y = *reinterpret_cast<const uint32_t*>(&h23);
+            *reinterpret_cast<uint2*>(&s_x128[r][lane * 4]) = oq;
         }
         __syncthreads();
 
@@ -784,7 +792,7 @@ void exl3_moe_mma_grouped_m16_mul1_k(
     int kb_end = (K_blocks128 * (sk + 1)) / split_k;
 
     __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
-    __shared__ half s_x128[16][128];
+    __shared__ alignas(16) half s_x128[16][128];
     __shared__ int s_pair_ids[16];
     if (t < g_len) {
         s_pair_ids[t] = sorted_pairs[g_off + t];
@@ -806,15 +814,23 @@ void exl3_moe_mma_grouped_m16_mul1_k(
             int mr = pid / top_k;
             const half* x_src = x_per_expert ? (x_in + (size_t)pid * K) : (x_in + (size_t)mr * K);
             int base = kb + lane * 4;
-            float v0 = __half2float(x_src[base + 0]) * (suh ? __half2float(suh[base + 0]) : 1.0f);
-            float v1 = __half2float(x_src[base + 1]) * (suh ? __half2float(suh[base + 1]) : 1.0f);
-            float v2 = __half2float(x_src[base + 2]) * (suh ? __half2float(suh[base + 2]) : 1.0f);
-            float v3 = __half2float(x_src[base + 3]) * (suh ? __half2float(suh[base + 3]) : 1.0f);
+            uint2 xq = *reinterpret_cast<const uint2*>(x_src + base);
+            float2 x01 = __half22float2(*reinterpret_cast<const half2*>(&xq.x));
+            float2 x23 = __half22float2(*reinterpret_cast<const half2*>(&xq.y));
+            float v0 = x01.x, v1 = x01.y, v2 = x23.x, v3 = x23.y;
+            if (suh) {
+                uint2 sq = __ldg(reinterpret_cast<const uint2*>(suh + base));
+                float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
+                float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
+                v0 *= s01.x; v1 *= s01.y; v2 *= s23.x; v3 *= s23.y;
+            }
             mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
-            s_x128[r][lane * 4 + 0] = __float2half(v0);
-            s_x128[r][lane * 4 + 1] = __float2half(v1);
-            s_x128[r][lane * 4 + 2] = __float2half(v2);
-            s_x128[r][lane * 4 + 3] = __float2half(v3);
+            half2 h01 = __float22half2_rn(make_float2(v0, v1));
+            half2 h23 = __float22half2_rn(make_float2(v2, v3));
+            uint2 oq;
+            oq.x = *reinterpret_cast<const uint32_t*>(&h01);
+            oq.y = *reinterpret_cast<const uint32_t*>(&h23);
+            *reinterpret_cast<uint2*>(&s_x128[r][lane * 4]) = oq;
         }
         __syncthreads();
 
@@ -913,7 +929,7 @@ void exl3_batched_group_mma_m16_mul1_k(
     int kb_end = (K_blocks128 * (sk + 1)) / split_k;
 
     __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
-    __shared__ half s_x128[16][128];
+    __shared__ alignas(16) half s_x128[16][128];
 
     float c00 = 0.0f, c01 = 0.0f, c02 = 0.0f, c03 = 0.0f;
     float c10 = 0.0f, c11 = 0.0f, c12 = 0.0f, c13 = 0.0f;
@@ -928,15 +944,20 @@ void exl3_batched_group_mma_m16_mul1_k(
         for (int r = warp; r < m_len; r += 8) {
             const half* x_src = x_in + (size_t)((m0 + r) * G + g) * K;
             int base = kb + lane * 4;
-            float v0 = __half2float(x_src[base + 0]) * __half2float(suh[base + 0]);
-            float v1 = __half2float(x_src[base + 1]) * __half2float(suh[base + 1]);
-            float v2 = __half2float(x_src[base + 2]) * __half2float(suh[base + 2]);
-            float v3 = __half2float(x_src[base + 3]) * __half2float(suh[base + 3]);
+            uint2 xq = *reinterpret_cast<const uint2*>(x_src + base);
+            float2 x01 = __half22float2(*reinterpret_cast<const half2*>(&xq.x));
+            float2 x23 = __half22float2(*reinterpret_cast<const half2*>(&xq.y));
+            uint2 sq = __ldg(reinterpret_cast<const uint2*>(suh + base));
+            float2 s01 = __half22float2(*reinterpret_cast<const half2*>(&sq.x));
+            float2 s23 = __half22float2(*reinterpret_cast<const half2*>(&sq.y));
+            float v0 = x01.x * s01.x, v1 = x01.y * s01.y, v2 = x23.x * s23.x, v3 = x23.y * s23.y;
             mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
-            s_x128[r][lane * 4 + 0] = __float2half(v0);
-            s_x128[r][lane * 4 + 1] = __float2half(v1);
-            s_x128[r][lane * 4 + 2] = __float2half(v2);
-            s_x128[r][lane * 4 + 3] = __float2half(v3);
+            half2 h01 = __float22half2_rn(make_float2(v0, v1));
+            half2 h23 = __float22half2_rn(make_float2(v2, v3));
+            uint2 oq;
+            oq.x = *reinterpret_cast<const uint32_t*>(&h01);
+            oq.y = *reinterpret_cast<const uint32_t*>(&h23);
+            *reinterpret_cast<uint2*>(&s_x128[r][lane * 4]) = oq;
         }
         __syncthreads();
 

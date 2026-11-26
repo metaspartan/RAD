@@ -94,6 +94,7 @@ extern "C" {
         stream: CudaStream,
     );
 
+    #[allow(dead_code)]
     pub fn rad_cuda_rms_norm_f32_bf16w_f16(
         x: *const c_void,
         w: *const c_void,
@@ -330,6 +331,35 @@ extern "C" {
         stream: CudaStream,
     );
 
+    pub fn rad_cuda_mhc_pre_coeff_rmsnorm(
+        streams: *const c_void,
+        hc_fn: *const c_void,
+        hc_base: *const c_void,
+        hc_scale: *const c_void,
+        prev_pre: *const c_void,
+        norm_w: *const c_void,
+        h_coeff: *mut c_void,
+        next_pre: *mut c_void,
+        normed_out: *mut c_void,
+        m: i32,
+        d: i32,
+        rms_eps: f32,
+        hc_eps: f32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_mhc_pre_mix_rmsnorm_only(
+        streams: *const c_void,
+        prev_pre: *const c_void,
+        norm_w: *const c_void,
+        normed_out: *mut c_void,
+        m: i32,
+        d: i32,
+        rms_eps: f32,
+        stream: CudaStream,
+    );
+
+    #[allow(dead_code)]
     pub fn rad_cuda_mhc_pre_and_coeff(
         streams: *const c_void,
         hc_fn: *const c_void,
@@ -346,6 +376,7 @@ extern "C" {
         stream: CudaStream,
     );
 
+    #[allow(dead_code)]
     pub fn rad_cuda_mhc_pre_mix_only(
         streams: *const c_void,
         prev_pre: *const c_void,
