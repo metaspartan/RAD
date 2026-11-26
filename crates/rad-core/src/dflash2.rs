@@ -152,6 +152,7 @@ pub struct DFlash2Drafter {
     cand_vals: DevBuf,
     d_draft_toks: DevBuf,
     d_pos: DevBuf,
+    d_inj_pos0: DevBuf,
     d_ctx_len: DevBuf,
     d_seq_ids: DevBuf,
     d_anchors: DevBuf,
@@ -160,6 +161,7 @@ pub struct DFlash2Drafter {
     draft_graph: Option<(usize, CapturedGraph)>,
     seq_draft_graphs: HashMap<(usize, usize), CapturedGraph>,
     multi_draft_graphs: HashMap<(usize, usize), CapturedGraph>,
+    inject_graphs: HashMap<(usize, usize, usize), CapturedGraph>,
 }
 
 unsafe impl Send for DFlash2Drafter {}
@@ -304,6 +306,7 @@ impl DFlash2Drafter {
             cand_vals: DevBuf::new(max_seqs * (kmax - 1) * 16 * 4).map_err(he)?,
             d_draft_toks: DevBuf::new(max_seqs * kmax * 4).map_err(he)?,
             d_pos: DevBuf::new(max_seqs * 4).map_err(he)?,
+            d_inj_pos0: DevBuf::new(4).map_err(he)?,
             d_ctx_len: DevBuf::new(max_seqs * 4).map_err(he)?,
             d_seq_ids: DevBuf::new(max_seqs * 4).map_err(he)?,
             d_anchors: DevBuf::new(max_seqs * 4).map_err(he)?,
@@ -312,6 +315,7 @@ impl DFlash2Drafter {
             draft_graph: None,
             seq_draft_graphs: HashMap::new(),
             multi_draft_graphs: HashMap::new(),
+            inject_graphs: HashMap::new(),
         })
     }
 
@@ -407,8 +411,59 @@ impl DFlash2Drafter {
         }
     }
 
+    unsafe fn enqueue_inject_chunk_dpos(&self, s: HipStream, seq: usize, bsc_feats: *const f32, max_batch: usize, n_tok: usize) {
+        let e = self.n_embd as i32;
+        let kv_dim = (self.n_head_kv * self.dh) as i32;
+        let ci = n_tok as i32;
+        ops::ink_gather_dspark_feats_batch(s, bsc_feats, self.inj_feats.ptr as *mut f32, 0, max_batch as i32, e, ci);
+        if self.fc.ty == WeightType::Q4_0 {
+            ops::ink_quantize_q8_1(s, self.inj_feats.ptr as *const f32, self.inj_xq.ptr, 4 * e, ci);
+        }
+        self.gemm_w(s, &self.fc, self.inj_feats.ptr as *const f32, self.inj_xq.ptr, self.inj_proj.ptr as *mut f32, e, 4 * e, ci);
+        if self.layers[0].wk.ty == WeightType::Q4_0 {
+            ops::ink_dflash2_rmsnorm_q8(s, self.inj_proj.ptr as *const f32, self.hidden_norm.ptr as *const f32, self.inj_normed.ptr as *mut f32, self.inj_xq.ptr, e, ci, self.eps);
+        } else {
+            ops::ink_rmsnorm_batch(s, self.inj_proj.ptr as *const f32, self.hidden_norm.ptr as *const f32, self.inj_normed.ptr as *mut f32, e, ci, self.eps);
+        }
+        for l in &self.layers {
+            let kv_off = seq * self.n_head_kv * l.max_ctx * self.dh;
+            self.gemm_w(s, &l.wk, self.inj_normed.ptr as *const f32, self.inj_xq.ptr, self.inj_k.ptr as *mut f32, kv_dim, e, ci);
+            self.gemm_w(s, &l.wv, self.inj_normed.ptr as *const f32, self.inj_xq.ptr, self.inj_v.ptr as *mut f32, kv_dim, e, ci);
+            ops::ink_dflash2_rope_norm_ctx_batch_dpos(
+                s,
+                self.inj_k.ptr as *const f32,
+                self.inj_v.ptr as *const f32,
+                l.k_norm.ptr as *const f32,
+                (l.k_cache.ptr as *mut u16).add(kv_off),
+                (l.v_cache.ptr as *mut u16).add(kv_off),
+                self.d_inj_pos0.ptr as *const i32,
+                l.max_ctx as i32,
+                self.n_head_kv as i32,
+                self.dh as i32,
+                self.freq_base,
+                1,
+                ci,
+            );
+        }
+    }
+
     pub fn inject_target_feats_batch_seq_async(&mut self, seq: usize, bsc_feats: *const f32, max_batch: usize, start_tok: usize, pos0: i32, n_tok: usize) -> Result<()> {
         if n_tok == 0 {
+            return Ok(());
+        }
+        if start_tok == 0 && n_tok <= 8 {
+            let key = (seq, n_tok, bsc_feats as usize);
+            if !self.inject_graphs.contains_key(&key) {
+                let g = unsafe { CapturedGraph::capture(|s| self.enqueue_inject_chunk_dpos(s, seq, bsc_feats, max_batch, n_tok)) }.map_err(he)?;
+                self.inject_graphs.insert(key, g);
+            }
+            self.d_inj_pos0.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
+            let g = self.inject_graphs.get(&key).unwrap();
+            g.launch_on(self.stream).map_err(he)?;
+            self.seq_ctx_len[seq] = pos0 + n_tok as i32;
+            if seq == 0 {
+                self.ctx_len = pos0 + n_tok as i32;
+            }
             return Ok(());
         }
         let e = self.n_embd as i32;
@@ -431,9 +486,10 @@ impl DFlash2Drafter {
                     ops::ink_quantize_q8_1(self.stream, self.inj_feats.ptr as *const f32, self.inj_xq.ptr, 4 * e, ci);
                 }
                 self.gemm_w(self.stream, &self.fc, self.inj_feats.ptr as *const f32, self.inj_xq.ptr, self.inj_proj.ptr as *mut f32, e, 4 * e, ci);
-                ops::ink_rmsnorm_batch(self.stream, self.inj_proj.ptr as *const f32, self.hidden_norm.ptr as *const f32, self.inj_normed.ptr as *mut f32, e, ci, self.eps);
                 if self.layers[0].wk.ty == WeightType::Q4_0 {
-                    ops::ink_quantize_q8_1(self.stream, self.inj_normed.ptr as *const f32, self.inj_xq.ptr, e, ci);
+                    ops::ink_dflash2_rmsnorm_q8(self.stream, self.inj_proj.ptr as *const f32, self.hidden_norm.ptr as *const f32, self.inj_normed.ptr as *mut f32, self.inj_xq.ptr, e, ci, self.eps);
+                } else {
+                    ops::ink_rmsnorm_batch(self.stream, self.inj_proj.ptr as *const f32, self.hidden_norm.ptr as *const f32, self.inj_normed.ptr as *mut f32, e, ci, self.eps);
                 }
                 for l in &self.layers {
                     let kv_off = seq * self.n_head_kv * l.max_ctx * self.dh;
@@ -528,7 +584,7 @@ impl DFlash2Drafter {
                         self.v.ptr as *const f32,
                         (l.k_cache.ptr as *const u16).add(kv_off),
                         (l.v_cache.ptr as *const u16).add(kv_off),
-                        self.d_ctx_len.ptr as *const i32,
+                        self.d_pos.ptr as *const i32,
                         self.xq.ptr,
                         ki,
                         self.n_head as i32,
@@ -546,7 +602,7 @@ impl DFlash2Drafter {
                         self.v.ptr as *const f32,
                         (l.k_cache.ptr as *const u16).add(kv_off),
                         (l.v_cache.ptr as *const u16).add(kv_off),
-                        self.d_ctx_len.ptr as *const i32,
+                        self.d_pos.ptr as *const i32,
                         self.xq.ptr,
                         ki,
                         self.n_head as i32,
@@ -564,7 +620,7 @@ impl DFlash2Drafter {
                         self.v.ptr as *const f32,
                         (l.k_cache.ptr as *const u16).add(kv_off),
                         (l.v_cache.ptr as *const u16).add(kv_off),
-                        self.d_ctx_len.ptr as *const i32,
+                        self.d_pos.ptr as *const i32,
                         self.attn_out.ptr as *mut f32,
                         ki,
                         self.n_head as i32,
@@ -804,21 +860,19 @@ impl DFlash2Drafter {
             let (_, ref g) = self.draft_graph.as_ref().unwrap();
             self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(self.stream)).map_err(he)?;
             self.d_pos.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
-            self.d_ctx_len.copy_from(&self.ctx_len.to_le_bytes(), Some(self.stream)).map_err(he)?;
             g.launch_on(self.stream).map_err(he)?;
-            unsafe { rad_hip::hipStreamSynchronize(self.stream); }
         } else {
             self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(self.stream)).map_err(he)?;
             self.d_pos.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
-            self.d_ctx_len.copy_from(&self.ctx_len.to_le_bytes(), Some(self.stream)).map_err(he)?;
             unsafe {
                 self.enqueue_draft_seq(self.stream, target, 0, k_len);
-                rad_hip::hipStreamSynchronize(self.stream);
             }
         }
         let mut out_b = vec![0u8; k_len * 4];
         let rc = unsafe {
-            rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.d_draft_toks.ptr, k_len * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
+            let r = rad_hip::hipMemcpyAsync(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.d_draft_toks.ptr, k_len * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST, self.stream);
+            rad_hip::hipStreamSynchronize(self.stream);
+            r
         };
         if rc != rad_hip::HIP_SUCCESS {
             return Err(he(rc));
@@ -838,12 +892,12 @@ impl DFlash2Drafter {
         let g = self.seq_draft_graphs.get(&key).unwrap();
         self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(self.stream)).map_err(he)?;
         self.d_pos.copy_from(&pos0.to_le_bytes(), Some(self.stream)).map_err(he)?;
-        self.d_ctx_len.copy_from(&ctx_len.to_le_bytes(), Some(self.stream)).map_err(he)?;
         g.launch_on(self.stream).map_err(he)?;
-        unsafe { rad_hip::hipStreamSynchronize(self.stream); }
         let mut out_b = vec![0u8; k_len * 4];
         let rc = unsafe {
-            rad_hip::hipMemcpy(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.d_draft_toks.ptr, k_len * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST)
+            let r = rad_hip::hipMemcpyAsync(out_b.as_mut_ptr() as *mut core::ffi::c_void, self.d_draft_toks.ptr, k_len * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST, self.stream);
+            rad_hip::hipStreamSynchronize(self.stream);
+            r
         };
         if rc != rad_hip::HIP_SUCCESS {
             return Err(he(rc));

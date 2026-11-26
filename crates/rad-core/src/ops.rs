@@ -130,6 +130,7 @@ extern "C" {
     pub fn ink_dflash2_select_path(s: HipStream, cand_ids: *const i32, cand_vals: *const f32, h_proj: *const f32, pred_cb: *const u16, succ_cb: *const u16, d_draft_toks: *mut i32, n_users: i32, k_len: i32, rank: i32, softcap: f32) -> i32;
     pub fn ink_gather_dspark_feats_batch(s: HipStream, bsc_feats: *const f32, dst: *mut f32, start_tok: i32, max_batch: i32, n_embd: i32, n_tok: i32) -> i32;
     pub fn ink_dflash2_rope_norm_ctx_batch(s: HipStream, k_in: *const f32, v_in: *const f32, k_norm_w: *const f32, kc: *mut u16, vc: *mut u16, pos0: i32, max_ctx: i32, n_head_kv: i32, dh: i32, freq_base: f32, is_swa: i32, n_tok: i32) -> i32;
+    pub fn ink_dflash2_rope_norm_ctx_batch_dpos(s: HipStream, k_in: *const f32, v_in: *const f32, k_norm_w: *const f32, kc: *mut u16, vc: *mut u16, d_pos0: *const i32, max_ctx: i32, n_head_kv: i32, dh: i32, freq_base: f32, is_swa: i32, n_tok: i32) -> i32;
     pub fn ink_gemm_f16_bias(s: HipStream, w: *const u16, bias: *const f32, x: *const f32, y: *mut f32, n: i32, k: i32, b: i32) -> i32;
     pub fn ink_layernorm_f32(s: HipStream, x: *const f32, w: *const f32, b: *const f32, y: *mut f32, n: i32, rows: i32, eps: f32) -> i32;
     pub fn ink_gelu_f32(s: HipStream, x: *mut f32, n: usize) -> i32;
