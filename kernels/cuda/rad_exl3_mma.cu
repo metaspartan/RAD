@@ -1327,37 +1327,56 @@ void exl3_batched_group_mma_m64_prerot_k(
     int ld_col = (t & 3) * 4;
     uint4* s_u4 = reinterpret_cast<uint4*>(s_packed[warp]);
 
-    for (int kt = kt_start; kt < kt_end; ++kt) {
-        int kb = kt * 16;
+    if (kt_start < kt_end) {
+        int kb0 = kt_start * 16;
         if (ld_row < m_len) {
-            const half* x_src = x_rot + (size_t)((m0 + ld_row) * G + g) * K + kb + ld_col;
+            const half* x_src = x_rot + (size_t)((m0 + ld_row) * G + g) * K + kb0 + ld_col;
             *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = *reinterpret_cast<const uint2*>(x_src);
         } else {
             *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = make_uint2(0u, 0u);
         }
         if (n_tile < N_tiles && lane < PACKED_U4) {
-            const uint4* g_u4 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt * N_tiles + n_tile) * PACKED_U16);
-            s_u4[lane] = __ldg(g_u4 + lane);
+            const uint4* g0 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt_start * N_tiles + n_tile) * PACKED_U16);
+            s_u4[lane] = __ldg(g0 + lane);
         }
         __syncthreads();
+        for (int kt = kt_start; kt < kt_end; ++kt) {
+            uint2 next_x = make_uint2(0u, 0u);
+            uint4 next_g;
+            if (kt + 1 < kt_end) {
+                int kbn = (kt + 1) * 16;
+                if (ld_row < m_len) {
+                    const half* x_src = x_rot + (size_t)((m0 + ld_row) * G + g) * K + kbn + ld_col;
+                    next_x = *reinterpret_cast<const uint2*>(x_src);
+                }
+                if (n_tile < N_tiles && lane < PACKED_U4) {
+                    const uint4* gn = reinterpret_cast<const uint4*>(trellis + ((size_t)(kt + 1) * N_tiles + n_tile) * PACKED_U16);
+                    next_g = __ldg(gn + lane);
+                }
+            }
+            if (n_tile < N_tiles) {
+                uint32_t b00, b01, b10, b11;
+                mma_dq8_mul1<BITS>(s_packed[warp], lane * 8, b00, b01, b10, b11);
 
-        if (n_tile < N_tiles) {
-            uint32_t b00, b01, b10, b11;
-            mma_dq8_mul1<BITS>(s_packed[warp], lane * 8, b00, b01, b10, b11);
-
-            #pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                int r0 = r * 16 + group_id;
-                int r1 = r0 + 8;
-                uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_x[r0][k_off0]);
-                uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_x[r0][k_off1]);
-                uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_x[r1][k_off0]);
-                uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_x[r1][k_off1]);
-                mma_m16n8k16_f32(c0[r][0], c0[r][1], c0[r][2], c0[r][3], a0, a1, a2, a3, b00, b01);
-                mma_m16n8k16_f32(c1[r][0], c1[r][1], c1[r][2], c1[r][3], a0, a1, a2, a3, b10, b11);
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    int r0 = r * 16 + group_id;
+                    int r1 = r0 + 8;
+                    uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_x[r0][k_off0]);
+                    uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_x[r0][k_off1]);
+                    uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_x[r1][k_off0]);
+                    uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_x[r1][k_off1]);
+                    mma_m16n8k16_f32(c0[r][0], c0[r][1], c0[r][2], c0[r][3], a0, a1, a2, a3, b00, b01);
+                    mma_m16n8k16_f32(c1[r][0], c1[r][1], c1[r][2], c1[r][3], a0, a1, a2, a3, b10, b11);
+                }
+            }
+            if (kt + 1 < kt_end) {
+                __syncthreads();
+                *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = next_x;
+                if (n_tile < N_tiles && lane < PACKED_U4) s_u4[lane] = next_g;
+                __syncthreads();
             }
         }
-        __syncthreads();
     }
 
     if (split_k == 1 && y_out != nullptr) {

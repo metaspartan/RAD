@@ -50,28 +50,45 @@ void moe_gate_logits_mma_f16_k(
     int ld_m = m_base + ld_row;
 
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
-    for (int k = 0; k < D; k += 16) {
+    if (D > 0) {
         if (ld_row < 16) {
-            if (ld_m < M) {
-                *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = *reinterpret_cast<const uint2*>(x + (size_t)ld_m * D + k + ld_col);
-            } else {
-                *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = make_uint2(0u, 0u);
-            }
+            *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = (ld_m < M)
+                ? *reinterpret_cast<const uint2*>(x + (size_t)ld_m * D + ld_col)
+                : make_uint2(0u, 0u);
+        }
+        uint32_t b0 = 0u, b1 = 0u;
+        if (e0 < n_experts && wr) {
+            b0 = __ldg(reinterpret_cast<const uint32_t*>(wr + k_off0));
+            b1 = __ldg(reinterpret_cast<const uint32_t*>(wr + k_off1));
         }
         __syncthreads();
-        if (e0 < n_experts) {
-            uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_x[group_id][k_off0]);
-            uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_x[group_id][k_off1]);
-            uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_x[group_id + 8][k_off0]);
-            uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_x[group_id + 8][k_off1]);
-            uint32_t b0 = 0u, b1 = 0u;
-            if (wr) {
-                b0 = __ldg(reinterpret_cast<const uint32_t*>(wr + k + k_off0));
-                b1 = __ldg(reinterpret_cast<const uint32_t*>(wr + k + k_off1));
+        for (int k = 0; k < D; k += 16) {
+            uint2 next_x = make_uint2(0u, 0u);
+            uint32_t nb0 = 0u, nb1 = 0u;
+            if (k + 16 < D) {
+                if (ld_row < 16 && ld_m < M) {
+                    next_x = *reinterpret_cast<const uint2*>(x + (size_t)ld_m * D + k + 16 + ld_col);
+                }
+                if (e0 < n_experts && wr) {
+                    nb0 = __ldg(reinterpret_cast<const uint32_t*>(wr + k + 16 + k_off0));
+                    nb1 = __ldg(reinterpret_cast<const uint32_t*>(wr + k + 16 + k_off1));
+                }
             }
-            router_mma_m16n8k16_f32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+            if (e0 < n_experts) {
+                uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_x[group_id][k_off0]);
+                uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_x[group_id][k_off1]);
+                uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_x[group_id + 8][k_off0]);
+                uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_x[group_id + 8][k_off1]);
+                router_mma_m16n8k16_f32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+            }
+            if (k + 16 < D) {
+                __syncthreads();
+                if (ld_row < 16) *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = next_x;
+                b0 = nb0;
+                b1 = nb1;
+                __syncthreads();
+            }
         }
-        __syncthreads();
     }
     if (e0 >= n_experts) return;
 
