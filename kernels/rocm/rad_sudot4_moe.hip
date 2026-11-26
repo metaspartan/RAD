@@ -1405,7 +1405,7 @@ extern "C" __global__ void shortconv_res_batch_snap_clear_k(float* __restrict__ 
 
 
 extern "C" int ink_shortconv_res_batch_snap_clear(hipStream_t s, float* raw, const float* conv_w, float* hist, float* snap, const float* add_src, float* block_dst, float* out, int n_embd, int B) {
-    shortconv_res_batch_snap_clear_k<<<dim3((n_embd + 63) / 64), dim3(64), 0, s>>>(raw, conv_w, hist, snap, add_src, block_dst, out, n_embd, B);
+    shortconv_res_batch_snap_clear_k<<<dim3((n_embd + 31) / 32), dim3(32), 0, s>>>(raw, conv_w, hist, snap, add_src, block_dst, out, n_embd, B);
     return 0;
 }
 
@@ -1416,7 +1416,7 @@ extern "C" int ink_shortconv_res_batch_snap(hipStream_t s, const float* raw, con
         hist_update_3_k<<<dim3((n_embd + 255) / 256), dim3(256), 0, s>>>(raw, hist, n_embd, B);
         return 0;
     }
-    shortconv_res_batch_snap_k<<<dim3((n_embd + 63) / 64), dim3(64), 0, s>>>(raw, conv_w, hist, snap, add_src, block_dst, out, n_embd, B);
+    shortconv_res_batch_snap_k<<<dim3((n_embd + 31) / 32), dim3(32), 0, s>>>(raw, conv_w, hist, snap, add_src, block_dst, out, n_embd, B);
     return 0;
 }
 
