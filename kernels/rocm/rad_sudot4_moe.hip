@@ -379,23 +379,32 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
     int z_n = gridDim.z;
     if (cnt == 0 || z_id * 8 >= cnt) return;
     int off0 = exp_offsets[exp_id];
-    int grp = threadIdx.x >> 2;
-    int lane4 = threadIdx.x & 3;
+    int tid = threadIdx.x;
+    int grp = tid >> 2;
+    int lane4 = tid & 3;
     int row = blockIdx.x * 32 + grp;
-    if (row >= n_embd) return;
+    bool valid = (row < n_embd);
 
     int nblk = n_ff >> 5;
     size_t row_bytes = q4_soa_row_bytes(nblk);
     size_t exp_bytes = (size_t)n_embd * row_bytes;
-    const uint8_t* wrow = W + (size_t)exp_id * exp_bytes + (size_t)row * row_bytes;
+    const uint8_t* wrow = valid ? (W + (size_t)exp_id * exp_bytes + (size_t)row * row_bytes) : W;
     const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
     const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 16);
+    __shared__ q8_1_blk sm_act[4][32];
+    bool use_lds = (nblk <= 32);
 
     if (cnt == 1) {
         int tid0 = tok_sorted[off0], sid0 = slot_sorted[off0];
+        const q8_1_blk* ap0 = act_q + ((size_t)tid0 * n_used + sid0) * nblk;
+        if (use_lds) {
+            if (tid < nblk) sm_act[0][tid] = ap0[tid];
+            __syncthreads();
+        }
+        if (!valid) return;
         float acc0 = 0.0f;
         for (int b = lane4; b < nblk; b += 4) {
-            const q8_1_blk ab = act_q[((size_t)tid0 * n_used + sid0) * nblk + b];
+            const q8_1_blk ab = use_lds ? sm_act[0][b] : ap0[b];
             acc0 += dot_q4_soa_q8_1_blk(qrow[b], __half2float(drow[b]), ab);
         }
         float v = s_warp_sum4(acc0) * wt_sorted[off0];
@@ -405,6 +414,14 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
     if (cnt == 2) {
         int tid0 = tok_sorted[off0], sid0 = slot_sorted[off0];
         int tid1 = tok_sorted[off0 + 1], sid1 = slot_sorted[off0 + 1];
+        const q8_1_blk* ap0 = act_q + ((size_t)tid0 * n_used + sid0) * nblk;
+        const q8_1_blk* ap1 = act_q + ((size_t)tid1 * n_used + sid1) * nblk;
+        if (use_lds) {
+            if (tid < nblk) sm_act[0][tid] = ap0[tid];
+            else if (tid < 2 * nblk) sm_act[1][tid - nblk] = ap1[tid - nblk];
+            __syncthreads();
+        }
+        if (!valid) return;
         float acc0 = 0.0f, acc1 = 0.0f;
         for (int b = lane4; b < nblk; b += 4) {
             uint4 q4 = qrow[b];
@@ -413,7 +430,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
             int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu), w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
             int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
             int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
-            const q8_1_blk ab0 = act_q[((size_t)tid0 * n_used + sid0) * nblk + b];
+            const q8_1_blk ab0 = use_lds ? sm_act[0][b] : ap0[b];
             int32_t s0 = 0;
             s0 = __builtin_amdgcn_sudot4(false, w0, true, ab0.q[0], s0, false);
             s0 = __builtin_amdgcn_sudot4(false, w1, true, ab0.q[1], s0, false);
@@ -424,7 +441,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
             s0 = __builtin_amdgcn_sudot4(false, w6, true, ab0.q[6], s0, false);
             s0 = __builtin_amdgcn_sudot4(false, w7, true, ab0.q[7], s0, false);
             acc0 = fmaf(dw * ab0.d, (float)(s0 - 8 * ab0.s), acc0);
-            const q8_1_blk ab1 = act_q[((size_t)tid1 * n_used + sid1) * nblk + b];
+            const q8_1_blk ab1 = use_lds ? sm_act[1][b] : ap1[b];
             int32_t s1 = 0;
             s1 = __builtin_amdgcn_sudot4(false, w0, true, ab1.q[0], s1, false);
             s1 = __builtin_amdgcn_sudot4(false, w1, true, ab1.q[1], s1, false);
@@ -448,6 +465,16 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
         int t0i = tok_sorted[off0], s0i = slot_sorted[off0];
         int t1i = tok_sorted[off0 + 1], s1i = slot_sorted[off0 + 1];
         int t2i = tok_sorted[off0 + 2], s2i = slot_sorted[off0 + 2];
+        const q8_1_blk* ap0 = act_q + ((size_t)t0i * n_used + s0i) * nblk;
+        const q8_1_blk* ap1 = act_q + ((size_t)t1i * n_used + s1i) * nblk;
+        const q8_1_blk* ap2 = act_q + ((size_t)t2i * n_used + s2i) * nblk;
+        if (use_lds) {
+            if (tid < nblk) sm_act[0][tid] = ap0[tid];
+            else if (tid < 2 * nblk) sm_act[1][tid - nblk] = ap1[tid - nblk];
+            else if (tid < 3 * nblk) sm_act[2][tid - 2 * nblk] = ap2[tid - 2 * nblk];
+            __syncthreads();
+        }
+        if (!valid) return;
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
         for (int b = lane4; b < nblk; b += 4) {
             uint4 q4 = qrow[b];
@@ -456,7 +483,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
             int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu), w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
             int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
             int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
-            const q8_1_blk ab0 = act_q[((size_t)t0i * n_used + s0i) * nblk + b];
+            const q8_1_blk ab0 = use_lds ? sm_act[0][b] : ap0[b];
             int32_t p0 = 0;
             p0 = __builtin_amdgcn_sudot4(false, w0, true, ab0.q[0], p0, false);
             p0 = __builtin_amdgcn_sudot4(false, w1, true, ab0.q[1], p0, false);
@@ -467,7 +494,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
             p0 = __builtin_amdgcn_sudot4(false, w6, true, ab0.q[6], p0, false);
             p0 = __builtin_amdgcn_sudot4(false, w7, true, ab0.q[7], p0, false);
             a0 = fmaf(dw * ab0.d, (float)(p0 - 8 * ab0.s), a0);
-            const q8_1_blk ab1 = act_q[((size_t)t1i * n_used + s1i) * nblk + b];
+            const q8_1_blk ab1 = use_lds ? sm_act[1][b] : ap1[b];
             int32_t p1 = 0;
             p1 = __builtin_amdgcn_sudot4(false, w0, true, ab1.q[0], p1, false);
             p1 = __builtin_amdgcn_sudot4(false, w1, true, ab1.q[1], p1, false);
@@ -478,7 +505,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
             p1 = __builtin_amdgcn_sudot4(false, w6, true, ab1.q[6], p1, false);
             p1 = __builtin_amdgcn_sudot4(false, w7, true, ab1.q[7], p1, false);
             a1 = fmaf(dw * ab1.d, (float)(p1 - 8 * ab1.s), a1);
-            const q8_1_blk ab2 = act_q[((size_t)t2i * n_used + s2i) * nblk + b];
+            const q8_1_blk ab2 = use_lds ? sm_act[2][b] : ap2[b];
             int32_t p2 = 0;
             p2 = __builtin_amdgcn_sudot4(false, w0, true, ab2.q[0], p2, false);
             p2 = __builtin_amdgcn_sudot4(false, w1, true, ab2.q[1], p2, false);
@@ -505,6 +532,18 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
         int t1i = tok_sorted[off0 + 1], s1i = slot_sorted[off0 + 1];
         int t2i = tok_sorted[off0 + 2], s2i = slot_sorted[off0 + 2];
         int t3i = tok_sorted[off0 + 3], s3i = slot_sorted[off0 + 3];
+        const q8_1_blk* ap0 = act_q + ((size_t)t0i * n_used + s0i) * nblk;
+        const q8_1_blk* ap1 = act_q + ((size_t)t1i * n_used + s1i) * nblk;
+        const q8_1_blk* ap2 = act_q + ((size_t)t2i * n_used + s2i) * nblk;
+        const q8_1_blk* ap3 = act_q + ((size_t)t3i * n_used + s3i) * nblk;
+        if (use_lds) {
+            if (tid < nblk) sm_act[0][tid] = ap0[tid];
+            else if (tid < 2 * nblk) sm_act[1][tid - nblk] = ap1[tid - nblk];
+            else if (tid < 3 * nblk) sm_act[2][tid - 2 * nblk] = ap2[tid - 2 * nblk];
+            else if (tid < 4 * nblk) sm_act[3][tid - 3 * nblk] = ap3[tid - 3 * nblk];
+            __syncthreads();
+        }
+        if (!valid) return;
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
         for (int b = lane4; b < nblk; b += 4) {
             uint4 q4 = qrow[b];
@@ -513,7 +552,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
             int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu), w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
             int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
             int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
-            const q8_1_blk ab0 = act_q[((size_t)t0i * n_used + s0i) * nblk + b];
+            const q8_1_blk ab0 = use_lds ? sm_act[0][b] : ap0[b];
             int32_t p0 = 0;
             p0 = __builtin_amdgcn_sudot4(false, w0, true, ab0.q[0], p0, false);
             p0 = __builtin_amdgcn_sudot4(false, w1, true, ab0.q[1], p0, false);
@@ -524,7 +563,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
             p0 = __builtin_amdgcn_sudot4(false, w6, true, ab0.q[6], p0, false);
             p0 = __builtin_amdgcn_sudot4(false, w7, true, ab0.q[7], p0, false);
             a0 = fmaf(dw * ab0.d, (float)(p0 - 8 * ab0.s), a0);
-            const q8_1_blk ab1 = act_q[((size_t)t1i * n_used + s1i) * nblk + b];
+            const q8_1_blk ab1 = use_lds ? sm_act[1][b] : ap1[b];
             int32_t p1 = 0;
             p1 = __builtin_amdgcn_sudot4(false, w0, true, ab1.q[0], p1, false);
             p1 = __builtin_amdgcn_sudot4(false, w1, true, ab1.q[1], p1, false);
@@ -535,7 +574,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
             p1 = __builtin_amdgcn_sudot4(false, w6, true, ab1.q[6], p1, false);
             p1 = __builtin_amdgcn_sudot4(false, w7, true, ab1.q[7], p1, false);
             a1 = fmaf(dw * ab1.d, (float)(p1 - 8 * ab1.s), a1);
-            const q8_1_blk ab2 = act_q[((size_t)t2i * n_used + s2i) * nblk + b];
+            const q8_1_blk ab2 = use_lds ? sm_act[2][b] : ap2[b];
             int32_t p2 = 0;
             p2 = __builtin_amdgcn_sudot4(false, w0, true, ab2.q[0], p2, false);
             p2 = __builtin_amdgcn_sudot4(false, w1, true, ab2.q[1], p2, false);
@@ -546,7 +585,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
             p2 = __builtin_amdgcn_sudot4(false, w6, true, ab2.q[6], p2, false);
             p2 = __builtin_amdgcn_sudot4(false, w7, true, ab2.q[7], p2, false);
             a2 = fmaf(dw * ab2.d, (float)(p2 - 8 * ab2.s), a2);
-            const q8_1_blk ab3 = act_q[((size_t)t3i * n_used + s3i) * nblk + b];
+            const q8_1_blk ab3 = use_lds ? sm_act[3][b] : ap3[b];
             int32_t p3 = 0;
             p3 = __builtin_amdgcn_sudot4(false, w0, true, ab3.q[0], p3, false);
             p3 = __builtin_amdgcn_sudot4(false, w1, true, ab3.q[1], p3, false);
@@ -570,6 +609,7 @@ extern "C" __global__ void moe_dn_q4_0_sudot4_k(const uint8_t* __restrict__ W,
         }
         return;
     }
+    if (!valid) return;
 
     for (int t0 = z_id * 8; t0 < cnt; t0 += z_n * 8) {
         int nt = min(8, cnt - t0);

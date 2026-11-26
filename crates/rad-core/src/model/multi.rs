@@ -124,12 +124,13 @@ impl InklingEngine {
         self.bsc.d_seq_ids.copy_from(seq_bytes, Some(g.stream)).map_err(he)?;
         self.bsc.d_positions.copy_from(pos_bytes, Some(g.stream)).map_err(he)?;
         g.launch().map_err(he)?;
-        let mut out = vec![0i32; b];
+        let pin_v = self.h_io_pinned.ptr as *mut i32;
         let rc = unsafe {
-            rad_hip::hipMemcpyAsync(out.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST, g.stream)
+            rad_hip::hipMemcpyAsync(pin_v as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST, g.stream)
         };
         if rc != rad_hip::HIP_SUCCESS { return Err(he(rc)); }
         g.sync().map_err(he)?;
+        let out = unsafe { std::slice::from_raw_parts(pin_v, b).to_vec() };
         for (idx, &sid) in seq_ids.iter().enumerate() {
             let su = sid as usize;
             self.seq_pos[su] += 1;
@@ -173,12 +174,13 @@ impl InklingEngine {
         self.bsc.d_seq_ids.copy_from(seq_bytes, Some(g.stream)).map_err(he)?;
         self.bsc.d_positions.copy_from(pos_bytes, Some(g.stream)).map_err(he)?;
         g.launch().map_err(he)?;
-        let mut flat_out = vec![0i32; total_b];
+        let pin_v = self.h_io_pinned.ptr as *mut i32;
         let rc = unsafe {
-            rad_hip::hipMemcpyAsync(flat_out.as_mut_ptr() as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, total_b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST, g.stream)
+            rad_hip::hipMemcpyAsync(pin_v as *mut core::ffi::c_void, self.bsc.d_out_toks.ptr, total_b * 4, rad_hip::HIP_MEMCPY_DEVICE_TO_HOST, g.stream)
         };
         if rc != rad_hip::HIP_SUCCESS { return Err(he(rc)); }
         g.sync().map_err(he)?;
+        let flat_out = unsafe { std::slice::from_raw_parts(pin_v, total_b) };
         for &sid in seq_ids {
             let su = sid as usize;
             self.seq_pos[su] += k_len as i32;
