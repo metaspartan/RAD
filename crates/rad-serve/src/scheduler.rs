@@ -612,21 +612,21 @@ pub(crate) fn run_scheduler(
                         } else {
                             128usize.min(rem_kv)
                         };
-                        let draft = if let Some((ng, mlen)) = ngram_lookup_draft_cfg(&engine.seq_tokens[seq], slot.next_tok, max_ng_k, in_edit) {
+                        let (draft, verified) = if let Some((ng, mlen)) = ngram_lookup_draft_cfg(&engine.seq_tokens[seq], slot.next_tok, max_ng_k, in_edit) {
                             if mlen >= 5 {
-                                ng
-                            } else if seq == 0 {
-                                d.draft(slot.next_tok, &engine, spec_k)?
+                                let v = if let Some(ds) = d.stream_opt() {
+                                    engine.verify_batch_seq_on(seq, &ng, ds)?
+                                } else {
+                                    engine.verify_batch_seq(seq, &ng)?
+                                };
+                                (ng, v)
                             } else {
-                                d.draft_seq(seq, slot.next_tok, &engine, spec_k)?
+                                d.draft_and_verify_seq(seq, slot.next_tok, &mut engine, spec_k)?
                             }
-                        } else if seq == 0 {
-                            d.draft(slot.next_tok, &engine, spec_k)?
                         } else {
-                            d.draft_seq(seq, slot.next_tok, &engine, spec_k)?
+                            d.draft_and_verify_seq(seq, slot.next_tok, &mut engine, spec_k)?
                         };
                         let dk = draft.len();
-                        let verified = engine.verify_batch_seq(seq, &draft)?;
                         let rem_emit = slot.max_tokens.saturating_sub(slot.emitted).max(1);
                         let acc_lim = dk.min(rem_emit);
                         let mut n_acc = 1usize;
@@ -683,7 +683,11 @@ pub(crate) fn run_scheduler(
                             }
                             last_pred = verified[n_acc - 1];
                         }
-                        engine.rewind_verify_seq_to(seq, n_acc, dk)?;
+                        if let Some(ds) = d.stream_opt() {
+                            engine.rewind_verify_seq_to_on(seq, n_acc, dk, ds)?;
+                        } else {
+                            engine.rewind_verify_seq_to(seq, n_acc, dk)?;
+                        }
                         d.inject_batch_seq_async(seq, &engine, 0, pos0, n_acc)?;
                         for j in 0..n_acc {
                             engine.seq_tokens[seq].push(draft[j]);

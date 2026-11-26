@@ -122,6 +122,42 @@ impl Drafter {
         }
     }
 
+    pub(crate) fn stream_opt(&self) -> Option<rad_hip::HipStream> {
+        match self {
+            Drafter::DFlash2(d) => Some(d.stream()),
+            Drafter::Dspark(_) => None,
+        }
+    }
+
+    pub(crate) fn draft_and_verify_seq(
+        &mut self,
+        seq: usize,
+        anchor_tok: i32,
+        engine: &mut InklingEngine,
+        k_len: usize,
+    ) -> anyhow::Result<(Vec<i32>, Vec<i32>)> {
+        match self {
+            Drafter::DFlash2(d) => {
+                let k = k_len.min(d.block_size);
+                let s = d.stream();
+                let mut draft = vec![0i32; k];
+                let d_ptr = d.draft_enqueue_on(seq, anchor_tok, engine, k, s)?;
+                let verified = engine.verify_batch_seq_from_dev(seq, d_ptr, k, s, &mut draft)?;
+                Ok((draft, verified))
+            }
+            Drafter::Dspark(d) => {
+                let draft = if seq == 0 {
+                    d.draft(anchor_tok, engine, k_len)?
+                } else {
+                    d.draft_seq(seq, anchor_tok, engine, k_len)?
+                };
+                let verified = engine.verify_batch_seq(seq, &draft)?;
+                Ok((draft, verified))
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn draft(&mut self, anchor_tok: i32, target: &InklingEngine, k_len: usize) -> anyhow::Result<Vec<i32>> {
         match self {
             Drafter::DFlash2(d) => d.draft(anchor_tok, target, k_len),

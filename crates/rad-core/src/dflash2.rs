@@ -856,6 +856,44 @@ impl DFlash2Drafter {
         Ok(())
     }
 
+    pub fn draft_enqueue_on(
+        &mut self,
+        seq: usize,
+        anchor_tok: i32,
+        target: &InklingEngine,
+        k_len: usize,
+        stream: HipStream,
+    ) -> Result<*const core::ffi::c_void> {
+        let k_len = k_len.min(self.block_size);
+        let pos0 = if seq == 0 { self.ctx_len } else { self.seq_ctx_len[seq] };
+        if seq == 0 {
+            let use_graph = self.draft_graph.as_ref().map(|(gk, _)| *gk == k_len).unwrap_or(false);
+            if use_graph {
+                let (_, ref g) = self.draft_graph.as_ref().unwrap();
+                self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(stream)).map_err(he)?;
+                self.d_pos.copy_from(&pos0.to_le_bytes(), Some(stream)).map_err(he)?;
+                g.launch_on(stream).map_err(he)?;
+            } else {
+                self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(stream)).map_err(he)?;
+                self.d_pos.copy_from(&pos0.to_le_bytes(), Some(stream)).map_err(he)?;
+                unsafe {
+                    self.enqueue_draft_seq(stream, target, 0, k_len);
+                }
+            }
+        } else {
+            let key = (seq, k_len);
+            if !self.seq_draft_graphs.contains_key(&key) {
+                let g = unsafe { CapturedGraph::capture(|s| self.enqueue_draft_seq(s, target, seq, k_len)) }.map_err(he)?;
+                self.seq_draft_graphs.insert(key, g);
+            }
+            let g = self.seq_draft_graphs.get(&key).unwrap();
+            self.d_draft_toks.copy_from(&anchor_tok.to_le_bytes(), Some(stream)).map_err(he)?;
+            self.d_pos.copy_from(&pos0.to_le_bytes(), Some(stream)).map_err(he)?;
+            g.launch_on(stream).map_err(he)?;
+        }
+        Ok(self.d_draft_toks.ptr as *const core::ffi::c_void)
+    }
+
     pub fn draft(&mut self, anchor_tok: i32, target: &InklingEngine, k_len: usize) -> Result<Vec<i32>> {
         let k_len = k_len.min(self.block_size);
         let pos0 = self.ctx_len;

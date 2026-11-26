@@ -1158,6 +1158,118 @@ impl InklingEngine {
         unsafe { rad_hip::hipStreamSynchronize(self.stream); }
         p
     }
+    pub fn verify_batch_seq_from_dev(
+        &mut self,
+        seq: usize,
+        d_toks_src: *const core::ffi::c_void,
+        b: usize,
+        stream: HipStream,
+        draft_out: &mut [i32],
+    ) -> Result<Vec<i32>> {
+        assert!(b >= 1 && b <= self.multi_verify_cap.min(512));
+        let pos0 = self.seq_pos[seq];
+        let key = (seq, b);
+        if !self.seq_verify_graphs.contains_key(&key) {
+            let g = if seq == 0 {
+                unsafe { CapturedGraph::capture(|s| self.enqueue_forward_batch(s, b, true)) }.map_err(he)?
+            } else {
+                unsafe { CapturedGraph::capture(|s| self.enqueue_forward_ex(s, b, true, Some(seq), b)) }.map_err(he)?
+            };
+            self.seq_verify_graphs.insert(key, g);
+        }
+        let g = self.seq_verify_graphs.get(&key).unwrap();
+        let rc_cp = unsafe {
+            rad_hip::hipMemcpyAsync(
+                self.bsc.d_toks.ptr,
+                d_toks_src,
+                b * 4,
+                rad_hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
+                stream,
+            )
+        };
+        if rc_cp != rad_hip::HIP_SUCCESS {
+            return Err(he(rc_cp));
+        }
+        self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(stream)).map_err(he)?;
+        g.launch_on(stream).map_err(he)?;
+        let mut out = vec![0i32; b];
+        let rc_d = unsafe {
+            rad_hip::hipMemcpyAsync(
+                draft_out.as_mut_ptr() as *mut core::ffi::c_void,
+                d_toks_src,
+                b * 4,
+                rad_hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                stream,
+            )
+        };
+        if rc_d != rad_hip::HIP_SUCCESS {
+            return Err(he(rc_d));
+        }
+        let rc = unsafe {
+            rad_hip::hipMemcpyAsync(
+                out.as_mut_ptr() as *mut core::ffi::c_void,
+                self.bsc.d_out_toks.ptr,
+                b * 4,
+                rad_hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                stream,
+            )
+        };
+        if rc != rad_hip::HIP_SUCCESS {
+            return Err(he(rc));
+        }
+        let rc_s = unsafe { rad_hip::hipStreamSynchronize(stream) };
+        if rc_s != rad_hip::HIP_SUCCESS {
+            return Err(he(rc_s));
+        }
+        self.seq_pos[seq] += b as i32;
+        if seq == 0 {
+            self.pos = self.seq_pos[0];
+        }
+        Ok(out)
+    }
+
+    pub fn verify_batch_seq_on(&mut self, seq: usize, tokens: &[i32], stream: HipStream) -> Result<Vec<i32>> {
+        let b = tokens.len();
+        assert!(b >= 1 && b <= self.multi_verify_cap.min(512));
+        let pos0 = self.seq_pos[seq];
+        let tok_bytes = unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, b * 4) };
+        let key = (seq, b);
+        if !self.seq_verify_graphs.contains_key(&key) {
+            let g = if seq == 0 {
+                unsafe { CapturedGraph::capture(|s| self.enqueue_forward_batch(s, b, true)) }.map_err(he)?
+            } else {
+                unsafe { CapturedGraph::capture(|s| self.enqueue_forward_ex(s, b, true, Some(seq), b)) }.map_err(he)?
+            };
+            self.seq_verify_graphs.insert(key, g);
+        }
+        let g = self.seq_verify_graphs.get(&key).unwrap();
+        self.bsc.d_toks.copy_from(tok_bytes, Some(stream)).map_err(he)?;
+        self.bsc.d_pos0.copy_from(&pos0.to_le_bytes(), Some(stream)).map_err(he)?;
+        g.launch_on(stream).map_err(he)?;
+        let mut out = vec![0i32; b];
+        let rc = unsafe {
+            rad_hip::hipMemcpyAsync(
+                out.as_mut_ptr() as *mut core::ffi::c_void,
+                self.bsc.d_out_toks.ptr,
+                b * 4,
+                rad_hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                stream,
+            )
+        };
+        if rc != rad_hip::HIP_SUCCESS {
+            return Err(he(rc));
+        }
+        let rc_s = unsafe { rad_hip::hipStreamSynchronize(stream) };
+        if rc_s != rad_hip::HIP_SUCCESS {
+            return Err(he(rc_s));
+        }
+        self.seq_pos[seq] += b as i32;
+        if seq == 0 {
+            self.pos = self.seq_pos[0];
+        }
+        Ok(out)
+    }
+
     pub fn verify_batch_seq(&mut self, seq: usize, tokens: &[i32]) -> Result<Vec<i32>> {
         if seq == 0 {
             self.pos = self.seq_pos[0];
@@ -1186,6 +1298,30 @@ impl InklingEngine {
         g.sync().map_err(he)?;
         self.seq_pos[seq] += b as i32;
         Ok(out)
+    }
+
+    pub fn rewind_verify_seq_to_on(&mut self, seq: usize, n_acc: usize, b: usize, stream: HipStream) -> Result<()> {
+        if n_acc < b {
+            let idx = (n_acc - 1) as i32;
+            let kv_n = (self.cfg.n_head_kv * self.cfg.dh * 3) as i32;
+            let e_n = (self.cfg.n_embd * 3) as i32;
+            unsafe {
+                ops::ink_rewind_single_all_slots(
+                    stream,
+                    self.d_rewind_ptrs.ptr as *const u64,
+                    seq as i32,
+                    idx,
+                    self.slots.len() as i32,
+                    kv_n,
+                    e_n,
+                );
+            }
+            self.seq_pos[seq] -= (b - n_acc) as i32;
+            if seq == 0 {
+                self.pos = self.seq_pos[0];
+            }
+        }
+        Ok(())
     }
 
     pub fn rewind_verify_seq_to(&mut self, seq: usize, n_acc: usize, b: usize) -> Result<()> {
