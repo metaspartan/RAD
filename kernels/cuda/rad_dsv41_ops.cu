@@ -934,34 +934,83 @@ void mqa_flash_mma16_f16_k(
         __syncthreads();
     };
 
-    for (int p0 = p_start; p0 < seq_len; p0 += 16) {
-        int tile_len = seq_len - p0;
-        if (tile_len > 16) tile_len = 16;
-        int n_u4 = tile_len * 64;
-        const uint4* src_u4 = reinterpret_cast<const uint4*>(k_cache + (size_t)p0 * 512);
-        for (int i = t; i < 1024; i += 256) {
-            int r = i >> 6;
-            int c4 = i & 63;
-            reinterpret_cast<uint4*>(s_kv[r])[c4] = (i < n_u4) ? __ldg(src_u4 + i) : make_uint4(0u, 0u, 0u, 0u);
+    if (p_start < seq_len) {
+        int tile_len0 = seq_len - p_start;
+        if (tile_len0 > 16) tile_len0 = 16;
+        int n_u4_0 = tile_len0 * 64;
+        const uint4* src0 = reinterpret_cast<const uint4*>(k_cache + (size_t)p_start * 512);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            int i = t + k * 256;
+            reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = (i < n_u4_0) ? __ldg(src0 + i) : make_uint4(0u, 0u, 0u, 0u);
         }
         __syncthreads();
-        process_tile(tile_len);
+        for (int p0 = p_start; p0 < seq_len; p0 += 16) {
+            int tile_len = seq_len - p0;
+            if (tile_len > 16) tile_len = 16;
+            uint4 nxt[4];
+            bool has_next = (p0 + 16 < seq_len);
+            if (has_next) {
+                int nlen = seq_len - (p0 + 16);
+                if (nlen > 16) nlen = 16;
+                int nu4 = nlen * 64;
+                const uint4* nsrc = reinterpret_cast<const uint4*>(k_cache + (size_t)(p0 + 16) * 512);
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    int i = t + k * 256;
+                    nxt[k] = (i < nu4) ? __ldg(nsrc + i) : make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
+            process_tile(tile_len);
+            if (has_next) {
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    int i = t + k * 256;
+                    reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = nxt[k];
+                }
+                __syncthreads();
+            }
+        }
     }
 
     if (comp_kv && comp_ratio > 0 && p_start > 0) {
         int c_end = p_start / comp_ratio;
-        for (int c0 = 0; c0 < c_end; c0 += 16) {
-            int tile_len = c_end - c0;
-            if (tile_len > 16) tile_len = 16;
-            int n_u4 = tile_len * 64;
-            const uint4* src_u4 = reinterpret_cast<const uint4*>(comp_kv + (size_t)c0 * 512);
-            for (int i = t; i < 1024; i += 256) {
-                int r = i >> 6;
-                int c4 = i & 63;
-                reinterpret_cast<uint4*>(s_kv[r])[c4] = (i < n_u4) ? __ldg(src_u4 + i) : make_uint4(0u, 0u, 0u, 0u);
+        if (c_end > 0) {
+            int tile_len0 = (c_end > 16) ? 16 : c_end;
+            int n_u4_0 = tile_len0 * 64;
+            const uint4* src0 = reinterpret_cast<const uint4*>(comp_kv);
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                int i = t + k * 256;
+                reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = (i < n_u4_0) ? __ldg(src0 + i) : make_uint4(0u, 0u, 0u, 0u);
             }
             __syncthreads();
-            process_tile(tile_len);
+            for (int c0 = 0; c0 < c_end; c0 += 16) {
+                int tile_len = c_end - c0;
+                if (tile_len > 16) tile_len = 16;
+                uint4 nxt[4];
+                bool has_next = (c0 + 16 < c_end);
+                if (has_next) {
+                    int nlen = c_end - (c0 + 16);
+                    if (nlen > 16) nlen = 16;
+                    int nu4 = nlen * 64;
+                    const uint4* nsrc = reinterpret_cast<const uint4*>(comp_kv + (size_t)(c0 + 16) * 512);
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        int i = t + k * 256;
+                        nxt[k] = (i < nu4) ? __ldg(nsrc + i) : make_uint4(0u, 0u, 0u, 0u);
+                    }
+                }
+                process_tile(tile_len);
+                if (has_next) {
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        int i = t + k * 256;
+                        reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = nxt[k];
+                    }
+                    __syncthreads();
+                }
+            }
         }
     }
 
@@ -1041,9 +1090,7 @@ void mqa_flash_mma16_splitkv_f16_k(
     float o2[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     float o3[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
-    for (int ti = t_beg; ti < t_end; ++ti) {
-        int tile_len;
-        const uint4* src_u4;
+    auto tile_info = [&](int ti, int& tile_len, const uint4*& src_u4) {
         if (ti < raw_tiles) {
             int p0 = p_start + ti * 16;
             tile_len = seq_len - p0;
@@ -1055,93 +1102,125 @@ void mqa_flash_mma16_splitkv_f16_k(
             if (tile_len > 16) tile_len = 16;
             src_u4 = reinterpret_cast<const uint4*>(comp_kv + (size_t)c0 * 512);
         }
-        int n_u4 = tile_len * 64;
-        for (int i = t; i < 1024; i += 256) {
-            int r = i >> 6;
-            int c4 = i & 63;
-            reinterpret_cast<uint4*>(s_kv[r])[c4] = (i < n_u4) ? __ldg(src_u4 + i) : make_uint4(0u, 0u, 0u, 0u);
-        }
-        __syncthreads();
+    };
 
-        float s00 = 0.0f, s01 = 0.0f, s02 = 0.0f, s03 = 0.0f;
-        float s10 = 0.0f, s11 = 0.0f, s12 = 0.0f, s13 = 0.0f;
-        int k_base = warp * 64;
+    if (t_beg < t_end) {
+        int tile_len0;
+        const uint4* src0;
+        tile_info(t_beg, tile_len0, src0);
+        int nu4_0 = tile_len0 * 64;
         #pragma unroll
-        for (int ks = 0; ks < 64; ks += 16) {
-            int ko0 = k_base + ks + tid * 2;
-            int ko1 = ko0 + 8;
-            uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][ko0]);
-            uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][ko0]);
-            uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][ko1]);
-            uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][ko1]);
-            uint32_t b00 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id][ko0]);
-            uint32_t b01 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id][ko1]);
-            uint32_t b10 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id + 8][ko0]);
-            uint32_t b11 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id + 8][ko1]);
-            mqa_mma_m16n8k16_f32(s00, s01, s02, s03, a0, a1, a2, a3, b00, b01);
-            mqa_mma_m16n8k16_f32(s10, s11, s12, s13, a0, a1, a2, a3, b10, b11);
+        for (int k = 0; k < 4; ++k) {
+            int i = t + k * 256;
+            reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = (i < nu4_0) ? __ldg(src0 + i) : make_uint4(0u, 0u, 0u, 0u);
         }
-        s_sp[warp][group_id][tid * 2] = s00;
-        s_sp[warp][group_id][tid * 2 + 1] = s01;
-        s_sp[warp][group_id + 8][tid * 2] = s02;
-        s_sp[warp][group_id + 8][tid * 2 + 1] = s03;
-        s_sp[warp][group_id][8 + tid * 2] = s10;
-        s_sp[warp][group_id][8 + tid * 2 + 1] = s11;
-        s_sp[warp][group_id + 8][8 + tid * 2] = s12;
-        s_sp[warp][group_id + 8][8 + tid * 2 + 1] = s13;
         __syncthreads();
+        for (int ti = t_beg; ti < t_end; ++ti) {
+            int tile_len;
+            const uint4* src_u4;
+            tile_info(ti, tile_len, src_u4);
+            uint4 nxt[4];
+            bool has_next = (ti + 1 < t_end);
+            if (has_next) {
+                int nlen;
+                const uint4* nsrc;
+                tile_info(ti + 1, nlen, nsrc);
+                int nu4 = nlen * 64;
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    int i = t + k * 256;
+                    nxt[k] = (i < nu4) ? __ldg(nsrc + i) : make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
 
-        int r = t >> 4;
-        int c = t & 15;
-        float sc = -1e30f;
-        if (c < tile_len) {
-            float sum = s_sp[0][r][c] + s_sp[1][r][c] + s_sp[2][r][c] + s_sp[3][r][c]
-                      + s_sp[4][r][c] + s_sp[5][r][c] + s_sp[6][r][c] + s_sp[7][r][c];
-            sc = sum * scale;
-        }
-        float rmax = sc;
-        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 8));
-        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 4));
-        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 2));
-        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 1));
-        float old_m = s_m[r];
-        float new_m = fmaxf(old_m, rmax);
-        float alpha = exp2f((old_m - new_m) * 1.44269504f);
-        float p = (c < tile_len) ? exp2f((sc - new_m) * 1.44269504f) : 0.0f;
-        s_p[r][c] = __float2half(p);
-        float rsum = p;
-        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 8);
-        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 4);
-        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 2);
-        rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 1);
-        if (c == 0) {
-            s_l[r] = s_l[r] * alpha + rsum;
-            s_m[r] = new_m;
-            s_alpha[r] = alpha;
-        }
-        __syncthreads();
+            float s00 = 0.0f, s01 = 0.0f, s02 = 0.0f, s03 = 0.0f;
+            float s10 = 0.0f, s11 = 0.0f, s12 = 0.0f, s13 = 0.0f;
+            int k_base = warp * 64;
+            #pragma unroll
+            for (int ks = 0; ks < 64; ks += 16) {
+                int ko0 = k_base + ks + tid * 2;
+                int ko1 = ko0 + 8;
+                uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][ko0]);
+                uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][ko0]);
+                uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][ko1]);
+                uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][ko1]);
+                uint32_t b00 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id][ko0]);
+                uint32_t b01 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id][ko1]);
+                uint32_t b10 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id + 8][ko0]);
+                uint32_t b11 = *reinterpret_cast<const uint32_t*>(&s_kv[group_id + 8][ko1]);
+                mqa_mma_m16n8k16_f32(s00, s01, s02, s03, a0, a1, a2, a3, b00, b01);
+                mqa_mma_m16n8k16_f32(s10, s11, s12, s13, a0, a1, a2, a3, b10, b11);
+            }
+            s_sp[warp][group_id][tid * 2] = s00;
+            s_sp[warp][group_id][tid * 2 + 1] = s01;
+            s_sp[warp][group_id + 8][tid * 2] = s02;
+            s_sp[warp][group_id + 8][tid * 2 + 1] = s03;
+            s_sp[warp][group_id][8 + tid * 2] = s10;
+            s_sp[warp][group_id][8 + tid * 2 + 1] = s11;
+            s_sp[warp][group_id + 8][8 + tid * 2] = s12;
+            s_sp[warp][group_id + 8][8 + tid * 2 + 1] = s13;
+            __syncthreads();
 
-        float a0_sc = s_alpha[group_id];
-        float a1_sc = s_alpha[group_id + 8];
-        uint32_t pa0 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2]);
-        uint32_t pa1 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2]);
-        uint32_t pa2 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2 + 8]);
-        uint32_t pa3 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2 + 8]);
-        int col_w = warp * 64;
-        #pragma unroll
-        for (int nb = 0; nb < 8; ++nb) {
-            o0[nb] *= a0_sc;
-            o1[nb] *= a0_sc;
-            o2[nb] *= a1_sc;
-            o3[nb] *= a1_sc;
-            int col = col_w + nb * 8 + group_id;
-            half2 vb0 = __halves2half2(s_kv[tid * 2][col], s_kv[tid * 2 + 1][col]);
-            half2 vb1 = __halves2half2(s_kv[tid * 2 + 8][col], s_kv[tid * 2 + 9][col]);
-            uint32_t b0 = *reinterpret_cast<uint32_t*>(&vb0);
-            uint32_t b1 = *reinterpret_cast<uint32_t*>(&vb1);
-            mqa_mma_m16n8k16_f32(o0[nb], o1[nb], o2[nb], o3[nb], pa0, pa1, pa2, pa3, b0, b1);
+            int r = t >> 4;
+            int c = t & 15;
+            float sc = -1e30f;
+            if (c < tile_len) {
+                float sum = s_sp[0][r][c] + s_sp[1][r][c] + s_sp[2][r][c] + s_sp[3][r][c]
+                          + s_sp[4][r][c] + s_sp[5][r][c] + s_sp[6][r][c] + s_sp[7][r][c];
+                sc = sum * scale;
+            }
+            float rmax = sc;
+            rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 8));
+            rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 4));
+            rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 2));
+            rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFu, rmax, 1));
+            float old_m = s_m[r];
+            float new_m = fmaxf(old_m, rmax);
+            float alpha = exp2f((old_m - new_m) * 1.44269504f);
+            float p = (c < tile_len) ? exp2f((sc - new_m) * 1.44269504f) : 0.0f;
+            s_p[r][c] = __float2half(p);
+            float rsum = p;
+            rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 8);
+            rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 4);
+            rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 2);
+            rsum += __shfl_xor_sync(0xFFFFFFFFu, rsum, 1);
+            if (c == 0) {
+                s_l[r] = s_l[r] * alpha + rsum;
+                s_m[r] = new_m;
+                s_alpha[r] = alpha;
+            }
+            __syncthreads();
+
+            float a0_sc = s_alpha[group_id];
+            float a1_sc = s_alpha[group_id + 8];
+            uint32_t pa0 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2]);
+            uint32_t pa1 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2]);
+            uint32_t pa2 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2 + 8]);
+            uint32_t pa3 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2 + 8]);
+            int col_w = warp * 64;
+            #pragma unroll
+            for (int nb = 0; nb < 8; ++nb) {
+                o0[nb] *= a0_sc;
+                o1[nb] *= a0_sc;
+                o2[nb] *= a1_sc;
+                o3[nb] *= a1_sc;
+                int col = col_w + nb * 8 + group_id;
+                half2 vb0 = __halves2half2(s_kv[tid * 2][col], s_kv[tid * 2 + 1][col]);
+                half2 vb1 = __halves2half2(s_kv[tid * 2 + 8][col], s_kv[tid * 2 + 9][col]);
+                uint32_t b0 = *reinterpret_cast<uint32_t*>(&vb0);
+                uint32_t b1 = *reinterpret_cast<uint32_t*>(&vb1);
+                mqa_mma_m16n8k16_f32(o0[nb], o1[nb], o2[nb], o3[nb], pa0, pa1, pa2, pa3, b0, b1);
+            }
+            __syncthreads();
+            if (has_next) {
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    int i = t + k * 256;
+                    reinterpret_cast<uint4*>(s_kv[i >> 6])[i & 63] = nxt[k];
+                }
+                __syncthreads();
+            }
         }
-        __syncthreads();
     }
 
     int col_w = warp * 64;
