@@ -269,17 +269,21 @@ extern "C" __global__ void gemm_q4_0_sudot4_k(const uint8_t* __restrict__ W,
     for (int b = lane; b < nblk; b += 32) {
         uint4 q4 = qrow[b];
         float dw = __half2float(drow[b]);
+        int32_t w0 = (int32_t)(q4.x & 0x0F0F0F0Fu), w1 = (int32_t)(q4.y & 0x0F0F0F0Fu);
+        int32_t w2 = (int32_t)(q4.z & 0x0F0F0F0Fu), w3 = (int32_t)(q4.w & 0x0F0F0F0Fu);
+        int32_t w4 = (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), w5 = (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu);
+        int32_t w6 = (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), w7 = (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu);
         for (int m = 0; m < n_t; ++m) {
             const q8_1_blk xb = Xq[(size_t)(t0 + m) * nblk + b];
             int32_t sumi = 0;
-            sumi = __builtin_amdgcn_sudot4(false, (int32_t)(q4.x & 0x0F0F0F0Fu), true, xb.q[0], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, (int32_t)(q4.y & 0x0F0F0F0Fu), true, xb.q[1], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, (int32_t)(q4.z & 0x0F0F0F0Fu), true, xb.q[2], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, (int32_t)(q4.w & 0x0F0F0F0Fu), true, xb.q[3], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, (int32_t)((q4.x >> 4) & 0x0F0F0F0Fu), true, xb.q[4], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, (int32_t)((q4.y >> 4) & 0x0F0F0F0Fu), true, xb.q[5], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, (int32_t)((q4.z >> 4) & 0x0F0F0F0Fu), true, xb.q[6], sumi, false);
-            sumi = __builtin_amdgcn_sudot4(false, (int32_t)((q4.w >> 4) & 0x0F0F0F0Fu), true, xb.q[7], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w0, true, xb.q[0], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w1, true, xb.q[1], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w2, true, xb.q[2], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w3, true, xb.q[3], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w4, true, xb.q[4], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w5, true, xb.q[5], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w6, true, xb.q[6], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(false, w7, true, xb.q[7], sumi, false);
             acc[m] = fmaf(dw * xb.d, (float)(sumi - 8 * xb.s), acc[m]);
         }
     }

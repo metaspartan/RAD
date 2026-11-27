@@ -364,38 +364,35 @@ extern "C" __global__ void dflash2_topk16_part_k(const float* __restrict__ logit
         best_v[k] = -1e30f;
         best_i[k] = 0;
     }
+    float thresh = -1e30f;
+    auto insert_cand = [&](float v, int idx) {
+        float cv = v;
+        int ci = idx;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            if (cv > best_v[k]) {
+                float tv = best_v[k];
+                int ti = best_i[k];
+                best_v[k] = cv;
+                best_i[k] = ci;
+                cv = tv;
+                ci = ti;
+            }
+        }
+        thresh = best_v[15];
+    };
     int i_end4 = i_end & ~3;
     const float4* row_p4 = reinterpret_cast<const float4*>(row_p);
     for (int i = i_beg + tid * 4; i < i_end4; i += 512) {
         float4 v4 = row_p4[i >> 2];
-        float vals[4] = {v4.x, v4.y, v4.z, v4.w};
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            float v = vals[j];
-            if (v > best_v[15]) {
-                int pos = 15;
-                while (pos > 0 && v > best_v[pos - 1]) {
-                    best_v[pos] = best_v[pos - 1];
-                    best_i[pos] = best_i[pos - 1];
-                    --pos;
-                }
-                best_v[pos] = v;
-                best_i[pos] = i + j;
-            }
-        }
+        if (v4.x > thresh) insert_cand(v4.x, i);
+        if (v4.y > thresh) insert_cand(v4.y, i + 1);
+        if (v4.z > thresh) insert_cand(v4.z, i + 2);
+        if (v4.w > thresh) insert_cand(v4.w, i + 3);
     }
     for (int i = i_end4 + tid; i < i_end; i += 128) {
         float v = row_p[i];
-        if (v > best_v[15]) {
-            int pos = 15;
-            while (pos > 0 && v > best_v[pos - 1]) {
-                best_v[pos] = best_v[pos - 1];
-                best_i[pos] = best_i[pos - 1];
-                --pos;
-            }
-            best_v[pos] = v;
-            best_i[pos] = i;
-        }
+        if (v > thresh) insert_cand(v, i);
     }
 
     __shared__ float sm_v[128 * 16];
