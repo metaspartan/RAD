@@ -21,17 +21,17 @@ extern "C" __global__ void gemm_q4_0_wmma64_k(const uint8_t* __restrict__ W,
 
     __shared__ union {
         struct {
-            uint4 wq[4][128];
-            float dw[4][128];
-            int2 xq[4][4][66];
-            float xd[4][64];
-            int32_t xs[4][64];
+            uint4 wq[2][2][128];
+            float dw[2][2][128];
+            int2 xq[2][2][4][66];
+            float xd[2][2][64];
+            int32_t xs[2][2][64];
         } kloop;
         float out[32][132];
     } sm;
 
-    int r_loc = tid >> 2;
-    int kb_load = tid & 3;
+    int r_loc = tid >> 1;
+    int kb_load = tid & 1;
     int r_g0 = min(blk_row0 + r_loc, n - 1);
     int r_g1 = min(blk_row0 + r_loc + 64, n - 1);
     const uint8_t* wr0 = W + (size_t)r_g0 * rbytes;
@@ -54,83 +54,99 @@ extern "C" __global__ void gemm_q4_0_wmma64_k(const uint8_t* __restrict__ W,
     float acc10[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     float acc11[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
-    for (int b0 = 0; b0 < nblk; b0 += 4) {
+    auto load_tile = [&](int buf, int b0) {
         int b = b0 + kb_load;
-        if (b < nblk) {
-            sm.kloop.wq[kb_load][r_loc] = qr0[b];
-            sm.kloop.dw[kb_load][r_loc] = __half2float(dr0[b]);
-            sm.kloop.wq[kb_load][r_loc + 64] = qr1[b];
-            sm.kloop.dw[kb_load][r_loc + 64] = __half2float(dr1[b]);
-            const w_q8_1_blk xb0 = xr0[b];
-            sm.kloop.xq[kb_load][0][r_loc] = make_int2(xb0.q[0], xb0.q[1]);
-            sm.kloop.xq[kb_load][1][r_loc] = make_int2(xb0.q[2], xb0.q[3]);
-            sm.kloop.xq[kb_load][2][r_loc] = make_int2(xb0.q[4], xb0.q[5]);
-            sm.kloop.xq[kb_load][3][r_loc] = make_int2(xb0.q[6], xb0.q[7]);
-            sm.kloop.xd[kb_load][r_loc] = xb0.d;
-            sm.kloop.xs[kb_load][r_loc] = 8 * xb0.s;
-        } else {
-            sm.kloop.wq[kb_load][r_loc] = make_uint4(0, 0, 0, 0);
-            sm.kloop.dw[kb_load][r_loc] = 0.0f;
-            sm.kloop.wq[kb_load][r_loc + 64] = make_uint4(0, 0, 0, 0);
-            sm.kloop.dw[kb_load][r_loc + 64] = 0.0f;
-            sm.kloop.xd[kb_load][r_loc] = 0.0f;
-            sm.kloop.xs[kb_load][r_loc] = 0;
-        }
-        __syncthreads();
-
-#pragma unroll
-        for (int kb = 0; kb < 4; ++kb) {
-            uint4 q0 = sm.kloop.wq[kb][m0 + col];
-            uint32_t w00 = half ? q0.z : q0.x;
-            uint32_t w01 = half ? q0.w : q0.y;
-            wmma_i2_v a0_lo = {(int32_t)(w00 & 0x0F0F0F0Fu), (int32_t)(w01 & 0x0F0F0F0Fu)};
-            wmma_i2_v a0_hi = {(int32_t)((w00 >> 4) & 0x0F0F0F0Fu), (int32_t)((w01 >> 4) & 0x0F0F0F0Fu)};
-
-            uint4 q1 = sm.kloop.wq[kb][m1 + col];
-            uint32_t w10 = half ? q1.z : q1.x;
-            uint32_t w11 = half ? q1.w : q1.y;
-            wmma_i2_v a1_lo = {(int32_t)(w10 & 0x0F0F0F0Fu), (int32_t)(w11 & 0x0F0F0F0Fu)};
-            wmma_i2_v a1_hi = {(int32_t)((w10 >> 4) & 0x0F0F0F0Fu), (int32_t)((w11 >> 4) & 0x0F0F0F0Fu)};
-
-            int2 x0l = sm.kloop.xq[kb][half][n0 + col];
-            int2 x0h = sm.kloop.xq[kb][2 + half][n0 + col];
-            wmma_i2_v b0_lo = {x0l.x, x0l.y};
-            wmma_i2_v b0_hi = {x0h.x, x0h.y};
-
-            int2 x1l = sm.kloop.xq[kb][half][n1 + col];
-            int2 x1h = sm.kloop.xq[kb][2 + half][n1 + col];
-            wmma_i2_v b1_lo = {x1l.x, x1l.y};
-            wmma_i2_v b1_hi = {x1h.x, x1h.y};
-
-            wmma_i8_v c00 = {0, 0, 0, 0, 0, 0, 0, 0};
-            wmma_i8_v c01 = {0, 0, 0, 0, 0, 0, 0, 0};
-            wmma_i8_v c10 = {0, 0, 0, 0, 0, 0, 0, 0};
-            wmma_i8_v c11 = {0, 0, 0, 0, 0, 0, 0, 0};
-            c00 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_lo, true, b0_lo, c00, false);
-            c00 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_hi, true, b0_hi, c00, false);
-            c01 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_lo, true, b1_lo, c01, false);
-            c01 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_hi, true, b1_hi, c01, false);
-            c10 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_lo, true, b0_lo, c10, false);
-            c10 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_hi, true, b0_hi, c10, false);
-            c11 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_lo, true, b1_lo, c11, false);
-            c11 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_hi, true, b1_hi, c11, false);
-
-            float xd0 = sm.kloop.xd[kb][n0 + col];
-            int32_t xs0 = sm.kloop.xs[kb][n0 + col];
-            float xd1 = sm.kloop.xd[kb][n1 + col];
-            int32_t xs1 = sm.kloop.xs[kb][n1 + col];
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                float dw0 = sm.kloop.dw[kb][m0 + half * 8 + i];
-                float dw1 = sm.kloop.dw[kb][m1 + half * 8 + i];
-                acc00[i] = fmaf(dw0 * xd0, (float)(c00[i] - xs0), acc00[i]);
-                acc01[i] = fmaf(dw0 * xd1, (float)(c01[i] - xs1), acc01[i]);
-                acc10[i] = fmaf(dw1 * xd0, (float)(c10[i] - xs0), acc10[i]);
-                acc11[i] = fmaf(dw1 * xd1, (float)(c11[i] - xs1), acc11[i]);
+        if (tid < 128) {
+            if (b < nblk) {
+                sm.kloop.wq[buf][kb_load][r_loc] = qr0[b];
+                sm.kloop.dw[buf][kb_load][r_loc] = __half2float(dr0[b]);
+                sm.kloop.wq[buf][kb_load][r_loc + 64] = qr1[b];
+                sm.kloop.dw[buf][kb_load][r_loc + 64] = __half2float(dr1[b]);
+                const w_q8_1_blk xb0 = xr0[b];
+                sm.kloop.xq[buf][kb_load][0][r_loc] = make_int2(xb0.q[0], xb0.q[1]);
+                sm.kloop.xq[buf][kb_load][1][r_loc] = make_int2(xb0.q[2], xb0.q[3]);
+                sm.kloop.xq[buf][kb_load][2][r_loc] = make_int2(xb0.q[4], xb0.q[5]);
+                sm.kloop.xq[buf][kb_load][3][r_loc] = make_int2(xb0.q[6], xb0.q[7]);
+                sm.kloop.xd[buf][kb_load][r_loc] = xb0.d;
+                sm.kloop.xs[buf][kb_load][r_loc] = 8 * xb0.s;
+            } else {
+                sm.kloop.wq[buf][kb_load][r_loc] = make_uint4(0, 0, 0, 0);
+                sm.kloop.dw[buf][kb_load][r_loc] = 0.0f;
+                sm.kloop.wq[buf][kb_load][r_loc + 64] = make_uint4(0, 0, 0, 0);
+                sm.kloop.dw[buf][kb_load][r_loc + 64] = 0.0f;
+                sm.kloop.xd[buf][kb_load][r_loc] = 0.0f;
+                sm.kloop.xs[buf][kb_load][r_loc] = 0;
             }
         }
+    };
+
+    if (nblk > 0) {
+        load_tile(0, 0);
         __syncthreads();
+        for (int b0 = 0, step = 0; b0 < nblk; b0 += 2, ++step) {
+            int cur = step & 1;
+            int nxt = cur ^ 1;
+            if (b0 + 2 < nblk) {
+                load_tile(nxt, b0 + 2);
+            }
+
+#pragma unroll
+            for (int kb = 0; kb < 2; ++kb) {
+                uint4 q0 = sm.kloop.wq[cur][kb][m0 + col];
+                uint32_t w00 = half ? q0.z : q0.x;
+                uint32_t w01 = half ? q0.w : q0.y;
+                wmma_i2_v a0_lo = {(int32_t)(w00 & 0x0F0F0F0Fu), (int32_t)(w01 & 0x0F0F0F0Fu)};
+                wmma_i2_v a0_hi = {(int32_t)((w00 >> 4) & 0x0F0F0F0Fu), (int32_t)((w01 >> 4) & 0x0F0F0F0Fu)};
+
+                uint4 q1 = sm.kloop.wq[cur][kb][m1 + col];
+                uint32_t w10 = half ? q1.z : q1.x;
+                uint32_t w11 = half ? q1.w : q1.y;
+                wmma_i2_v a1_lo = {(int32_t)(w10 & 0x0F0F0F0Fu), (int32_t)(w11 & 0x0F0F0F0Fu)};
+                wmma_i2_v a1_hi = {(int32_t)((w10 >> 4) & 0x0F0F0F0Fu), (int32_t)((w11 >> 4) & 0x0F0F0F0Fu)};
+
+                int2 x0l = sm.kloop.xq[cur][kb][half][n0 + col];
+                int2 x0h = sm.kloop.xq[cur][kb][2 + half][n0 + col];
+                wmma_i2_v b0_lo = {x0l.x, x0l.y};
+                wmma_i2_v b0_hi = {x0h.x, x0h.y};
+
+                int2 x1l = sm.kloop.xq[cur][kb][half][n1 + col];
+                int2 x1h = sm.kloop.xq[cur][kb][2 + half][n1 + col];
+                wmma_i2_v b1_lo = {x1l.x, x1l.y};
+                wmma_i2_v b1_hi = {x1h.x, x1h.y};
+
+                wmma_i8_v c00 = {0, 0, 0, 0, 0, 0, 0, 0};
+                wmma_i8_v c01 = {0, 0, 0, 0, 0, 0, 0, 0};
+                wmma_i8_v c10 = {0, 0, 0, 0, 0, 0, 0, 0};
+                wmma_i8_v c11 = {0, 0, 0, 0, 0, 0, 0, 0};
+                c00 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_lo, true, b0_lo, c00, false);
+                c00 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_hi, true, b0_hi, c00, false);
+                c01 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_lo, true, b1_lo, c01, false);
+                c01 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_hi, true, b1_hi, c01, false);
+                c10 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_lo, true, b0_lo, c10, false);
+                c10 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_hi, true, b0_hi, c10, false);
+                c11 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_lo, true, b1_lo, c11, false);
+                c11 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_hi, true, b1_hi, c11, false);
+
+                float xd0 = sm.kloop.xd[cur][kb][n0 + col];
+                int32_t xs0 = sm.kloop.xs[cur][kb][n0 + col];
+                float xd1 = sm.kloop.xd[cur][kb][n1 + col];
+                int32_t xs1 = sm.kloop.xs[cur][kb][n1 + col];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    float dw0 = sm.kloop.dw[cur][kb][m0 + half * 8 + i];
+                    float dw1 = sm.kloop.dw[cur][kb][m1 + half * 8 + i];
+                    acc00[i] = fmaf(dw0 * xd0, (float)(c00[i] - xs0), acc00[i]);
+                    acc01[i] = fmaf(dw0 * xd1, (float)(c01[i] - xs1), acc01[i]);
+                    acc10[i] = fmaf(dw1 * xd0, (float)(c10[i] - xs0), acc10[i]);
+                    acc11[i] = fmaf(dw1 * xd1, (float)(c11[i] - xs1), acc11[i]);
+                }
+            }
+            if (b0 + 2 < nblk) {
+                __syncthreads();
+            }
+        }
     }
+    __syncthreads();
 
     int c4 = tid & 31;
     int t_base = tid >> 5;
@@ -1059,19 +1075,19 @@ extern "C" __global__ void moe_gu_q4_0_wmma_q8_k(const uint8_t* __restrict__ W,
 
     __shared__ union {
         struct {
-            uint4 wg[4][64];
-            uint4 wu[4][64];
-            float dg[4][64];
-            float du[4][64];
-            int2 xq[4][4][66];
-            float xd[4][64];
-            int32_t xs[4][64];
+            uint4 wg[2][2][64];
+            uint4 wu[2][2][64];
+            float dg[2][2][64];
+            float du[2][2][64];
+            int2 xq[2][2][4][66];
+            float xd[2][2][64];
+            int32_t xs[2][2][64];
         } t;
         float act[64][65];
     } sm;
 
-    int r_loc = tid >> 2;
-    int kb_load = tid & 3;
+    int r_loc = tid >> 1;
+    int kb_load = tid & 1;
     int r_g = min(blk_row0 + r_loc, n_ff - 1);
     const uint8_t* wg_p = W + (size_t)exp_id * exp_bytes + (size_t)r_g * rbytes;
     const uint8_t* wu_p = W + (size_t)exp_id * exp_bytes + (size_t)(n_ff + r_g) * rbytes;
@@ -1099,83 +1115,99 @@ extern "C" __global__ void moe_gu_q4_0_wmma_q8_k(const uint8_t* __restrict__ W,
         float ag1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         float au1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
-        for (int b0 = 0; b0 < nblk; b0 += 4) {
-            int b = b0 + kb_load;
-            if (b < nblk) {
-                sm.t.wg[kb_load][r_loc] = qg_r[b];
-                sm.t.dg[kb_load][r_loc] = __half2float(dg_r[b]);
-                sm.t.wu[kb_load][r_loc] = qu_r[b];
-                sm.t.du[kb_load][r_loc] = __half2float(du_r[b]);
-                const w_q8_1_blk xb = xr[b];
-                sm.t.xq[kb_load][0][r_loc] = make_int2(xb.q[0], xb.q[1]);
-                sm.t.xq[kb_load][1][r_loc] = make_int2(xb.q[2], xb.q[3]);
-                sm.t.xq[kb_load][2][r_loc] = make_int2(xb.q[4], xb.q[5]);
-                sm.t.xq[kb_load][3][r_loc] = make_int2(xb.q[6], xb.q[7]);
-                sm.t.xd[kb_load][r_loc] = xb.d;
-                sm.t.xs[kb_load][r_loc] = 8 * xb.s;
-            } else {
-                sm.t.wg[kb_load][r_loc] = make_uint4(0, 0, 0, 0);
-                sm.t.dg[kb_load][r_loc] = 0.0f;
-                sm.t.wu[kb_load][r_loc] = make_uint4(0, 0, 0, 0);
-                sm.t.du[kb_load][r_loc] = 0.0f;
-                sm.t.xd[kb_load][r_loc] = 0.0f;
-                sm.t.xs[kb_load][r_loc] = 0;
-            }
-            __syncthreads();
-
-#pragma unroll
-            for (int kb = 0; kb < 4; ++kb) {
-                uint4 qg = sm.t.wg[kb][m0 + col];
-                uint32_t g0 = half ? qg.z : qg.x;
-                uint32_t g1 = half ? qg.w : qg.y;
-                wmma_i2_v ag_lo = {(int32_t)(g0 & 0x0F0F0F0Fu), (int32_t)(g1 & 0x0F0F0F0Fu)};
-                wmma_i2_v ag_hi = {(int32_t)((g0 >> 4) & 0x0F0F0F0Fu), (int32_t)((g1 >> 4) & 0x0F0F0F0Fu)};
-
-                uint4 qu = sm.t.wu[kb][m0 + col];
-                uint32_t u0 = half ? qu.z : qu.x;
-                uint32_t u1 = half ? qu.w : qu.y;
-                wmma_i2_v au_lo = {(int32_t)(u0 & 0x0F0F0F0Fu), (int32_t)(u1 & 0x0F0F0F0Fu)};
-                wmma_i2_v au_hi = {(int32_t)((u0 >> 4) & 0x0F0F0F0Fu), (int32_t)((u1 >> 4) & 0x0F0F0F0Fu)};
-
-                int2 x0l = sm.t.xq[kb][half][n0 + col];
-                int2 x0h = sm.t.xq[kb][2 + half][n0 + col];
-                wmma_i2_v b0_lo = {x0l.x, x0l.y};
-                wmma_i2_v b0_hi = {x0h.x, x0h.y};
-
-                int2 x1l = sm.t.xq[kb][half][n1 + col];
-                int2 x1h = sm.t.xq[kb][2 + half][n1 + col];
-                wmma_i2_v b1_lo = {x1l.x, x1l.y};
-                wmma_i2_v b1_hi = {x1h.x, x1h.y};
-
-                wmma_i8_v cg0 = {0, 0, 0, 0, 0, 0, 0, 0};
-                wmma_i8_v cu0 = {0, 0, 0, 0, 0, 0, 0, 0};
-                wmma_i8_v cg1 = {0, 0, 0, 0, 0, 0, 0, 0};
-                wmma_i8_v cu1 = {0, 0, 0, 0, 0, 0, 0, 0};
-                cg0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_lo, true, b0_lo, cg0, false);
-                cg0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_hi, true, b0_hi, cg0, false);
-                cu0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_lo, true, b0_lo, cu0, false);
-                cu0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_hi, true, b0_hi, cu0, false);
-                cg1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_lo, true, b1_lo, cg1, false);
-                cg1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_hi, true, b1_hi, cg1, false);
-                cu1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_lo, true, b1_lo, cu1, false);
-                cu1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_hi, true, b1_hi, cu1, false);
-
-                float xd0 = sm.t.xd[kb][n0 + col];
-                int32_t xs0 = sm.t.xs[kb][n0 + col];
-                float xd1 = sm.t.xd[kb][n1 + col];
-                int32_t xs1 = sm.t.xs[kb][n1 + col];
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    float dgi = sm.t.dg[kb][m0 + half * 8 + i];
-                    float dui = sm.t.du[kb][m0 + half * 8 + i];
-                    ag0[i] = fmaf(dgi * xd0, (float)(cg0[i] - xs0), ag0[i]);
-                    au0[i] = fmaf(dui * xd0, (float)(cu0[i] - xs0), au0[i]);
-                    ag1[i] = fmaf(dgi * xd1, (float)(cg1[i] - xs1), ag1[i]);
-                    au1[i] = fmaf(dui * xd1, (float)(cu1[i] - xs1), au1[i]);
+        auto load_tile = [&](int buf, int b0) {
+            if (tid < 128) {
+                int b = b0 + kb_load;
+                if (b < nblk) {
+                    sm.t.wg[buf][kb_load][r_loc] = qg_r[b];
+                    sm.t.dg[buf][kb_load][r_loc] = __half2float(dg_r[b]);
+                    sm.t.wu[buf][kb_load][r_loc] = qu_r[b];
+                    sm.t.du[buf][kb_load][r_loc] = __half2float(du_r[b]);
+                    const w_q8_1_blk xb = xr[b];
+                    sm.t.xq[buf][kb_load][0][r_loc] = make_int2(xb.q[0], xb.q[1]);
+                    sm.t.xq[buf][kb_load][1][r_loc] = make_int2(xb.q[2], xb.q[3]);
+                    sm.t.xq[buf][kb_load][2][r_loc] = make_int2(xb.q[4], xb.q[5]);
+                    sm.t.xq[buf][kb_load][3][r_loc] = make_int2(xb.q[6], xb.q[7]);
+                    sm.t.xd[buf][kb_load][r_loc] = xb.d;
+                    sm.t.xs[buf][kb_load][r_loc] = 8 * xb.s;
+                } else {
+                    sm.t.wg[buf][kb_load][r_loc] = make_uint4(0, 0, 0, 0);
+                    sm.t.dg[buf][kb_load][r_loc] = 0.0f;
+                    sm.t.wu[buf][kb_load][r_loc] = make_uint4(0, 0, 0, 0);
+                    sm.t.du[buf][kb_load][r_loc] = 0.0f;
+                    sm.t.xd[buf][kb_load][r_loc] = 0.0f;
+                    sm.t.xs[buf][kb_load][r_loc] = 0;
                 }
             }
+        };
+
+        if (nblk > 0) {
+            load_tile(0, 0);
             __syncthreads();
+            for (int b0 = 0, step = 0; b0 < nblk; b0 += 2, ++step) {
+                int cur = step & 1;
+                int nxt = cur ^ 1;
+                if (b0 + 2 < nblk) {
+                    load_tile(nxt, b0 + 2);
+                }
+
+#pragma unroll
+                for (int kb = 0; kb < 2; ++kb) {
+                    uint4 qg = sm.t.wg[cur][kb][m0 + col];
+                    uint32_t g0 = half ? qg.z : qg.x;
+                    uint32_t g1 = half ? qg.w : qg.y;
+                    wmma_i2_v ag_lo = {(int32_t)(g0 & 0x0F0F0F0Fu), (int32_t)(g1 & 0x0F0F0F0Fu)};
+                    wmma_i2_v ag_hi = {(int32_t)((g0 >> 4) & 0x0F0F0F0Fu), (int32_t)((g1 >> 4) & 0x0F0F0F0Fu)};
+
+                    uint4 qu = sm.t.wu[cur][kb][m0 + col];
+                    uint32_t u0 = half ? qu.z : qu.x;
+                    uint32_t u1 = half ? qu.w : qu.y;
+                    wmma_i2_v au_lo = {(int32_t)(u0 & 0x0F0F0F0Fu), (int32_t)(u1 & 0x0F0F0F0Fu)};
+                    wmma_i2_v au_hi = {(int32_t)((u0 >> 4) & 0x0F0F0F0Fu), (int32_t)((u1 >> 4) & 0x0F0F0F0Fu)};
+
+                    int2 x0l = sm.t.xq[cur][kb][half][n0 + col];
+                    int2 x0h = sm.t.xq[cur][kb][2 + half][n0 + col];
+                    wmma_i2_v b0_lo = {x0l.x, x0l.y};
+                    wmma_i2_v b0_hi = {x0h.x, x0h.y};
+
+                    int2 x1l = sm.t.xq[cur][kb][half][n1 + col];
+                    int2 x1h = sm.t.xq[cur][kb][2 + half][n1 + col];
+                    wmma_i2_v b1_lo = {x1l.x, x1l.y};
+                    wmma_i2_v b1_hi = {x1h.x, x1h.y};
+
+                    wmma_i8_v cg0 = {0, 0, 0, 0, 0, 0, 0, 0};
+                    wmma_i8_v cu0 = {0, 0, 0, 0, 0, 0, 0, 0};
+                    wmma_i8_v cg1 = {0, 0, 0, 0, 0, 0, 0, 0};
+                    wmma_i8_v cu1 = {0, 0, 0, 0, 0, 0, 0, 0};
+                    cg0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_lo, true, b0_lo, cg0, false);
+                    cg0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_hi, true, b0_hi, cg0, false);
+                    cu0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_lo, true, b0_lo, cu0, false);
+                    cu0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_hi, true, b0_hi, cu0, false);
+                    cg1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_lo, true, b1_lo, cg1, false);
+                    cg1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, ag_hi, true, b1_hi, cg1, false);
+                    cu1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_lo, true, b1_lo, cu1, false);
+                    cu1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, au_hi, true, b1_hi, cu1, false);
+
+                    float xd0 = sm.t.xd[cur][kb][n0 + col];
+                    int32_t xs0 = sm.t.xs[cur][kb][n0 + col];
+                    float xd1 = sm.t.xd[cur][kb][n1 + col];
+                    int32_t xs1 = sm.t.xs[cur][kb][n1 + col];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        float dgi = sm.t.dg[cur][kb][m0 + half * 8 + i];
+                        float dui = sm.t.du[cur][kb][m0 + half * 8 + i];
+                        ag0[i] = fmaf(dgi * xd0, (float)(cg0[i] - xs0), ag0[i]);
+                        au0[i] = fmaf(dui * xd0, (float)(cu0[i] - xs0), au0[i]);
+                        ag1[i] = fmaf(dgi * xd1, (float)(cg1[i] - xs1), ag1[i]);
+                        au1[i] = fmaf(dui * xd1, (float)(cu1[i] - xs1), au1[i]);
+                    }
+                }
+                if (b0 + 2 < nblk) {
+                    __syncthreads();
+                }
+            }
         }
+        __syncthreads();
         constexpr float kLog2e = 1.4426950408889634f;
         float inv_beta = 1.0f / beta;
         float inv_lb = (lb > 0.0f) ? (1.0f / lb) : 0.0f;
@@ -1276,17 +1308,17 @@ extern "C" __global__ void moe_dn_q4_0_wmma_k(const uint8_t* __restrict__ W,
 
     __shared__ union {
         struct {
-            uint4 wq[4][128];
-            float dw[4][128];
-            int2 aq[4][4][66];
-            float ad[4][64];
-            int32_t as[4][64];
+            uint4 wq[2][2][128];
+            float dw[2][2][128];
+            int2 aq[2][2][4][66];
+            float ad[2][2][64];
+            int32_t as[2][2][64];
         } kloop;
         __half out[32][136];
     } sm;
 
-    int r_loc = tid >> 2;
-    int kb_load = tid & 3;
+    int r_loc = tid >> 1;
+    int kb_load = tid & 1;
     int r_g0 = min(blk_row0 + r_loc, n_embd - 1);
     int r_g1 = min(blk_row0 + r_loc + 64, n_embd - 1);
     const uint8_t* wr0 = W + (size_t)exp_id * exp_bytes + (size_t)r_g0 * rbytes;
@@ -1318,83 +1350,99 @@ extern "C" __global__ void moe_dn_q4_0_wmma_k(const uint8_t* __restrict__ W,
         float acc10[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         float acc11[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
-        for (int b0 = 0; b0 < nblk; b0 += 4) {
-            int b = b0 + kb_load;
-            if (b < nblk) {
-                sm.kloop.wq[kb_load][r_loc] = qr0[b];
-                sm.kloop.dw[kb_load][r_loc] = __half2float(dr0[b]);
-                sm.kloop.wq[kb_load][r_loc + 64] = qr1[b];
-                sm.kloop.dw[kb_load][r_loc + 64] = __half2float(dr1[b]);
-                const w_q8_1_blk ab0 = ar0[b];
-                sm.kloop.aq[kb_load][0][r_loc] = make_int2(ab0.q[0], ab0.q[1]);
-                sm.kloop.aq[kb_load][1][r_loc] = make_int2(ab0.q[2], ab0.q[3]);
-                sm.kloop.aq[kb_load][2][r_loc] = make_int2(ab0.q[4], ab0.q[5]);
-                sm.kloop.aq[kb_load][3][r_loc] = make_int2(ab0.q[6], ab0.q[7]);
-                sm.kloop.ad[kb_load][r_loc] = ab0.d;
-                sm.kloop.as[kb_load][r_loc] = 8 * ab0.s;
-            } else {
-                sm.kloop.wq[kb_load][r_loc] = make_uint4(0, 0, 0, 0);
-                sm.kloop.dw[kb_load][r_loc] = 0.0f;
-                sm.kloop.wq[kb_load][r_loc + 64] = make_uint4(0, 0, 0, 0);
-                sm.kloop.dw[kb_load][r_loc + 64] = 0.0f;
-                sm.kloop.ad[kb_load][r_loc] = 0.0f;
-                sm.kloop.as[kb_load][r_loc] = 0;
-            }
-            __syncthreads();
-
-#pragma unroll
-            for (int kb = 0; kb < 4; ++kb) {
-                uint4 q0 = sm.kloop.wq[kb][m0 + col];
-                uint32_t w00 = half ? q0.z : q0.x;
-                uint32_t w01 = half ? q0.w : q0.y;
-                wmma_i2_v a0_lo = {(int32_t)(w00 & 0x0F0F0F0Fu), (int32_t)(w01 & 0x0F0F0F0Fu)};
-                wmma_i2_v a0_hi = {(int32_t)((w00 >> 4) & 0x0F0F0F0Fu), (int32_t)((w01 >> 4) & 0x0F0F0F0Fu)};
-
-                uint4 q1 = sm.kloop.wq[kb][m1 + col];
-                uint32_t w10 = half ? q1.z : q1.x;
-                uint32_t w11 = half ? q1.w : q1.y;
-                wmma_i2_v a1_lo = {(int32_t)(w10 & 0x0F0F0F0Fu), (int32_t)(w11 & 0x0F0F0F0Fu)};
-                wmma_i2_v a1_hi = {(int32_t)((w10 >> 4) & 0x0F0F0F0Fu), (int32_t)((w11 >> 4) & 0x0F0F0F0Fu)};
-
-                int2 x0l = sm.kloop.aq[kb][half][n0 + col];
-                int2 x0h = sm.kloop.aq[kb][2 + half][n0 + col];
-                wmma_i2_v b0_lo = {x0l.x, x0l.y};
-                wmma_i2_v b0_hi = {x0h.x, x0h.y};
-
-                int2 x1l = sm.kloop.aq[kb][half][n1 + col];
-                int2 x1h = sm.kloop.aq[kb][2 + half][n1 + col];
-                wmma_i2_v b1_lo = {x1l.x, x1l.y};
-                wmma_i2_v b1_hi = {x1h.x, x1h.y};
-
-                wmma_i8_v c00 = {0, 0, 0, 0, 0, 0, 0, 0};
-                wmma_i8_v c01 = {0, 0, 0, 0, 0, 0, 0, 0};
-                wmma_i8_v c10 = {0, 0, 0, 0, 0, 0, 0, 0};
-                wmma_i8_v c11 = {0, 0, 0, 0, 0, 0, 0, 0};
-                c00 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_lo, true, b0_lo, c00, false);
-                c00 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_hi, true, b0_hi, c00, false);
-                c01 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_lo, true, b1_lo, c01, false);
-                c01 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_hi, true, b1_hi, c01, false);
-                c10 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_lo, true, b0_lo, c10, false);
-                c10 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_hi, true, b0_hi, c10, false);
-                c11 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_lo, true, b1_lo, c11, false);
-                c11 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_hi, true, b1_hi, c11, false);
-
-                float ad0 = sm.kloop.ad[kb][n0 + col];
-                int32_t as0 = sm.kloop.as[kb][n0 + col];
-                float ad1 = sm.kloop.ad[kb][n1 + col];
-                int32_t as1 = sm.kloop.as[kb][n1 + col];
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    float dw0 = sm.kloop.dw[kb][m0 + half * 8 + i];
-                    float dw1 = sm.kloop.dw[kb][m1 + half * 8 + i];
-                    acc00[i] = fmaf(dw0 * ad0, (float)(c00[i] - as0), acc00[i]);
-                    acc01[i] = fmaf(dw0 * ad1, (float)(c01[i] - as1), acc01[i]);
-                    acc10[i] = fmaf(dw1 * ad0, (float)(c10[i] - as0), acc10[i]);
-                    acc11[i] = fmaf(dw1 * ad1, (float)(c11[i] - as1), acc11[i]);
+        auto load_tile = [&](int buf, int b0) {
+            if (tid < 128) {
+                int b = b0 + kb_load;
+                if (b < nblk) {
+                    sm.kloop.wq[buf][kb_load][r_loc] = qr0[b];
+                    sm.kloop.dw[buf][kb_load][r_loc] = __half2float(dr0[b]);
+                    sm.kloop.wq[buf][kb_load][r_loc + 64] = qr1[b];
+                    sm.kloop.dw[buf][kb_load][r_loc + 64] = __half2float(dr1[b]);
+                    const w_q8_1_blk ab0 = ar0[b];
+                    sm.kloop.aq[buf][kb_load][0][r_loc] = make_int2(ab0.q[0], ab0.q[1]);
+                    sm.kloop.aq[buf][kb_load][1][r_loc] = make_int2(ab0.q[2], ab0.q[3]);
+                    sm.kloop.aq[buf][kb_load][2][r_loc] = make_int2(ab0.q[4], ab0.q[5]);
+                    sm.kloop.aq[buf][kb_load][3][r_loc] = make_int2(ab0.q[6], ab0.q[7]);
+                    sm.kloop.ad[buf][kb_load][r_loc] = ab0.d;
+                    sm.kloop.as[buf][kb_load][r_loc] = 8 * ab0.s;
+                } else {
+                    sm.kloop.wq[buf][kb_load][r_loc] = make_uint4(0, 0, 0, 0);
+                    sm.kloop.dw[buf][kb_load][r_loc] = 0.0f;
+                    sm.kloop.wq[buf][kb_load][r_loc + 64] = make_uint4(0, 0, 0, 0);
+                    sm.kloop.dw[buf][kb_load][r_loc + 64] = 0.0f;
+                    sm.kloop.ad[buf][kb_load][r_loc] = 0.0f;
+                    sm.kloop.as[buf][kb_load][r_loc] = 0;
                 }
             }
+        };
+
+        if (nblk > 0) {
+            load_tile(0, 0);
             __syncthreads();
+            for (int b0 = 0, step = 0; b0 < nblk; b0 += 2, ++step) {
+                int cur = step & 1;
+                int nxt = cur ^ 1;
+                if (b0 + 2 < nblk) {
+                    load_tile(nxt, b0 + 2);
+                }
+
+#pragma unroll
+                for (int kb = 0; kb < 2; ++kb) {
+                    uint4 q0 = sm.kloop.wq[cur][kb][m0 + col];
+                    uint32_t w00 = half ? q0.z : q0.x;
+                    uint32_t w01 = half ? q0.w : q0.y;
+                    wmma_i2_v a0_lo = {(int32_t)(w00 & 0x0F0F0F0Fu), (int32_t)(w01 & 0x0F0F0F0Fu)};
+                    wmma_i2_v a0_hi = {(int32_t)((w00 >> 4) & 0x0F0F0F0Fu), (int32_t)((w01 >> 4) & 0x0F0F0F0Fu)};
+
+                    uint4 q1 = sm.kloop.wq[cur][kb][m1 + col];
+                    uint32_t w10 = half ? q1.z : q1.x;
+                    uint32_t w11 = half ? q1.w : q1.y;
+                    wmma_i2_v a1_lo = {(int32_t)(w10 & 0x0F0F0F0Fu), (int32_t)(w11 & 0x0F0F0F0Fu)};
+                    wmma_i2_v a1_hi = {(int32_t)((w10 >> 4) & 0x0F0F0F0Fu), (int32_t)((w11 >> 4) & 0x0F0F0F0Fu)};
+
+                    int2 x0l = sm.kloop.aq[cur][kb][half][n0 + col];
+                    int2 x0h = sm.kloop.aq[cur][kb][2 + half][n0 + col];
+                    wmma_i2_v b0_lo = {x0l.x, x0l.y};
+                    wmma_i2_v b0_hi = {x0h.x, x0h.y};
+
+                    int2 x1l = sm.kloop.aq[cur][kb][half][n1 + col];
+                    int2 x1h = sm.kloop.aq[cur][kb][2 + half][n1 + col];
+                    wmma_i2_v b1_lo = {x1l.x, x1l.y};
+                    wmma_i2_v b1_hi = {x1h.x, x1h.y};
+
+                    wmma_i8_v c00 = {0, 0, 0, 0, 0, 0, 0, 0};
+                    wmma_i8_v c01 = {0, 0, 0, 0, 0, 0, 0, 0};
+                    wmma_i8_v c10 = {0, 0, 0, 0, 0, 0, 0, 0};
+                    wmma_i8_v c11 = {0, 0, 0, 0, 0, 0, 0, 0};
+                    c00 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_lo, true, b0_lo, c00, false);
+                    c00 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_hi, true, b0_hi, c00, false);
+                    c01 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_lo, true, b1_lo, c01, false);
+                    c01 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a0_hi, true, b1_hi, c01, false);
+                    c10 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_lo, true, b0_lo, c10, false);
+                    c10 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_hi, true, b0_hi, c10, false);
+                    c11 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_lo, true, b1_lo, c11, false);
+                    c11 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a1_hi, true, b1_hi, c11, false);
+
+                    float ad0 = sm.kloop.ad[cur][kb][n0 + col];
+                    int32_t as0 = sm.kloop.as[cur][kb][n0 + col];
+                    float ad1 = sm.kloop.ad[cur][kb][n1 + col];
+                    int32_t as1 = sm.kloop.as[cur][kb][n1 + col];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        float dw0 = sm.kloop.dw[cur][kb][m0 + half * 8 + i];
+                        float dw1 = sm.kloop.dw[cur][kb][m1 + half * 8 + i];
+                        acc00[i] = fmaf(dw0 * ad0, (float)(c00[i] - as0), acc00[i]);
+                        acc01[i] = fmaf(dw0 * ad1, (float)(c01[i] - as1), acc01[i]);
+                        acc10[i] = fmaf(dw1 * ad0, (float)(c10[i] - as0), acc10[i]);
+                        acc11[i] = fmaf(dw1 * ad1, (float)(c11[i] - as1), acc11[i]);
+                    }
+                }
+                if (b0 + 2 < nblk) {
+                    __syncthreads();
+                }
+            }
         }
+        __syncthreads();
 #pragma unroll
         for (int p = 0; p < 2; ++p) {
             if (p * 32 >= nt) break;
