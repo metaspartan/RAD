@@ -110,7 +110,7 @@ void* rad_rdma_init(const char* dev_name, size_t buf_bytes, RadRdmaInfo* local_i
     qia.send_cq = r->scq;
     qia.recv_cq = r->rcq;
     qia.qp_type = IBV_QPT_RC;
-    qia.cap.max_send_wr = 32;
+    qia.cap.max_send_wr = 64;
     qia.cap.max_recv_wr = 32;
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
@@ -209,12 +209,13 @@ int rad_rdma_exchange_mapped(void* handle, int n_bytes) {
     struct ibv_send_wr wr;
     struct ibv_send_wr* bad_wr = NULL;
     memset(&wr, 0, sizeof(wr));
-    wr.wr_id = ++r->seq;
+    uint64_t seq = ++r->seq;
+    wr.wr_id = seq;
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-    wr.send_flags = IBV_SEND_SIGNALED | ((n_bytes <= 512) ? IBV_SEND_INLINE : 0);
-    wr.imm_data = (uint32_t)r->seq;
+    wr.send_flags = IBV_SEND_SIGNALED | ((n_bytes <= 256) ? IBV_SEND_INLINE : 0);
+    wr.imm_data = (uint32_t)seq;
     wr.wr.rdma.remote_addr = r->remote_addr;
     wr.wr.rdma.rkey = r->remote_rkey;
     if (ibv_post_send(r->qp, &wr, &bad_wr) != 0) return -2;

@@ -305,10 +305,32 @@ impl Tp2Comm {
     }
 
     pub fn broadcast_u32_array<const N: usize>(&mut self, vals: &mut [u32; N]) -> std::io::Result<()> {
+        if self.world_size() <= 1 {
+            return Ok(());
+        }
+        let n_bytes = N * 4;
+        if !self.rdma.is_null() && n_bytes > 0 && n_bytes <= 256 {
+            let sh = unsafe { rad_rdma_send_hptr(self.rdma) } as *mut u8;
+            let rh = unsafe { rad_rdma_recv_hptr(self.rdma) } as *const u8;
+            if !sh.is_null() && !rh.is_null() {
+                if self.rank == 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(vals.as_ptr() as *const u8, sh, n_bytes);
+                    }
+                }
+                self.rdma_exchange_mapped(n_bytes)?;
+                if self.rank != 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(rh, vals.as_mut_ptr() as *mut u8, n_bytes);
+                    }
+                }
+                return Ok(());
+            }
+        }
         let Some(ref mut s) = self.stream else {
             return Ok(());
         };
-        let bytes = unsafe { std::slice::from_raw_parts_mut(vals.as_mut_ptr() as *mut u8, N * 4) };
+        let bytes = unsafe { std::slice::from_raw_parts_mut(vals.as_mut_ptr() as *mut u8, n_bytes) };
         if self.rank == 0 {
             s.write_all(bytes)?;
         } else {
@@ -318,6 +340,56 @@ impl Tp2Comm {
     }
 
     pub fn broadcast_i32_vec(&mut self, data: &mut Vec<i32>) -> std::io::Result<()> {
+        if self.world_size() <= 1 {
+            return Ok(());
+        }
+        if !self.rdma.is_null() {
+            let sh = unsafe { rad_rdma_send_hptr(self.rdma) } as *mut u8;
+            let rh = unsafe { rad_rdma_recv_hptr(self.rdma) } as *const u8;
+            if !sh.is_null() && !rh.is_null() {
+                let inline_ok = if self.rank == 0 {
+                    let n = data.len();
+                    if n <= 60 {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping((n as u32).to_le_bytes().as_ptr(), sh, 4);
+                            if n > 0 {
+                                std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, sh.add(4), n * 4);
+                            }
+                        }
+                        true
+                    } else {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(u32::MAX.to_le_bytes().as_ptr(), sh, 4);
+                        }
+                        false
+                    }
+                } else {
+                    true
+                };
+                self.rdma_exchange_mapped(256)?;
+                if self.rank == 0 {
+                    if inline_ok {
+                        return Ok(());
+                    }
+                } else {
+                    let mut lbuf = [0u8; 4];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(rh, lbuf.as_mut_ptr(), 4);
+                    }
+                    let tag = u32::from_le_bytes(lbuf);
+                    if tag != u32::MAX {
+                        let n = tag as usize;
+                        data.resize(n, 0);
+                        if n > 0 {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(rh.add(4), data.as_mut_ptr() as *mut u8, n * 4);
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
         let Some(ref mut s) = self.stream else {
             return Ok(());
         };

@@ -135,6 +135,7 @@ __device__ __forceinline__ float s_bf16_f32(uint16_t u) {
 
 
 __device__ __forceinline__ void store_q8_1_from_warp(float v, int lane, q8_1_blk* dst, int8_t* sm) {
+    (void)sm;
     float amax = s_warp_max32(fabsf(v));
     amax = __shfl(amax, 0, 32);
     float d = amax / 127.0f;
@@ -143,12 +144,14 @@ __device__ __forceinline__ void store_q8_1_from_warp(float v, int lane, q8_1_blk
     if (qi > 127) qi = 127;
     if (qi < -127) qi = -127;
     int32_t qsum = s_warp_sum32_i(qi);
-    sm[lane] = (int8_t)qi;
+    int q1 = __shfl_down(qi, 1, 32);
+    int q2 = __shfl_down(qi, 2, 32);
+    int q3 = __shfl_down(qi, 3, 32);
     if (lane == 0) {
         dst->d = d;
         dst->s = qsum;
     }
-    if (lane < 8) {
-        dst->q[lane] = pack4_i8(sm[lane * 4], sm[lane * 4 + 1], sm[lane * 4 + 2], sm[lane * 4 + 3]);
+    if ((lane & 3) == 0) {
+        dst->q[lane >> 2] = pack4_i8((int8_t)qi, (int8_t)q1, (int8_t)q2, (int8_t)q3);
     }
 }

@@ -313,6 +313,27 @@ fn extract_xml_attr(attrs: &str, key: &str) -> Option<String> {
     None
 }
 
+fn find_tag_gt(s: &str) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    quote = Some(b);
+                } else if b == b'>' {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn find_dsml_tag(haystack: &str, tag_names: &[&str]) -> Option<(usize, usize, String)> {
     let prefix = "<｜DSML｜";
     let mut off = 0usize;
@@ -393,7 +414,7 @@ pub fn split_think_and_dsml(raw: &str) -> (Option<String>, String, Vec<Value>) {
         let mut cursor = block;
         while let Some((_, head_end, _)) = find_dsml_tag(cursor, &["invoke", "call"]) {
             let after_head = &cursor[head_end..];
-            let Some(gt) = after_head.find('>') else { break };
+            let Some(gt) = find_tag_gt(after_head) else { break };
             let attrs = &after_head[..gt];
             let Some(fn_name) = extract_xml_attr(attrs, "name") else {
                 cursor = &after_head[gt + 1..];
@@ -409,22 +430,37 @@ pub fn split_think_and_dsml(raw: &str) -> (Option<String>, String, Vec<Value>) {
             let mut pcur = inv_body;
             while let Some((_, phead_end, _)) = find_dsml_tag(pcur, &["parameter", "param"]) {
                 let pa = &pcur[phead_end..];
-                let Some(pgt) = pa.find('>') else { break };
+                let Some(pgt) = find_tag_gt(pa) else { break };
                 let pattrs = &pa[..pgt];
                 let Some(pname) = extract_xml_attr(pattrs, "name") else {
                     pcur = &pa[pgt + 1..];
                     continue;
                 };
-                let is_str = extract_xml_attr(pattrs, "string")
-                    .map(|v| v != "false")
-                    .unwrap_or(true);
+                let str_attr = extract_xml_attr(pattrs, "string");
+                let is_str = str_attr.as_deref().map(|v| v != "false").unwrap_or(true);
+                let self_closing = pattrs.trim_end().ends_with('/');
                 let val_start = &pa[pgt + 1..];
-                let (vraw, np) = if let Some((pc, pe)) = find_dsml_close(val_start, &["parameter", "param"]) {
-                    (&val_start[..pc], &val_start[pe..])
+                let (vraw, np) = if self_closing {
+                    ("", val_start)
                 } else {
-                    (val_start, "")
+                    let close_m = find_dsml_close(val_start, &["parameter", "param"]);
+                    let next_m = find_dsml_tag(val_start, &["parameter", "param"]);
+                    match (close_m, next_m) {
+                        (Some((pc, pe)), Some((np_pos, _, _))) if np_pos < pc => {
+                            (&val_start[..np_pos], &val_start[np_pos..])
+                        }
+                        (Some((pc, pe)), _) => (&val_start[..pc], &val_start[pe..]),
+                        (None, Some((np_pos, _, _))) => (&val_start[..np_pos], &val_start[np_pos..]),
+                        (None, None) => (val_start, ""),
+                    }
                 };
-                let jval = if is_str {
+                let jval = if vraw.trim().is_empty() {
+                    if let Some(sv) = str_attr.filter(|v| v != "true" && v != "false") {
+                        Value::String(sv)
+                    } else {
+                        Value::String(String::new())
+                    }
+                } else if is_str {
                     let trimmed = vraw.trim();
                     if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
                         serde_json::from_str::<String>(trimmed)
@@ -725,5 +761,15 @@ mod tests {
         let args: Value = serde_json::from_str(tcs[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["cmd"], "ls -la");
         assert_eq!(args["timeout"], 30);
+    }
+
+    #[test]
+    fn parses_unclosed_and_inline_string_dsml_params() {
+        let raw = "</think><｜DSML｜ calls>\n<｜DSML｜ invoke name=\"exec\">\n<｜DSML｜ parameter name=\"workdir\" string=\"C:\\Users\\Carsen\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">echo ok</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let (_, _, tcs) = split_think_and_dsml(raw);
+        assert_eq!(tcs.len(), 1);
+        let args: Value = serde_json::from_str(tcs[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["workdir"], "C:\\Users\\Carsen");
+        assert_eq!(args["command"], "echo ok");
     }
 }

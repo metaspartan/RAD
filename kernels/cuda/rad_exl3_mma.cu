@@ -153,7 +153,7 @@ __global__ void mma_wht128_post_f32_to_f16_k(
         auto act = [&](float g, float u) -> float {
             float gc = fminf(g, swiglu_limit);
             float uc = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
-            return (gc / (1.0f + expf(-gc))) * uc;
+            return (gc / (1.0f + exp2f(-gc * 1.4426950408889634f))) * uc;
         };
         v0 = act(g01.x, v0);
         v1 = act(g01.y, v1);
@@ -317,9 +317,13 @@ void exl3_mma_m64_mul1_k(
     int kt_start = (K_tiles * sk) / split_k;
     int kt_end = (K_tiles * (sk + 1)) / split_k;
 
-    __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
-    __shared__ alignas(16) half s_x[64][16];
-    __shared__ alignas(16) float s_z[16][128];
+    __shared__ alignas(16) union {
+        struct {
+            uint32_t s_packed[2][8][PACKED_U32];
+            half s_x[2][64][16];
+        } k;
+        float s_z[16][128];
+    } smem;
 
     float c0[4][4];
     float c1[4][4];
@@ -341,20 +345,21 @@ void exl3_mma_m64_mul1_k(
     int ld_m = m_base + ld_row;
 
     constexpr int PACKED_U4 = 2 * BITS;
-    uint4* s_u4 = reinterpret_cast<uint4*>(s_packed[warp]);
     if (kt_start < kt_end) {
         int kb0 = kt_start * 16;
         if (ld_m < M) {
-            *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = *reinterpret_cast<const uint2*>(x_rot + (size_t)ld_m * K + kb0 + ld_col);
+            *reinterpret_cast<uint2*>(&smem.k.s_x[0][ld_row][ld_col]) = *reinterpret_cast<const uint2*>(x_rot + (size_t)ld_m * K + kb0 + ld_col);
         } else {
-            *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = make_uint2(0u, 0u);
+            *reinterpret_cast<uint2*>(&smem.k.s_x[0][ld_row][ld_col]) = make_uint2(0u, 0u);
         }
         if (n_tile < N_tiles && lane < PACKED_U4) {
             const uint4* g0 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt_start * N_tiles + n_tile) * PACKED_U16);
-            s_u4[lane] = __ldg(g0 + lane);
+            reinterpret_cast<uint4*>(smem.k.s_packed[0][warp])[lane] = __ldg(g0 + lane);
         }
         __syncthreads();
         for (int kt = kt_start; kt < kt_end; ++kt) {
+            int cur = (kt - kt_start) & 1;
+            int nxt = cur ^ 1;
             uint2 next_x = make_uint2(0u, 0u);
             uint4 next_g;
             if (kt + 1 < kt_end) {
@@ -367,26 +372,27 @@ void exl3_mma_m64_mul1_k(
             }
             if (n_tile < N_tiles) {
                 uint32_t b00, b01, b10, b11;
-                mma_dq8_mul1<BITS>(s_packed[warp], lane * 8, b00, b01, b10, b11);
+                mma_dq8_mul1<BITS>(smem.k.s_packed[cur][warp], lane * 8, b00, b01, b10, b11);
 
                 #pragma unroll
                 for (int r = 0; r < 4; ++r) {
                     int r0 = r * 16 + group_id;
                     int r1 = r0 + 8;
-                    uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_x[r0][k_off0]);
-                    uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_x[r0][k_off1]);
-                    uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_x[r1][k_off0]);
-                    uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_x[r1][k_off1]);
+                    uint32_t a0 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r0][k_off0]);
+                    uint32_t a2 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r0][k_off1]);
+                    uint32_t a1 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r1][k_off0]);
+                    uint32_t a3 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r1][k_off1]);
                     mma_m16n8k16_f32(c0[r][0], c0[r][1], c0[r][2], c0[r][3], a0, a1, a2, a3, b00, b01);
                     mma_m16n8k16_f32(c1[r][0], c1[r][1], c1[r][2], c1[r][3], a0, a1, a2, a3, b10, b11);
                 }
             }
             if (kt + 1 < kt_end) {
-                __syncthreads();
-                *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = next_x;
-                if (n_tile < N_tiles && lane < PACKED_U4) s_u4[lane] = next_g;
-                __syncthreads();
+                *reinterpret_cast<uint2*>(&smem.k.s_x[nxt][ld_row][ld_col]) = next_x;
+                if (n_tile < N_tiles && lane < PACKED_U4) {
+                    reinterpret_cast<uint4*>(smem.k.s_packed[nxt][warp])[lane] = next_g;
+                }
             }
+            __syncthreads();
         }
     }
 
@@ -402,10 +408,10 @@ void exl3_mma_m64_mul1_k(
         int w_col = warp * 16 + tid_in_grp * 2;
         for (int r = 0; r < 4; ++r) {
             if (m_base + r * 16 >= M) break;
-            s_z[group_id][w_col + 0] = c0[r][0]; s_z[group_id][w_col + 1] = c0[r][1];
-            s_z[group_id][w_col + 8] = c1[r][0]; s_z[group_id][w_col + 9] = c1[r][1];
-            s_z[group_id + 8][w_col + 0] = c0[r][2]; s_z[group_id + 8][w_col + 1] = c0[r][3];
-            s_z[group_id + 8][w_col + 8] = c1[r][2]; s_z[group_id + 8][w_col + 9] = c1[r][3];
+            smem.s_z[group_id][w_col + 0] = c0[r][0]; smem.s_z[group_id][w_col + 1] = c0[r][1];
+            smem.s_z[group_id][w_col + 8] = c1[r][0]; smem.s_z[group_id][w_col + 9] = c1[r][1];
+            smem.s_z[group_id + 8][w_col + 0] = c0[r][2]; smem.s_z[group_id + 8][w_col + 1] = c0[r][3];
+            smem.s_z[group_id + 8][w_col + 8] = c1[r][2]; smem.s_z[group_id + 8][w_col + 9] = c1[r][3];
             __syncthreads();
             #pragma unroll
             for (int sub = 0; sub < 2; ++sub) {
@@ -413,7 +419,7 @@ void exl3_mma_m64_mul1_k(
                 int mr = m_base + r * 16 + lr;
                 if (mr < M) {
                     size_t off = (size_t)mr * N + col;
-                    float4 zv = *reinterpret_cast<const float4*>(&s_z[lr][lane * 4]);
+                    float4 zv = *reinterpret_cast<const float4*>(&smem.s_z[lr][lane * 4]);
                     float v0 = zv.x, v1 = zv.y, v2 = zv.z, v3 = zv.w;
                     if (wht_scale > 0.0f) mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
                     v0 *= sv0; v1 *= sv1; v2 *= sv2; v3 *= sv3;
@@ -424,7 +430,7 @@ void exl3_mma_m64_mul1_k(
                         auto act = [&](float g, float u) -> float {
                             float gc = fminf(g, swiglu_limit);
                             float uc = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
-                            return (gc / (1.0f + expf(-gc))) * uc;
+                            return (gc / (1.0f + exp2f(-gc * 1.4426950408889634f))) * uc;
                         };
                         v0 = act(g01.x, v0); v1 = act(g01.y, v1); v2 = act(g23.x, v2); v3 = act(g23.y, v3);
                         if (next_suh) {
@@ -645,7 +651,7 @@ __global__ void moe_wht128_post_f32_to_f16_k(
             if (g > swiglu_limit) g = swiglu_limit;
             if (u > swiglu_limit) u = swiglu_limit;
             if (u < -swiglu_limit) u = -swiglu_limit;
-            return (g / (1.0f + expf(-g))) * u;
+            return (g / (1.0f + exp2f(-g * 1.4426950408889634f))) * u;
         };
         v0 = sw(g0.x, v0);
         v1 = sw(g0.y, v1);
@@ -815,9 +821,13 @@ void exl3_moe_mma_grouped_m64_prerot_k(
     int kt_start = (K_tiles * sk) / split_k;
     int kt_end = (K_tiles * (sk + 1)) / split_k;
 
-    __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
-    __shared__ alignas(16) half s_x[64][16];
-    __shared__ alignas(16) float s_z[16][128];
+    __shared__ alignas(16) union {
+        struct {
+            uint32_t s_packed[2][8][PACKED_U32];
+            half s_x[2][64][16];
+        } k;
+        float s_z[16][128];
+    } smem;
     __shared__ int s_pair_ids[64];
     if (t < g_len) {
         s_pair_ids[t] = sorted_pairs[g_off + t];
@@ -842,21 +852,22 @@ void exl3_moe_mma_grouped_m64_prerot_k(
     int ld_row = t >> 2;
     int ld_col = (t & 3) * 4;
     int ld_idx = (ld_row < g_len) ? (x_is_sorted ? (g_off + ld_row) : s_pair_ids[ld_row]) : -1;
-    uint4* s_u4 = reinterpret_cast<uint4*>(s_packed[warp]);
 
     if (kt_start < kt_end) {
         int kb0 = kt_start * 16;
         if (ld_idx >= 0) {
-            *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = *reinterpret_cast<const uint2*>(x_rot + (size_t)ld_idx * K + kb0 + ld_col);
+            *reinterpret_cast<uint2*>(&smem.k.s_x[0][ld_row][ld_col]) = *reinterpret_cast<const uint2*>(x_rot + (size_t)ld_idx * K + kb0 + ld_col);
         } else {
-            *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = make_uint2(0u, 0u);
+            *reinterpret_cast<uint2*>(&smem.k.s_x[0][ld_row][ld_col]) = make_uint2(0u, 0u);
         }
         if (n_tile < N_tiles && lane < PACKED_U4) {
             const uint4* g0 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt_start * N_tiles + n_tile) * PACKED_U16);
-            s_u4[lane] = __ldg(g0 + lane);
+            reinterpret_cast<uint4*>(smem.k.s_packed[0][warp])[lane] = __ldg(g0 + lane);
         }
         __syncthreads();
         for (int kt = kt_start; kt < kt_end; ++kt) {
+            int cur = (kt - kt_start) & 1;
+            int nxt = cur ^ 1;
             uint2 next_x = make_uint2(0u, 0u);
             uint4 next_g;
             if (kt + 1 < kt_end) {
@@ -869,25 +880,26 @@ void exl3_moe_mma_grouped_m64_prerot_k(
             }
             if (n_tile < N_tiles) {
                 uint32_t b00, b01, b10, b11;
-                mma_dq8_mul1<BITS>(s_packed[warp], lane * 8, b00, b01, b10, b11);
+                mma_dq8_mul1<BITS>(smem.k.s_packed[cur][warp], lane * 8, b00, b01, b10, b11);
                 #pragma unroll
                 for (int r = 0; r < 4; ++r) {
                     int r0 = r * 16 + group_id;
                     int r1 = r0 + 8;
-                    uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_x[r0][k_off0]);
-                    uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_x[r0][k_off1]);
-                    uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_x[r1][k_off0]);
-                    uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_x[r1][k_off1]);
+                    uint32_t a0 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r0][k_off0]);
+                    uint32_t a2 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r0][k_off1]);
+                    uint32_t a1 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r1][k_off0]);
+                    uint32_t a3 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r1][k_off1]);
                     mma_m16n8k16_f32(c0[r][0], c0[r][1], c0[r][2], c0[r][3], a0, a1, a2, a3, b00, b01);
                     mma_m16n8k16_f32(c1[r][0], c1[r][1], c1[r][2], c1[r][3], a0, a1, a2, a3, b10, b11);
                 }
             }
             if (kt + 1 < kt_end) {
-                __syncthreads();
-                *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = next_x;
-                if (n_tile < N_tiles && lane < PACKED_U4) s_u4[lane] = next_g;
-                __syncthreads();
+                *reinterpret_cast<uint2*>(&smem.k.s_x[nxt][ld_row][ld_col]) = next_x;
+                if (n_tile < N_tiles && lane < PACKED_U4) {
+                    reinterpret_cast<uint4*>(smem.k.s_packed[nxt][warp])[lane] = next_g;
+                }
             }
+            __syncthreads();
         }
     }
 
@@ -910,14 +922,14 @@ void exl3_moe_mma_grouped_m64_prerot_k(
         int w_col = warp * 16 + tid_in_grp * 2;
         for (int r = 0; r < 4; ++r) {
             if (r * 16 >= g_len) break;
-            s_z[group_id][w_col + 0] = c0[r][0];
-            s_z[group_id][w_col + 1] = c0[r][1];
-            s_z[group_id][w_col + 8] = c1[r][0];
-            s_z[group_id][w_col + 9] = c1[r][1];
-            s_z[group_id + 8][w_col + 0] = c0[r][2];
-            s_z[group_id + 8][w_col + 1] = c0[r][3];
-            s_z[group_id + 8][w_col + 8] = c1[r][2];
-            s_z[group_id + 8][w_col + 9] = c1[r][3];
+            smem.s_z[group_id][w_col + 0] = c0[r][0];
+            smem.s_z[group_id][w_col + 1] = c0[r][1];
+            smem.s_z[group_id][w_col + 8] = c1[r][0];
+            smem.s_z[group_id][w_col + 9] = c1[r][1];
+            smem.s_z[group_id + 8][w_col + 0] = c0[r][2];
+            smem.s_z[group_id + 8][w_col + 1] = c0[r][3];
+            smem.s_z[group_id + 8][w_col + 8] = c1[r][2];
+            smem.s_z[group_id + 8][w_col + 9] = c1[r][3];
             __syncthreads();
             #pragma unroll
             for (int sub = 0; sub < 2; ++sub) {
@@ -926,7 +938,7 @@ void exl3_moe_mma_grouped_m64_prerot_k(
                 if (row < g_len) {
                     int out_idx = y_is_sorted ? (g_off + row) : s_pair_ids[row];
                     size_t off = (size_t)out_idx * N + col;
-                    float4 zv = *reinterpret_cast<const float4*>(&s_z[lr][lane * 4]);
+                    float4 zv = *reinterpret_cast<const float4*>(&smem.s_z[lr][lane * 4]);
                     float v0 = zv.x, v1 = zv.y, v2 = zv.z, v3 = zv.w;
                     if (wht_scale > 0.0f) {
                         mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
@@ -940,7 +952,7 @@ void exl3_moe_mma_grouped_m64_prerot_k(
                             if (g_v > swiglu_limit) g_v = swiglu_limit;
                             if (u_v > swiglu_limit) u_v = swiglu_limit;
                             if (u_v < -swiglu_limit) u_v = -swiglu_limit;
-                            return (g_v / (1.0f + expf(-g_v))) * u_v;
+                            return (g_v / (1.0f + exp2f(-g_v * 1.4426950408889634f))) * u_v;
                         };
                         v0 = sw(g0.x, v0);
                         v1 = sw(g0.y, v1);
@@ -1345,9 +1357,13 @@ void exl3_batched_group_mma_m64_prerot_k(
     int kt_start = (K_tiles * sk) / split_k;
     int kt_end = (K_tiles * (sk + 1)) / split_k;
 
-    __shared__ alignas(16) uint32_t s_packed[8][PACKED_U32];
-    __shared__ alignas(16) half s_x[64][16];
-    __shared__ alignas(16) float s_z[16][128];
+    __shared__ alignas(16) union {
+        struct {
+            uint32_t s_packed[2][8][PACKED_U32];
+            half s_x[2][64][16];
+        } k;
+        float s_z[16][128];
+    } smem;
 
     float c0[4][4];
     float c1[4][4];
@@ -1366,22 +1382,23 @@ void exl3_batched_group_mma_m64_prerot_k(
     int k_off1 = k_off0 + 8;
     int ld_row = t >> 2;
     int ld_col = (t & 3) * 4;
-    uint4* s_u4 = reinterpret_cast<uint4*>(s_packed[warp]);
 
     if (kt_start < kt_end) {
         int kb0 = kt_start * 16;
         if (ld_row < m_len) {
             const half* x_src = x_rot + (size_t)((m0 + ld_row) * G + g) * K + kb0 + ld_col;
-            *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = *reinterpret_cast<const uint2*>(x_src);
+            *reinterpret_cast<uint2*>(&smem.k.s_x[0][ld_row][ld_col]) = *reinterpret_cast<const uint2*>(x_src);
         } else {
-            *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = make_uint2(0u, 0u);
+            *reinterpret_cast<uint2*>(&smem.k.s_x[0][ld_row][ld_col]) = make_uint2(0u, 0u);
         }
         if (n_tile < N_tiles && lane < PACKED_U4) {
             const uint4* g0 = reinterpret_cast<const uint4*>(trellis + ((size_t)kt_start * N_tiles + n_tile) * PACKED_U16);
-            s_u4[lane] = __ldg(g0 + lane);
+            reinterpret_cast<uint4*>(smem.k.s_packed[0][warp])[lane] = __ldg(g0 + lane);
         }
         __syncthreads();
         for (int kt = kt_start; kt < kt_end; ++kt) {
+            int cur = (kt - kt_start) & 1;
+            int nxt = cur ^ 1;
             uint2 next_x = make_uint2(0u, 0u);
             uint4 next_g;
             if (kt + 1 < kt_end) {
@@ -1397,26 +1414,27 @@ void exl3_batched_group_mma_m64_prerot_k(
             }
             if (n_tile < N_tiles) {
                 uint32_t b00, b01, b10, b11;
-                mma_dq8_mul1<BITS>(s_packed[warp], lane * 8, b00, b01, b10, b11);
+                mma_dq8_mul1<BITS>(smem.k.s_packed[cur][warp], lane * 8, b00, b01, b10, b11);
 
                 #pragma unroll
                 for (int r = 0; r < 4; ++r) {
                     int r0 = r * 16 + group_id;
                     int r1 = r0 + 8;
-                    uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_x[r0][k_off0]);
-                    uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_x[r0][k_off1]);
-                    uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_x[r1][k_off0]);
-                    uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_x[r1][k_off1]);
+                    uint32_t a0 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r0][k_off0]);
+                    uint32_t a2 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r0][k_off1]);
+                    uint32_t a1 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r1][k_off0]);
+                    uint32_t a3 = *reinterpret_cast<const uint32_t*>(&smem.k.s_x[cur][r1][k_off1]);
                     mma_m16n8k16_f32(c0[r][0], c0[r][1], c0[r][2], c0[r][3], a0, a1, a2, a3, b00, b01);
                     mma_m16n8k16_f32(c1[r][0], c1[r][1], c1[r][2], c1[r][3], a0, a1, a2, a3, b10, b11);
                 }
             }
             if (kt + 1 < kt_end) {
-                __syncthreads();
-                *reinterpret_cast<uint2*>(&s_x[ld_row][ld_col]) = next_x;
-                if (n_tile < N_tiles && lane < PACKED_U4) s_u4[lane] = next_g;
-                __syncthreads();
+                *reinterpret_cast<uint2*>(&smem.k.s_x[nxt][ld_row][ld_col]) = next_x;
+                if (n_tile < N_tiles && lane < PACKED_U4) {
+                    reinterpret_cast<uint4*>(smem.k.s_packed[nxt][warp])[lane] = next_g;
+                }
             }
+            __syncthreads();
         }
     }
 
@@ -1428,17 +1446,17 @@ void exl3_batched_group_mma_m64_prerot_k(
         int w_col = warp * 16 + tid_in_grp * 2;
         for (int r = 0; r < 4; ++r) {
             if (r * 16 >= m_len) break;
-            s_z[group_id][w_col + 0] = c0[r][0]; s_z[group_id][w_col + 1] = c0[r][1];
-            s_z[group_id][w_col + 8] = c1[r][0]; s_z[group_id][w_col + 9] = c1[r][1];
-            s_z[group_id + 8][w_col + 0] = c0[r][2]; s_z[group_id + 8][w_col + 1] = c0[r][3];
-            s_z[group_id + 8][w_col + 8] = c1[r][2]; s_z[group_id + 8][w_col + 9] = c1[r][3];
+            smem.s_z[group_id][w_col + 0] = c0[r][0]; smem.s_z[group_id][w_col + 1] = c0[r][1];
+            smem.s_z[group_id][w_col + 8] = c1[r][0]; smem.s_z[group_id][w_col + 9] = c1[r][1];
+            smem.s_z[group_id + 8][w_col + 0] = c0[r][2]; smem.s_z[group_id + 8][w_col + 1] = c0[r][3];
+            smem.s_z[group_id + 8][w_col + 8] = c1[r][2]; smem.s_z[group_id + 8][w_col + 9] = c1[r][3];
             __syncthreads();
             #pragma unroll
             for (int sub = 0; sub < 2; ++sub) {
                 int lr = warp + sub * 8;
                 int row = r * 16 + lr;
                 if (row < m_len) {
-                    float4 zv = *reinterpret_cast<const float4*>(&s_z[lr][lane * 4]);
+                    float4 zv = *reinterpret_cast<const float4*>(&smem.s_z[lr][lane * 4]);
                     float v0 = zv.x, v1 = zv.y, v2 = zv.z, v3 = zv.w;
                     mma_warp_wht128_f32(v0, v1, v2, v3, lane, wht_scale);
                     v0 *= s01.x; v1 *= s01.y; v2 *= s23.x; v3 *= s23.y;

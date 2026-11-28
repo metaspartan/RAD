@@ -42,7 +42,7 @@ __global__ void attn_b8_gqa3_flash_split_q8kv_t(const float* __restrict__ Q,
     int n_q_tile = MULTI ? K_stride : min(16, B - q_off);
     int t_max = min_pos_q + n_q_tile;
     int b_stride = (B > 64) ? 128 : 64;
-    int eff_splits = MULTI ? n_splits : min(n_splits, max(16, (pos0 + B + 255) >> 8));
+    int eff_splits = MULTI ? n_splits : min(n_splits, max(1, (pos0 + B + 63) >> 6));
     if (sp >= eff_splits) return;
 
     int total_tiles = (t_max + 15) / 16;
@@ -335,7 +335,7 @@ extern "C" __global__ void attn_b48_gqa3_flash_split_q8kv_k(const float* __restr
     int pos_q = pos0 + q_idx;
     int t_max = pos0 + B;
     int b_stride = (B > 64) ? 128 : 64;
-    int eff_splits = min(n_splits, max(16, (t_max + 255) >> 8));
+    int eff_splits = min(n_splits, max(1, (pos0 + B + 63) >> 6));
     if (sp >= eff_splits) return;
 
     int total_tiles = (t_max + 15) / 16;
@@ -573,7 +573,8 @@ extern "C" __global__ void attn_b8_flash_reduce_q8kv_k(const float* __restrict__
     int lane = threadIdx.x & 31;
     int d = wid * 32 + lane;
     int q_dim = n_head * 128;
-    int eff_splits = d_pos0 ? min(n_splits, max(16, (*d_pos0 + B + 255) >> 8)) : n_splits;
+    int eff_splits = d_pos0 ? min(n_splits, max(1, (*d_pos0 + B + 63) >> 6)) : n_splits;
+    constexpr float kLog2e = 1.4426950408889634f;
 
     float gm = -1e30f;
     for (int sp = 0; sp < eff_splits; ++sp) {
@@ -585,12 +586,12 @@ extern "C" __global__ void attn_b8_flash_reduce_q8kv_k(const float* __restrict__
     for (int sp = 0; sp < eff_splits; ++sp) {
         const float* p = split_buf + (((size_t)h * n_splits + sp) * b_stride + bt) * 130;
         if (p[0] > -1e20f) {
-            float sc = expf(p[0] - gm);
+            float sc = exp2f((p[0] - gm) * kLog2e);
             gl += p[1] * sc;
             go += p[2 + d] * sc;
         }
     }
-    float v = (go / gl) / (1.0f + expf(-gate[(size_t)bt * q_dim + (size_t)h * 128 + d]));
+    float v = (go / gl) / (1.0f + exp2f(-gate[(size_t)bt * q_dim + (size_t)h * 128 + d] * kLog2e));
     __shared__ int8_t smq[4][32];
     size_t qbase = ((size_t)bt * n_head + h) * 4;
     q8kv_store_q8_1(v, lane, out_q8 + qbase + wid, smq[wid]);
@@ -1047,7 +1048,8 @@ extern "C" __global__ void attn_batch_gated_flash_q8kv_k(const float* __restrict
     int q_row = qb * 64 + wid * 16 + col;
     bool vq = (q_row < B);
     int pos_q = pos0 + q_row;
-    float q_scale = rsqrtf((float)dh);
+    const float LOG2E = 1.4426950408889634f;
+    float q_scale = rsqrtf((float)dh) * LOG2E;
 
     q8kv_h8_v q_reg[8];
     float4 r_reg0 = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -1056,16 +1058,28 @@ extern "C" __global__ void attn_batch_gated_flash_q8kv_k(const float* __restrict
     float4 r_reg3 = make_float4(0.f, 0.f, 0.f, 0.f);
     float sink_q = 0.0f;
     if (vq) {
-        const float* qh = Q + (size_t)q_row * q_dim + (size_t)h * dh;
+        const float4* qh4 = reinterpret_cast<const float4*>(Q + (size_t)q_row * q_dim + (size_t)h * dh);
 #pragma unroll
         for (int db = 0; db < 8; ++db) {
-            int dbase = db * 16 + half * 8;
-#pragma unroll
-            for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)(qh[dbase + j] * q_scale);
+            int d4 = (db * 16 + half * 8) >> 2;
+            float4 qv0 = qh4[d4];
+            float4 qv1 = qh4[d4 + 1];
+            q_reg[db][0] = (_Float16)(qv0.x * q_scale);
+            q_reg[db][1] = (_Float16)(qv0.y * q_scale);
+            q_reg[db][2] = (_Float16)(qv0.z * q_scale);
+            q_reg[db][3] = (_Float16)(qv0.w * q_scale);
+            q_reg[db][4] = (_Float16)(qv1.x * q_scale);
+            q_reg[db][5] = (_Float16)(qv1.y * q_scale);
+            q_reg[db][6] = (_Float16)(qv1.z * q_scale);
+            q_reg[db][7] = (_Float16)(qv1.w * q_scale);
         }
         const float4* rh4 = reinterpret_cast<const float4*>(R + (size_t)q_row * r_dim + (size_t)h * d_rel);
-        r_reg0 = rh4[0]; r_reg1 = rh4[1]; r_reg2 = rh4[2]; r_reg3 = rh4[3];
-        sink_q = sinks[(size_t)q_row * n_head + h];
+        float4 t0 = rh4[0], t1 = rh4[1], t2 = rh4[2], t3 = rh4[3];
+        r_reg0 = make_float4(t0.x * LOG2E, t0.y * LOG2E, t0.z * LOG2E, t0.w * LOG2E);
+        r_reg1 = make_float4(t1.x * LOG2E, t1.y * LOG2E, t1.z * LOG2E, t1.w * LOG2E);
+        r_reg2 = make_float4(t2.x * LOG2E, t2.y * LOG2E, t2.z * LOG2E, t2.w * LOG2E);
+        r_reg3 = make_float4(t3.x * LOG2E, t3.y * LOG2E, t3.z * LOG2E, t3.w * LOG2E);
+        sink_q = sinks[(size_t)q_row * n_head + h] * LOG2E;
     } else {
 #pragma unroll
         for (int db = 0; db < 8; ++db) {
@@ -1160,26 +1174,30 @@ extern "C" __global__ void attn_batch_gated_flash_q8kv_k(const float* __restrict
         }
         float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
         float m_new = fmaxf(m_q, tile_max);
-        float alpha = expf(m_q - m_new);
+        bool need_rescale = (m_new > m_q);
+        float alpha = need_rescale ? exp2f(m_q - m_new) : 1.0f;
 
         q8kv_h8_v p_reg;
         float local_sum = 0.0f;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            float p = (sc_arr[i] > -1e20f) ? expf(sc_arr[i] - m_new) : 0.0f;
+            float p = (sc_arr[i] > -1e20f) ? exp2f(sc_arr[i] - m_new) : 0.0f;
             p_reg[i] = (_Float16)p;
             local_sum += p;
         }
         l_q = l_q * alpha + local_sum + __shfl_xor(local_sum, 16, 32);
         m_q = m_new;
 
+        if (need_rescale) {
+#pragma unroll
+            for (int db = 0; db < 8; ++db) o_acc[db] *= alpha;
+        }
 #pragma unroll
         for (int db = 0; db < 8; ++db) {
             q8kv_h8_v vt_v;
             int d_row = db * 16 + col;
 #pragma unroll
             for (int j = 0; j < 8; ++j) vt_v[j] = sm_vt[d_row][half * 8 + j];
-            o_acc[db] *= alpha;
             o_acc[db] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vt_v, p_reg, o_acc[db]);
         }
         __syncthreads();

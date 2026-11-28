@@ -1029,7 +1029,8 @@ void mqa_flash_mma16_dspark_f16_k(
     const float* __restrict__ attn_sink,
     half* __restrict__ out,
     int n_heads,
-    int q0,
+    int q0_val,
+    const int* __restrict__ d_q0,
     int max_ctx,
     int sliding_window,
     int blk_len,
@@ -1043,6 +1044,7 @@ void mqa_flash_mma16_dspark_f16_k(
     int group_id = lane >> 2;
     int tid = lane & 3;
 
+    int q0 = d_q0 ? *d_q0 : q0_val;
     int p_start = (sliding_window > 0 && q0 > sliding_window) ? (q0 - sliding_window) : 0;
 
     __shared__ half s_q[16][512];
@@ -1134,13 +1136,17 @@ void mqa_flash_mma16_dspark_f16_k(
         uint32_t pa1 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2]);
         uint32_t pa2 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2 + 8]);
         uint32_t pa3 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2 + 8]);
+        if (a0_sc != 1.0f) {
+            #pragma unroll
+            for (int nb = 0; nb < 8; ++nb) { o0[nb] *= a0_sc; o1[nb] *= a0_sc; }
+        }
+        if (a1_sc != 1.0f) {
+            #pragma unroll
+            for (int nb = 0; nb < 8; ++nb) { o2[nb] *= a1_sc; o3[nb] *= a1_sc; }
+        }
         int col_w = warp * 64;
         #pragma unroll
         for (int nb = 0; nb < 8; ++nb) {
-            o0[nb] *= a0_sc;
-            o1[nb] *= a0_sc;
-            o2[nb] *= a1_sc;
-            o3[nb] *= a1_sc;
             int col = col_w + nb * 8 + group_id;
             half2 vb0 = __halves2half2(s_kv[tid * 2][col], s_kv[tid * 2 + 1][col]);
             half2 vb1 = __halves2half2(s_kv[tid * 2 + 8][col], s_kv[tid * 2 + 9][col]);
@@ -1205,7 +1211,8 @@ void mqa_flash_mma16_dspark_splitkv_f16_k(
     float* __restrict__ partial_o,
     float* __restrict__ partial_ml,
     int n_heads,
-    int q0,
+    int q0_val,
+    const int* __restrict__ d_q0,
     int max_ctx,
     int sliding_window,
     int blk_len,
@@ -1221,6 +1228,7 @@ void mqa_flash_mma16_dspark_splitkv_f16_k(
     int group_id = lane >> 2;
     int tid = lane & 3;
 
+    int q0 = d_q0 ? *d_q0 : q0_val;
     int p_start = (sliding_window > 0 && q0 > sliding_window) ? (q0 - sliding_window) : 0;
     int raw_len = q0 - p_start;
     int raw_tiles = (raw_len + 15) >> 4;
@@ -1345,13 +1353,17 @@ void mqa_flash_mma16_dspark_splitkv_f16_k(
         uint32_t pa1 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2]);
         uint32_t pa2 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2 + 8]);
         uint32_t pa3 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2 + 8]);
+        if (a0_sc != 1.0f) {
+            #pragma unroll
+            for (int nb = 0; nb < 8; ++nb) { o0[nb] *= a0_sc; o1[nb] *= a0_sc; }
+        }
+        if (a1_sc != 1.0f) {
+            #pragma unroll
+            for (int nb = 0; nb < 8; ++nb) { o2[nb] *= a1_sc; o3[nb] *= a1_sc; }
+        }
         int col_w = warp * 64;
         #pragma unroll
         for (int nb = 0; nb < 8; ++nb) {
-            o0[nb] *= a0_sc;
-            o1[nb] *= a0_sc;
-            o2[nb] *= a1_sc;
-            o3[nb] *= a1_sc;
             int col = col_w + nb * 8 + group_id;
             half2 vb0 = __halves2half2(s_kv[tid * 2][col], s_kv[tid * 2 + 1][col]);
             half2 vb1 = __halves2half2(s_kv[tid * 2 + 8][col], s_kv[tid * 2 + 9][col]);
@@ -1423,6 +1435,7 @@ void rad_cuda_mqa_attn_sink_dspark_f16(
     int M,
     int n_heads,
     int q0,
+    const int* d_q0,
     int max_ctx,
     int sliding_window,
     int head_dim,
@@ -1438,7 +1451,7 @@ void rad_cuda_mqa_attn_sink_dspark_f16(
         dim3 g1(n_heads / 16, M, n_splits);
         mqa_flash_mma16_dspark_splitkv_f16_k<<<g1, 256, 0, stream>>>(
             q, k_ring, kv_blk, attn_sink, split_scratch, partial_ml,
-            n_heads, q0, max_ctx, sliding_window, M, scale, n_splits
+            n_heads, q0, d_q0, max_ctx, sliding_window, M, scale, n_splits
         );
         dim3 g2(n_heads, M);
         dspark_splitkv_reduce_f16_k<<<g2, 256, 0, stream>>>(
@@ -1448,7 +1461,7 @@ void rad_cuda_mqa_attn_sink_dspark_f16(
     }
     dim3 grid(n_heads / 16, M);
     mqa_flash_mma16_dspark_f16_k<<<grid, 256, 0, stream>>>(
-        q, k_ring, kv_blk, attn_sink, out, n_heads, q0, max_ctx, sliding_window, M, scale
+        q, k_ring, kv_blk, attn_sink, out, n_heads, q0, d_q0, max_ctx, sliding_window, M, scale
     );
 }
 

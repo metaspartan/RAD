@@ -193,7 +193,8 @@ __global__ void kv_scatter_f16_k(
     const half* __restrict__ v_in,
     half* __restrict__ k_cache,
     half* __restrict__ v_cache,
-    int start_pos,
+    int start_pos_val,
+    const int* __restrict__ d_start_pos,
     int max_ctx,
     int head_dim
 ) {
@@ -201,6 +202,7 @@ __global__ void kv_scatter_f16_k(
     int i8 = blockIdx.x * blockDim.x + threadIdx.x;
     int d8 = head_dim >> 3;
     if (i8 < d8) {
+        int start_pos = d_start_pos ? *d_start_pos : start_pos_val;
         int p = (start_pos + mr) % max_ctx;
         reinterpret_cast<uint4*>(k_cache + (size_t)p * head_dim)[i8] =
             reinterpret_cast<const uint4*>(k_in + (size_t)mr * head_dim)[i8];
@@ -218,7 +220,8 @@ __global__ void rope_yarn_f16_k(
     int n_kv_heads,
     int head_dim,
     int rope_dim,
-    int start_pos,
+    int start_pos_val,
+    const int* __restrict__ d_start_pos,
     float theta,
     int orig_len,
     float sign
@@ -228,40 +231,34 @@ __global__ void rope_yarn_f16_k(
     int i = threadIdx.x;
     int half_r = rope_dim >> 1;
     if (i >= half_r) return;
-    float freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
+    int start_pos = d_start_pos ? *d_start_pos : start_pos_val;
+    float freq = exp2f(-((float)(2 * i) / (float)rope_dim) * log2f(theta));
     if (orig_len > 0) {
         float factor = 16.0f;
         float orig_ctx = (float)orig_len;
-        float beta_fast = 32.0f;
-        float beta_slow = 1.0f;
-        float low = floorf((float)rope_dim * logf(orig_ctx / (beta_fast * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
-        float high = ceilf((float)rope_dim * logf(orig_ctx / (beta_slow * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
-        if (low < 0.0f) low = 0.0f;
-        if (high > (float)(rope_dim - 1)) high = (float)(rope_dim - 1);
-        float ramp = ((float)i - low) / fmaxf(high - low, 0.001f);
-        if (ramp < 0.0f) ramp = 0.0f;
-        if (ramp > 1.0f) ramp = 1.0f;
+        float inv_2logt = 0.5f / logf(theta);
+        float low = floorf((float)rope_dim * logf(orig_ctx / (32.0f * 6.2831853f)) * inv_2logt);
+        float high = ceilf((float)rope_dim * logf(orig_ctx / 6.2831853f) * inv_2logt);
+        low = fmaxf(low, 0.0f);
+        high = fminf(high, (float)(rope_dim - 1));
+        float ramp = fminf(fmaxf(((float)i - low) / fmaxf(high - low, 0.001f), 0.0f), 1.0f);
         freq = (freq / factor) * ramp + freq * (1.0f - ramp);
     }
-    float pos_f = (float)(start_pos + mr);
-    float ang = pos_f * freq;
-    float cs = cosf(ang);
-    float sn = sign * sinf(ang);
+    float ang = (float)(start_pos + mr) * freq;
+    float sn, cs;
+    sincosf(ang, &sn, &cs);
+    sn *= sign;
     int rope_off = head_dim - rope_dim;
     if (h < n_q_heads) {
-        half* p = q + ((size_t)mr * n_q_heads + h) * head_dim + rope_off;
-        float x0 = __half2float(p[2 * i]);
-        float x1 = __half2float(p[2 * i + 1]);
-        p[2 * i] = __float2half(x0 * cs - x1 * sn);
-        p[2 * i + 1] = __float2half(x0 * sn + x1 * cs);
+        half2* p2 = reinterpret_cast<half2*>(q + ((size_t)mr * n_q_heads + h) * head_dim + rope_off);
+        float2 xv = __half22float2(p2[i]);
+        p2[i] = __float22half2_rn(make_float2(xv.x * cs - xv.y * sn, xv.x * sn + xv.y * cs));
     } else {
         int kh = h - n_q_heads;
         if (kh < n_kv_heads) {
-            half* p = k + ((size_t)mr * n_kv_heads + kh) * head_dim + rope_off;
-            float x0 = __half2float(p[2 * i]);
-            float x1 = __half2float(p[2 * i + 1]);
-            p[2 * i] = __float2half(x0 * cs - x1 * sn);
-            p[2 * i + 1] = __float2half(x0 * sn + x1 * cs);
+            half2* p2 = reinterpret_cast<half2*>(k + ((size_t)mr * n_kv_heads + kh) * head_dim + rope_off);
+            float2 xv = __half22float2(p2[i]);
+            p2[i] = __float22half2_rn(make_float2(xv.x * cs - xv.y * sn, xv.x * sn + xv.y * cs));
         }
     }
 }
@@ -361,7 +358,8 @@ __global__ void mqa_attn_sink_causal_f16_k(
     const float* __restrict__ attn_sink,
     half* __restrict__ out,
     int n_heads,
-    int start_pos,
+    int start_pos_val,
+    const int* __restrict__ d_start_pos,
     int max_ctx,
     int sliding_window,
     int comp_ratio,
@@ -373,6 +371,7 @@ __global__ void mqa_attn_sink_causal_f16_k(
     int t = threadIdx.x;
     int lane = t & 31;
     int warp = t >> 5;
+    int start_pos = d_start_pos ? *d_start_pos : start_pos_val;
     int seq_len = start_pos + mr + 1;
     if (seq_len > max_ctx) seq_len = max_ctx;
     int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
@@ -576,13 +575,22 @@ __global__ void csa2_compress_pair_f16_k(
     const __nv_bfloat16* __restrict__ norm_w,
     half* __restrict__ comp_out,
     int c_start,
+    const int* __restrict__ d_start_pos,
+    int m_tokens,
     int head_dim,
     int rope_dim,
     float theta,
     int orig_len,
     float eps
 ) {
-    int c = c_start + blockIdx.x;
+    int c_beg = c_start;
+    if (d_start_pos) {
+        int sp = *d_start_pos;
+        c_beg = sp >> 1;
+        int c_end = (sp + m_tokens) >> 1;
+        if ((int)blockIdx.x >= (c_end - c_beg)) return;
+    }
+    int c = c_beg + blockIdx.x;
     int t = threadIdx.x;
     const half* k0 = raw_kv + (size_t)(2 * c) * head_dim;
     const half* k1 = raw_kv + (size_t)(2 * c + 1) * head_dim;
@@ -595,8 +603,8 @@ __global__ void csa2_compress_pair_f16_k(
         float sc0 = __half2float(g0[i]);
         float sc1 = __half2float(g1[i]);
         float mx = fmaxf(sc0, sc1);
-        float e0 = expf(sc0 - mx);
-        float e1 = expf(sc1 - mx);
+        float e0 = exp2f((sc0 - mx) * 1.44269504f);
+        float e1 = exp2f((sc1 - mx) * 1.44269504f);
         float w0 = e0 / (e0 + e1);
         float v = w0 * __half2float(k0[i]) + (1.0f - w0) * __half2float(k1[i]);
         s_v[i] = v;
@@ -621,22 +629,21 @@ __global__ void csa2_compress_pair_f16_k(
     int rope_off = head_dim - rope_dim;
     int half_r = rope_dim >> 1;
     if (t < half_r) {
-        float freq = 1.0f / powf(theta, (float)(2 * t) / (float)rope_dim);
+        float freq = exp2f(-((float)(2 * t) / (float)rope_dim) * log2f(theta));
         if (orig_len > 0) {
             float factor = 16.0f;
             float orig_ctx = (float)orig_len;
-            float low = floorf((float)rope_dim * logf(orig_ctx / (32.0f * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
-            float high = ceilf((float)rope_dim * logf(orig_ctx / (1.0f * 2.0f * 3.14159265f)) / (2.0f * logf(theta)));
-            if (low < 0.0f) low = 0.0f;
-            if (high > (float)(rope_dim - 1)) high = (float)(rope_dim - 1);
-            float ramp = ((float)t - low) / fmaxf(high - low, 0.001f);
-            if (ramp < 0.0f) ramp = 0.0f;
-            if (ramp > 1.0f) ramp = 1.0f;
+            float inv_2logt = 0.5f / logf(theta);
+            float low = floorf((float)rope_dim * logf(orig_ctx / (32.0f * 6.2831853f)) * inv_2logt);
+            float high = ceilf((float)rope_dim * logf(orig_ctx / 6.2831853f) * inv_2logt);
+            low = fmaxf(low, 0.0f);
+            high = fminf(high, (float)(rope_dim - 1));
+            float ramp = fminf(fmaxf(((float)t - low) / fmaxf(high - low, 0.001f), 0.0f), 1.0f);
             freq = (freq / factor) * ramp + freq * (1.0f - ramp);
         }
         float ang = (float)(2 * c) * freq;
-        float cs = cosf(ang);
-        float sn = sinf(ang);
+        float sn, cs;
+        sincosf(ang, &sn, &cs);
         float x0 = s_v[rope_off + 2 * t];
         float x1 = s_v[rope_off + 2 * t + 1];
         s_v[rope_off + 2 * t] = x0 * cs - x1 * sn;
@@ -689,7 +696,8 @@ __global__ void mqa_attn_sink_causal_mh_f16_k(
     const float* __restrict__ attn_sink,
     half* __restrict__ out,
     int n_heads,
-    int start_pos,
+    int start_pos_val,
+    const int* __restrict__ d_start_pos,
     int max_ctx,
     int sliding_window,
     int comp_ratio,
@@ -700,6 +708,7 @@ __global__ void mqa_attn_sink_causal_mh_f16_k(
     int t = threadIdx.x;
     int lane = t & 31;
     int warp = t >> 5;
+    int start_pos = d_start_pos ? *d_start_pos : start_pos_val;
     int seq_len = start_pos + mr + 1;
     if (seq_len > max_ctx) seq_len = max_ctx;
     int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
@@ -741,8 +750,8 @@ __global__ void mqa_attn_sink_causal_mh_f16_k(
         for (int j = 0; j < HB; ++j) {
             float score = s_score[j];
             float nm = fmaxf(m_max[j], score);
-            float alpha = expf(m_max[j] - nm);
-            float beta = expf(score - nm);
+            float alpha = exp2f((m_max[j] - nm) * 1.44269504f);
+            float beta = exp2f((score - nm) * 1.44269504f);
             l_sum[j] = l_sum[j] * alpha + beta;
             m_max[j] = nm;
             ax[j] = fmaf(ax[j], alpha, beta * vv.x);
@@ -771,8 +780,8 @@ __global__ void mqa_attn_sink_causal_mh_f16_k(
             for (int j = 0; j < HB; ++j) {
                 float score = s_score[j];
                 float nm = fmaxf(m_max[j], score);
-                float alpha = expf(m_max[j] - nm);
-                float beta = expf(score - nm);
+                float alpha = exp2f((m_max[j] - nm) * 1.44269504f);
+                float beta = exp2f((score - nm) * 1.44269504f);
                 l_sum[j] = l_sum[j] * alpha + beta;
                 m_max[j] = nm;
                 ax[j] = fmaf(ax[j], alpha, beta * kv.x);
@@ -811,7 +820,8 @@ void mqa_flash_mma_f16_k(
     const float* __restrict__ attn_sink,
     half* __restrict__ out,
     int n_heads,
-    int start_pos,
+    int start_pos_val,
+    const int* __restrict__ d_start_pos,
     int max_ctx,
     int sliding_window,
     int comp_ratio,
@@ -825,6 +835,7 @@ void mqa_flash_mma_f16_k(
     int group_id = lane >> 2;
     int tid = lane & 3;
 
+    int start_pos = d_start_pos ? *d_start_pos : start_pos_val;
     int seq_len = start_pos + mr + 1;
     if (seq_len > max_ctx) seq_len = max_ctx;
     int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
@@ -945,6 +956,23 @@ void mqa_flash_mma_f16_k(
             pa2[hg] = *reinterpret_cast<const uint32_t*>(&s_p[hg][group_id][tid * 2 + 8]);
             pa3[hg] = *reinterpret_cast<const uint32_t*>(&s_p[hg][group_id + 8][tid * 2 + 8]);
         }
+        #pragma unroll
+        for (int hg = 0; hg < NH_BLK; ++hg) {
+            if (a0_sc[hg] != 1.0f) {
+                #pragma unroll
+                for (int nb = 0; nb < 8; ++nb) {
+                    o0[hg][nb] *= a0_sc[hg];
+                    o1[hg][nb] *= a0_sc[hg];
+                }
+            }
+            if (a1_sc[hg] != 1.0f) {
+                #pragma unroll
+                for (int nb = 0; nb < 8; ++nb) {
+                    o2[hg][nb] *= a1_sc[hg];
+                    o3[hg][nb] *= a1_sc[hg];
+                }
+            }
+        }
         int col_w = warp * 64;
         #pragma unroll
         for (int nb = 0; nb < 8; ++nb) {
@@ -955,10 +983,6 @@ void mqa_flash_mma_f16_k(
             uint32_t b1 = *reinterpret_cast<uint32_t*>(&vb1);
             #pragma unroll
             for (int hg = 0; hg < NH_BLK; ++hg) {
-                o0[hg][nb] *= a0_sc[hg];
-                o1[hg][nb] *= a0_sc[hg];
-                o2[hg][nb] *= a1_sc[hg];
-                o3[hg][nb] *= a1_sc[hg];
                 mqa_mma_m16n8k16_f32(o0[hg][nb], o1[hg][nb], o2[hg][nb], o3[hg][nb], pa0[hg], pa1[hg], pa2[hg], pa3[hg], b0, b1);
             }
         }
@@ -1072,7 +1096,8 @@ void mqa_flash_mma16_splitkv_f16_k(
     float* __restrict__ partial_o,
     float* __restrict__ partial_ml,
     int n_heads,
-    int start_pos,
+    int start_pos_val,
+    const int* __restrict__ d_start_pos,
     int max_ctx,
     int sliding_window,
     int comp_ratio,
@@ -1088,6 +1113,7 @@ void mqa_flash_mma16_splitkv_f16_k(
     int group_id = lane >> 2;
     int tid = lane & 3;
 
+    int start_pos = d_start_pos ? *d_start_pos : start_pos_val;
     int seq_len = start_pos + mr + 1;
     if (seq_len > max_ctx) seq_len = max_ctx;
     int p_start = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
@@ -1231,13 +1257,17 @@ void mqa_flash_mma16_splitkv_f16_k(
             uint32_t pa1 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2]);
             uint32_t pa2 = *reinterpret_cast<const uint32_t*>(&s_p[group_id][tid * 2 + 8]);
             uint32_t pa3 = *reinterpret_cast<const uint32_t*>(&s_p[group_id + 8][tid * 2 + 8]);
+            if (a0_sc != 1.0f) {
+                #pragma unroll
+                for (int nb = 0; nb < 8; ++nb) { o0[nb] *= a0_sc; o1[nb] *= a0_sc; }
+            }
+            if (a1_sc != 1.0f) {
+                #pragma unroll
+                for (int nb = 0; nb < 8; ++nb) { o2[nb] *= a1_sc; o3[nb] *= a1_sc; }
+            }
             int col_w = warp * 64;
             #pragma unroll
             for (int nb = 0; nb < 8; ++nb) {
-                o0[nb] *= a0_sc;
-                o1[nb] *= a0_sc;
-                o2[nb] *= a1_sc;
-                o3[nb] *= a1_sc;
                 int col = col_w + nb * 8 + group_id;
                 half2 vb0 = __halves2half2(s_kv[tid * 2][col], s_kv[tid * 2 + 1][col]);
                 half2 vb1 = __halves2half2(s_kv[tid * 2 + 8][col], s_kv[tid * 2 + 9][col]);
@@ -1388,39 +1418,22 @@ void rad_cuda_mhc_collapse_mean_f16(
 }
 
 void rad_cuda_kv_scatter_f16(
-    const half* k_in,
-    const half* v_in,
-    half* k_cache,
-    half* v_cache,
-    int M,
-    int start_pos,
-    int max_ctx,
-    int head_dim,
-    cudaStream_t stream
+    const half* k_in, const half* v_in, half* k_cache, half* v_cache,
+    int M, int start_pos, const int* d_start_pos, int max_ctx, int head_dim, cudaStream_t stream
 ) {
     int d8 = head_dim >> 3;
     int threads = (d8 < 64) ? 32 : ((d8 < 128) ? 64 : 128);
     dim3 grid((d8 + threads - 1) / threads, M);
-    kv_scatter_f16_k<<<grid, threads, 0, stream>>>(k_in, v_in, k_cache, v_cache, start_pos, max_ctx, head_dim);
+    kv_scatter_f16_k<<<grid, threads, 0, stream>>>(k_in, v_in, k_cache, v_cache, start_pos, d_start_pos, max_ctx, head_dim);
 }
 
 void rad_cuda_rope_yarn_f16(
-    half* q,
-    half* k,
-    int M,
-    int n_q_heads,
-    int n_kv_heads,
-    int head_dim,
-    int rope_dim,
-    int start_pos,
-    float theta,
-    int orig_len,
-    float sign,
-    cudaStream_t stream
+    half* q, half* k, int M, int n_q_heads, int n_kv_heads, int head_dim, int rope_dim,
+    int start_pos, const int* d_start_pos, float theta, int orig_len, float sign, cudaStream_t stream
 ) {
     dim3 grid(n_q_heads + n_kv_heads, M);
     rope_yarn_f16_k<<<grid, rope_dim / 2, 0, stream>>>(
-        q, k, n_q_heads, n_kv_heads, head_dim, rope_dim, start_pos, theta, orig_len, sign
+        q, k, n_q_heads, n_kv_heads, head_dim, rope_dim, start_pos, d_start_pos, theta, orig_len, sign
     );
 }
 
@@ -1462,22 +1475,9 @@ __global__ void mtp_add_proj_to_mhc_f32_k(
 }
 
 void rad_cuda_mqa_attn_sink_causal_f16(
-    const half* q,
-    const half* k_cache,
-    const half* v_cache,
-    const half* comp_kv,
-    const float* attn_sink,
-    half* out,
-    float* split_scratch,
-    int M,
-    int n_heads,
-    int start_pos,
-    int max_ctx,
-    int sliding_window,
-    int comp_ratio,
-    int head_dim,
-    float scale,
-    cudaStream_t stream
+    const half* q, const half* k_cache, const half* v_cache, const half* comp_kv, const float* attn_sink,
+    half* out, float* split_scratch, int M, int n_heads, int start_pos, const int* d_start_pos,
+    int max_ctx, int sliding_window, int comp_ratio, int head_dim, float scale, cudaStream_t stream
 ) {
     if (head_dim == 512 && k_cache == v_cache && (n_heads % 16) == 0) {
         int eff_len = start_pos + M;
@@ -1493,71 +1493,53 @@ void rad_cuda_mqa_attn_sink_causal_f16(
             if (n_splits > 1) {
                 size_t o_elems = (size_t)M * n_heads * n_splits * 512;
                 float* partial_ml = split_scratch + o_elems;
-                dim3 g1(n_heads / 16, M, n_splits);
-                mqa_flash_mma16_splitkv_f16_k<<<g1, 256, 0, stream>>>(
+                mqa_flash_mma16_splitkv_f16_k<<<dim3(n_heads / 16, M, n_splits), 256, 0, stream>>>(
                     q, k_cache, comp_kv, attn_sink, split_scratch, partial_ml,
-                    n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale, n_splits
+                    n_heads, start_pos, d_start_pos, max_ctx, sliding_window, comp_ratio, scale, n_splits
                 );
-                dim3 g2(n_heads, M);
-                mqa_splitkv_reduce_f16_k<<<g2, 256, 0, stream>>>(
-                    split_scratch, partial_ml, out, n_heads, n_splits
-                );
+                mqa_splitkv_reduce_f16_k<<<dim3(n_heads, M), 256, 0, stream>>>(split_scratch, partial_ml, out, n_heads, n_splits);
                 return;
             }
         }
         if (M >= 16 && (n_heads % 32) == 0) {
-            dim3 grid(n_heads / 32, M);
-            mqa_flash_mma_f16_k<2><<<grid, 256, 0, stream>>>(
-                q, k_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
+            mqa_flash_mma_f16_k<2><<<dim3(n_heads / 32, M), 256, 0, stream>>>(
+                q, k_cache, comp_kv, attn_sink, out, n_heads, start_pos, d_start_pos, max_ctx, sliding_window, comp_ratio, scale
             );
             return;
         }
         if (M >= 16 || (M >= 4 && start_pos + M >= 256)) {
-            dim3 grid(n_heads / 16, M);
-            mqa_flash_mma_f16_k<1><<<grid, 256, 0, stream>>>(
-                q, k_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
+            mqa_flash_mma_f16_k<1><<<dim3(n_heads / 16, M), 256, 0, stream>>>(
+                q, k_cache, comp_kv, attn_sink, out, n_heads, start_pos, d_start_pos, max_ctx, sliding_window, comp_ratio, scale
             );
             return;
         }
     }
     if (head_dim == 512 && M >= 16 && (n_heads % 8) == 0) {
-        dim3 grid(n_heads / 8, M);
-        mqa_attn_sink_causal_mh_f16_k<8><<<grid, 256, 0, stream>>>(
-            q, k_cache, v_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
+        mqa_attn_sink_causal_mh_f16_k<8><<<dim3(n_heads / 8, M), 256, 0, stream>>>(
+            q, k_cache, v_cache, comp_kv, attn_sink, out, n_heads, start_pos, d_start_pos, max_ctx, sliding_window, comp_ratio, scale
         );
         return;
     }
     if (head_dim == 512 && M >= 2 && (n_heads % 4) == 0) {
-        dim3 grid(n_heads / 4, M);
-        mqa_attn_sink_causal_mh_f16_k<4><<<grid, 256, 0, stream>>>(
-            q, k_cache, v_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, scale
+        mqa_attn_sink_causal_mh_f16_k<4><<<dim3(n_heads / 4, M), 256, 0, stream>>>(
+            q, k_cache, v_cache, comp_kv, attn_sink, out, n_heads, start_pos, d_start_pos, max_ctx, sliding_window, comp_ratio, scale
         );
         return;
     }
     size_t smem = (head_dim == 512) ? 0 : (size_t)head_dim * 2 * sizeof(float);
-    dim3 grid(n_heads, M);
-    mqa_attn_sink_causal_f16_k<<<grid, 256, smem, stream>>>(
-        q, k_cache, v_cache, comp_kv, attn_sink, out, n_heads, start_pos, max_ctx, sliding_window, comp_ratio, head_dim, scale
+    mqa_attn_sink_causal_f16_k<<<dim3(n_heads, M), 256, smem, stream>>>(
+        q, k_cache, v_cache, comp_kv, attn_sink, out, n_heads, start_pos, d_start_pos, max_ctx, sliding_window, comp_ratio, head_dim, scale
     );
 }
 
 void rad_cuda_csa2_compress_pair_f16(
-    const half* raw_kv,
-    const half* raw_gate,
-    const __nv_bfloat16* norm_w,
-    half* comp_out,
-    int c_start,
-    int n_pairs,
-    int head_dim,
-    int rope_dim,
-    float theta,
-    int orig_len,
-    float eps,
-    cudaStream_t stream
+    const half* raw_kv, const half* raw_gate, const __nv_bfloat16* norm_w, half* comp_out,
+    int c_start, int n_pairs, const int* d_start_pos, int m_tokens,
+    int head_dim, int rope_dim, float theta, int orig_len, float eps, cudaStream_t stream
 ) {
     if (n_pairs <= 0) return;
     csa2_compress_pair_f16_k<<<n_pairs, 256, 0, stream>>>(
-        raw_kv, raw_gate, norm_w, comp_out, c_start, head_dim, rope_dim, theta, orig_len, eps
+        raw_kv, raw_gate, norm_w, comp_out, c_start, d_start_pos, m_tokens, head_dim, rope_dim, theta, orig_len, eps
     );
 }
 
@@ -1750,20 +1732,47 @@ __global__ void markov_argmax_stage1_f16_k(
     int vocab_local,
     int rank
 ) {
-    __shared__ float s_emb[256];
-    for (int i = threadIdx.x; i < rank; i += blockDim.x) {
+    __shared__ alignas(16) float s_emb[256];
+    int tid = threadIdx.x;
+    for (int i = tid; i < rank; i += blockDim.x) {
         s_emb[i] = __bfloat162float(markov_embed[(size_t)prev_tok * rank + i]);
     }
     __syncthreads();
-    int tid = threadIdx.x;
-    int base = blockIdx.x * 1024 + tid;
-    int r2 = rank >> 1;
     float best_v = -1e30f;
     int best_i = 0;
-    #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        int v = base + k * 256;
-        if (v < vocab_local) {
+    if ((rank & 7) == 0) {
+        int sub_id = tid >> 3;
+        int lane8 = tid & 7;
+        int r8 = rank >> 3;
+        const float4* s_emb4 = reinterpret_cast<const float4*>(s_emb);
+        for (int v = blockIdx.x * 32 + sub_id; v < vocab_local; v += gridDim.x * 32) {
+            const uint4* mh8 = reinterpret_cast<const uint4*>(markov_head + (size_t)v * rank);
+            float dot = 0.0f;
+            for (int i8 = lane8; i8 < r8; i8 += 8) {
+                uint4 wq = __ldg(mh8 + i8);
+                float2 w01 = __half22float2(*reinterpret_cast<const half2*>(&wq.x));
+                float2 w23 = __half22float2(*reinterpret_cast<const half2*>(&wq.y));
+                float2 w45 = __half22float2(*reinterpret_cast<const half2*>(&wq.z));
+                float2 w67 = __half22float2(*reinterpret_cast<const half2*>(&wq.w));
+                float4 e0 = s_emb4[i8 * 2];
+                float4 e1 = s_emb4[i8 * 2 + 1];
+                dot = fmaf(w01.x, e0.x, fmaf(w01.y, e0.y, fmaf(w23.x, e0.z, fmaf(w23.y, e0.w, dot))));
+                dot = fmaf(w45.x, e1.x, fmaf(w45.y, e1.y, fmaf(w67.x, e1.z, fmaf(w67.y, e1.w, dot))));
+            }
+            dot += __shfl_xor_sync(0xFFFFFFFFu, dot, 4);
+            dot += __shfl_xor_sync(0xFFFFFFFFu, dot, 2);
+            dot += __shfl_xor_sync(0xFFFFFFFFu, dot, 1);
+            if (lane8 == 0) {
+                float val = __half2float(__ldg(logits_row + v)) + dot;
+                if (val > best_v || (val == best_v && v < best_i)) {
+                    best_v = val;
+                    best_i = v;
+                }
+            }
+        }
+    } else {
+        int r2 = rank >> 1;
+        for (int v = blockIdx.x * 256 + tid; v < vocab_local; v += gridDim.x * 256) {
             const half2* mh2 = reinterpret_cast<const half2*>(markov_head + (size_t)v * rank);
             float dot = 0.0f;
             for (int i = 0; i < r2; ++i) {
@@ -1772,7 +1781,7 @@ __global__ void markov_argmax_stage1_f16_k(
                 dot = fmaf(wv.y, s_emb[2 * i + 1], dot);
             }
             float val = __half2float(__ldg(logits_row + v)) + dot;
-            if (val > best_v) {
+            if (val > best_v || (val == best_v && v < best_i)) {
                 best_v = val;
                 best_i = v;
             }
@@ -1820,18 +1829,42 @@ __global__ void markov_argmax_stage2_k(
     int* __restrict__ out_id,
     int n_blks
 ) {
-    float bv = -1e30f;
-    int bi = 0;
-    for (int i = 0; i < n_blks; ++i) {
-        float v = blk_vals[i];
-        int id = blk_ids[i];
-        if (v > bv || (v == bv && id < bi)) {
-            bv = v;
-            bi = id;
+    int tid = threadIdx.x;
+    float bv = (tid < n_blks) ? blk_vals[tid] : -1e30f;
+    int bi = (tid < n_blks) ? blk_ids[tid] : 0;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    for (int m = 16; m > 0; m >>= 1) {
+        float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, m);
+        int oi = __shfl_xor_sync(0xFFFFFFFFu, bi, m);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
         }
     }
-    out_val[0] = bv;
-    out_id[0] = bi;
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    if (lane == 0) {
+        sv[warp] = bv;
+        si[warp] = bi;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        bv = (lane < 8) ? sv[lane] : -1e30f;
+        bi = (lane < 8) ? si[lane] : 0;
+        for (int m = 4; m > 0; m >>= 1) {
+            float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, m);
+            int oi = __shfl_xor_sync(0xFFFFFFFFu, bi, m);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (lane == 0) {
+            out_val[0] = bv;
+            out_id[0] = bi;
+        }
+    }
 }
 
 void rad_cuda_markov_argmax_f16(
@@ -1847,11 +1880,13 @@ void rad_cuda_markov_argmax_f16(
     int rank,
     cudaStream_t stream
 ) {
-    int n_blks = (vocab_local + 1023) / 1024;
+    int n_blks = (vocab_local + 255) / 256;
+    if (n_blks > 256) n_blks = 256;
+    if (n_blks < 1) n_blks = 1;
     markov_argmax_stage1_f16_k<<<n_blks, 256, 0, stream>>>(
         logits_row, markov_head, markov_embed, prev_tok, blk_vals, blk_ids, vocab_local, rank
     );
-    markov_argmax_stage2_k<<<1, 1, 0, stream>>>(blk_vals, blk_ids, out_val, out_id, n_blks);
+    markov_argmax_stage2_k<<<1, 256, 0, stream>>>(blk_vals, blk_ids, out_val, out_id, n_blks);
 }
 
 void rad_cuda_markov_bias_add_f16(

@@ -134,7 +134,7 @@ extern "C" __global__ void dspark_swiglu_q8_k(const float* __restrict__ gate,
     int t = blockIdx.y;
     size_t idx = (size_t)t * k + (b << 5) + lane;
     float g = gate[idx];
-    float v = (g / (1.0f + expf(-g))) * up[idx];
+    float v = (g / (1.0f + exp2f(-g * 1.4426950408889634f))) * up[idx];
     float amax = __shfl(df2_warp_max32(fabsf(v)), 0, 32);
     float d = amax / 127.0f;
     float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
@@ -560,9 +560,11 @@ extern "C" __global__ void dflash2_rmsnorm_q8_k(const float* __restrict__ x,
     int lane = tid & 31;
     const float* xr = x + (size_t)bt * n_embd;
     float ss = 0.0f;
-    for (int i = tid; i < n_embd; i += 256) {
-        float v = xr[i];
-        ss += v * v;
+    const float4* xr4 = reinterpret_cast<const float4*>(xr);
+    int n4 = n_embd >> 2;
+    for (int i = tid; i < n4; i += 256) {
+        float4 v = xr4[i];
+        ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
     }
     ss = df2_warp_sum32(ss);
     __shared__ float sm_ss[8];

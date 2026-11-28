@@ -407,10 +407,8 @@ fn run_serve(cli: &Cli, mut comm: Tp2Comm) -> Result<()> {
             eng.pos = lcp;
             let mut pcmd = 3u32;
             let _ = comm.broadcast_u32(&mut pcmd);
-            let mut pval = lcp as u32;
-            let _ = comm.broadcast_u32(&mut pval);
-            let mut crow = 0u32;
-            let _ = comm.broadcast_u32(&mut crow);
+            let mut pargs = [lcp as u32, 0u32];
+            let _ = comm.broadcast_u32_array(&mut pargs);
             let t_pre = Instant::now();
             let mut next_tok = match eng.prefill_tokens(&p_ids[lcp..], &mut comm) {
                 Ok(t) => t,
