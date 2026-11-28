@@ -262,8 +262,22 @@ extern "C" __global__ void dflash2_select_path_k(const int* __restrict__ cand_id
         int cid = cids[(slot - 1) * 16 + cand_idx];
         const uint16_t* sb = succ_cb + (size_t)cid * rank;
         float dot = 0.0f;
-        for (int r = lane16; r < rank; r += 16) {
-            dot = fmaf(df2_bf16_f32(sb[r]), cond_s[r], dot);
+        if ((rank & 3) == 0) {
+            const uint2* sb2 = reinterpret_cast<const uint2*>(sb);
+            const float4* cs4 = reinterpret_cast<const float4*>(cond_s);
+            int rank4 = rank >> 2;
+            for (int r4 = lane16; r4 < rank4; r4 += 16) {
+                uint2 w = sb2[r4];
+                float4 c = cs4[r4];
+                dot = fmaf(df2_bf16_f32((uint16_t)(w.x & 0xFFFFu)), c.x, dot);
+                dot = fmaf(df2_bf16_f32((uint16_t)(w.x >> 16)), c.y, dot);
+                dot = fmaf(df2_bf16_f32((uint16_t)(w.y & 0xFFFFu)), c.z, dot);
+                dot = fmaf(df2_bf16_f32((uint16_t)(w.y >> 16)), c.w, dot);
+            }
+        } else {
+            for (int r = lane16; r < rank; r += 16) {
+                dot = fmaf(df2_bf16_f32(sb[r]), cond_s[r], dot);
+            }
         }
 #pragma unroll
         for (int off = 8; off > 0; off >>= 1) {
@@ -276,18 +290,23 @@ extern "C" __global__ void dflash2_select_path_k(const int* __restrict__ cand_id
         }
         __syncthreads();
 
-        if (tid == 0) {
-            int best = 0;
-            float bv = scores_s[0];
-            for (int j = 1; j < 16; ++j) {
-                if (scores_s[j] > bv) {
-                    bv = scores_s[j];
-                    best = j;
+        if (tid < 16) {
+            float bv = scores_s[tid];
+            int bi = tid;
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1) {
+                float ov = __shfl_down(bv, off, 16);
+                int oi = __shfl_down(bi, off, 16);
+                if (ov > bv || (ov == bv && oi < bi)) {
+                    bv = ov;
+                    bi = oi;
                 }
             }
-            int chosen = cids[(slot - 1) * 16 + best];
-            out_toks[slot] = chosen;
-            prev_tok = chosen;
+            if (tid == 0) {
+                int chosen = cids[(slot - 1) * 16 + bi];
+                out_toks[slot] = chosen;
+                prev_tok = chosen;
+            }
         }
         __syncthreads();
     }
@@ -662,13 +681,14 @@ extern "C" __global__ void dflash2_rope_norm_ctx_batch_k(const float* __restrict
         kv[p] = kv[p] * inv * k_norm_w[d];
     }
     int half_dh = dh >> 1;
+    float log2_fb = log2f(freq_base);
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
         int d = lane + p * 32;
-        float freq = powf(freq_base, -2.0f * (float)d / (float)dh);
+        float freq = exp2f((-2.0f * (float)d / (float)dh) * log2_fb);
         float ang = (float)pos * freq;
-        float ca = cosf(ang);
-        float sa = sinf(ang);
+        float sa, ca;
+        sincosf(ang, &sa, &ca);
         float x0 = kv[p];
         float x1 = kv[p + 2];
         kd[d] = __float2half(x0 * ca - x1 * sa);
@@ -724,13 +744,14 @@ extern "C" __global__ void dflash2_rope_norm_ctx_batch_dpos_k(const float* __res
         kv[p] = kv[p] * inv * k_norm_w[d];
     }
     int half_dh = dh >> 1;
+    float log2_fb = log2f(freq_base);
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
         int d = lane + p * 32;
-        float freq = powf(freq_base, -2.0f * (float)d / (float)dh);
+        float freq = exp2f((-2.0f * (float)d / (float)dh) * log2_fb);
         float ang = (float)pos * freq;
-        float ca = cosf(ang);
-        float sa = sinf(ang);
+        float sa, ca;
+        sincosf(ang, &sa, &ca);
         float x0 = kv[p];
         float x1 = kv[p + 2];
         kd[d] = __float2half(x0 * ca - x1 * sa);

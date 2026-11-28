@@ -63,12 +63,20 @@ __global__ void attn_batch_gqa3_flash_fp16_t(const float* __restrict__ Q,
     float4 r_reg3 = make_float4(0.f, 0.f, 0.f, 0.f);
     float sink_q = 0.0f;
     if (vq) {
-        const float* qh = Q + (size_t)bt_q * q_dim + (size_t)h * dh;
+        const float4* qh4 = reinterpret_cast<const float4*>(Q + (size_t)bt_q * q_dim + (size_t)h * dh);
 #pragma unroll
         for (int db = 0; db < 8; ++db) {
-            int dbase = db * 16 + half * 8;
-#pragma unroll
-            for (int j = 0; j < 8; ++j) q_reg[db][j] = (_Float16)(qh[dbase + j] * q_scale);
+            int d4 = (db * 16 + half * 8) >> 2;
+            float4 qv0 = qh4[d4];
+            float4 qv1 = qh4[d4 + 1];
+            q_reg[db][0] = (_Float16)(qv0.x * q_scale);
+            q_reg[db][1] = (_Float16)(qv0.y * q_scale);
+            q_reg[db][2] = (_Float16)(qv0.z * q_scale);
+            q_reg[db][3] = (_Float16)(qv0.w * q_scale);
+            q_reg[db][4] = (_Float16)(qv1.x * q_scale);
+            q_reg[db][5] = (_Float16)(qv1.y * q_scale);
+            q_reg[db][6] = (_Float16)(qv1.z * q_scale);
+            q_reg[db][7] = (_Float16)(qv1.w * q_scale);
         }
         const float4* rh4 = reinterpret_cast<const float4*>(R + (size_t)bt_q * r_dim + (size_t)h * d_rel);
         r_reg0 = make_float4(rh4[0].x * LOG2E, rh4[0].y * LOG2E, rh4[0].z * LOG2E, rh4[0].w * LOG2E);
@@ -107,8 +115,15 @@ __global__ void attn_batch_gqa3_flash_fp16_t(const float* __restrict__ Q,
                 const _Float16* vp = vc_h + (size_t)kv_slot * dh + d8_l;
                 *reinterpret_cast<uint4*>(&sm_k[tk_l][d8_l]) = *reinterpret_cast<const uint4*>(kp);
                 *reinterpret_cast<uint4*>(&sm_k[tk_l][d8_l + 8]) = *reinterpret_cast<const uint4*>(kp + 8);
+                uint4 vq0 = *reinterpret_cast<const uint4*>(vp);
+                uint4 vq1 = *reinterpret_cast<const uint4*>(vp + 8);
+                const _Float16* vh0 = reinterpret_cast<const _Float16*>(&vq0);
+                const _Float16* vh1 = reinterpret_cast<const _Float16*>(&vq1);
 #pragma unroll
-                for (int j = 0; j < 16; ++j) sm_vt[d8_l + j][tk_l] = vp[j];
+                for (int j = 0; j < 8; ++j) {
+                    sm_vt[d8_l + j][tk_l] = vh0[j];
+                    sm_vt[d8_l + 8 + j][tk_l] = vh1[j];
+                }
             } else {
                 *reinterpret_cast<uint4*>(&sm_k[tk_l][d8_l]) = make_uint4(0, 0, 0, 0);
                 *reinterpret_cast<uint4*>(&sm_k[tk_l][d8_l + 8]) = make_uint4(0, 0, 0, 0);
