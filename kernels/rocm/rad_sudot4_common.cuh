@@ -98,6 +98,10 @@ __device__ __forceinline__ size_t q4_soa_row_bytes(int nblk) {
     return (size_t)nblk * 16 + (((size_t)nblk * 2 + 15) & ~(size_t)15);
 }
 
+__device__ __forceinline__ size_t q8_soa_row_bytes(int nblk) {
+    return (size_t)nblk * 32 + (((size_t)nblk * 2 + 15) & ~(size_t)15);
+}
+
 __device__ __forceinline__ float dot_q4_soa_q8_1_blk(const uint4 q4,
                                                      float dw,
                                                      const q8_1_blk& xb) {

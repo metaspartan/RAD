@@ -563,8 +563,20 @@ extern "C" int ink_gemm_f32(hipStream_t s, const float* W, const float* X, float
             gemm_f32_f4_nt_k<8><<<dim3((n + 1) / 2, B / 8), dim3(64), 0, s>>>(W, X, Y, n, k, B);
             return 0;
         }
+        if (B == 6) {
+            gemm_f32_f4_nt_k<6><<<dim3((n + 1) / 2, 1), dim3(64), 0, s>>>(W, X, Y, n, k, B);
+            return 0;
+        }
         if (B == 4) {
             gemm_f32_f4_nt_k<4><<<dim3((n + 1) / 2, 1), dim3(64), 0, s>>>(W, X, Y, n, k, B);
+            return 0;
+        }
+        if (B == 3) {
+            gemm_f32_f4_nt_k<3><<<dim3((n + 1) / 2, 1), dim3(64), 0, s>>>(W, X, Y, n, k, B);
+            return 0;
+        }
+        if (B == 2) {
+            gemm_f32_f4_nt_k<2><<<dim3((n + 1) / 2, 1), dim3(64), 0, s>>>(W, X, Y, n, k, B);
             return 0;
         }
         gemm_f32_f4_rem_k<<<dim3((n + 1) / 2, (B + 7) / 8), dim3(64), 0, s>>>(W, X, Y, n, k, B);

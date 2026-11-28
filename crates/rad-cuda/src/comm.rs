@@ -290,6 +290,88 @@ impl Tp2Comm {
         Ok(())
     }
 
+    pub fn all_reduce_argmax_conf(&mut self, val: &mut f32, id: &mut i32, sum_exp: f32) -> std::io::Result<f32> {
+        if self.world_size() <= 1 {
+            return Ok(1.0f32 / sum_exp.max(1.0f32));
+        }
+        let (peer_v, peer_i, peer_s) = if !self.rdma.is_null() {
+            let sh = unsafe { rad_rdma_send_hptr(self.rdma) } as *mut u8;
+            let rh = unsafe { rad_rdma_recv_hptr(self.rdma) } as *const u8;
+            if !sh.is_null() && !rh.is_null() {
+                unsafe {
+                    let sbuf = std::slice::from_raw_parts_mut(sh, 12);
+                    sbuf[0..4].copy_from_slice(&val.to_le_bytes());
+                    sbuf[4..8].copy_from_slice(&id.to_le_bytes());
+                    sbuf[8..12].copy_from_slice(&sum_exp.to_le_bytes());
+                }
+                self.rdma_exchange_mapped(12)?;
+                unsafe {
+                    let rbuf = std::slice::from_raw_parts(rh, 12);
+                    (
+                        f32::from_le_bytes(rbuf[0..4].try_into().unwrap()),
+                        i32::from_le_bytes(rbuf[4..8].try_into().unwrap()),
+                        f32::from_le_bytes(rbuf[8..12].try_into().unwrap()),
+                    )
+                }
+            } else {
+                let Some(ref mut s) = self.stream else {
+                    return Ok(1.0f32 / sum_exp.max(1.0f32));
+                };
+                let mut sbuf = [0u8; 12];
+                let mut rbuf = [0u8; 12];
+                sbuf[0..4].copy_from_slice(&val.to_le_bytes());
+                sbuf[4..8].copy_from_slice(&id.to_le_bytes());
+                sbuf[8..12].copy_from_slice(&sum_exp.to_le_bytes());
+                if self.rank == 0 {
+                    s.write_all(&sbuf)?;
+                    s.read_exact(&mut rbuf)?;
+                } else {
+                    s.read_exact(&mut rbuf)?;
+                    s.write_all(&sbuf)?;
+                }
+                (
+                    f32::from_le_bytes(rbuf[0..4].try_into().unwrap()),
+                    i32::from_le_bytes(rbuf[4..8].try_into().unwrap()),
+                    f32::from_le_bytes(rbuf[8..12].try_into().unwrap()),
+                )
+            }
+        } else {
+            let Some(ref mut s) = self.stream else {
+                return Ok(1.0f32 / sum_exp.max(1.0f32));
+            };
+            let mut sbuf = [0u8; 12];
+            let mut rbuf = [0u8; 12];
+            sbuf[0..4].copy_from_slice(&val.to_le_bytes());
+            sbuf[4..8].copy_from_slice(&id.to_le_bytes());
+            sbuf[8..12].copy_from_slice(&sum_exp.to_le_bytes());
+            if self.rank == 0 {
+                s.write_all(&sbuf)?;
+                s.read_exact(&mut rbuf)?;
+            } else {
+                s.read_exact(&mut rbuf)?;
+                s.write_all(&sbuf)?;
+            }
+            (
+                f32::from_le_bytes(rbuf[0..4].try_into().unwrap()),
+                i32::from_le_bytes(rbuf[4..8].try_into().unwrap()),
+                f32::from_le_bytes(rbuf[8..12].try_into().unwrap()),
+            )
+        };
+        let lv = *val;
+        let gmax = lv.max(peer_v);
+        let (s0, s1) = if self.rank == 0 {
+            (sum_exp * (lv - gmax).exp(), peer_s * (peer_v - gmax).exp())
+        } else {
+            (peer_s * (peer_v - gmax).exp(), sum_exp * (lv - gmax).exp())
+        };
+        let gsum = s0 + s1;
+        if peer_v > lv || (peer_v == lv && peer_i < *id) {
+            *val = peer_v;
+            *id = peer_i;
+        }
+        Ok(1.0f32 / gsum.max(1.0f32))
+    }
+
     pub fn broadcast_u32(&mut self, val: &mut u32) -> std::io::Result<()> {
         let Some(ref mut s) = self.stream else {
             return Ok(());

@@ -1070,6 +1070,14 @@ extern "C" int ink_wo_conv_res_q4_batch_snap(hipStream_t s, const uint8_t* W, co
         wo_conv_res_q4_nt_snap_k<4><<<dim3((n_embd + 31) / 32), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, conv_w, hist, snap, add_src, block_dst, out, n_embd, q_dim);
         return 0;
     }
+    if (B == 3) {
+        wo_conv_res_q4_nt_snap_k<3><<<dim3((n_embd + 31) / 32), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, conv_w, hist, snap, add_src, block_dst, out, n_embd, q_dim);
+        return 0;
+    }
+    if (B == 2) {
+        wo_conv_res_q4_nt_snap_k<2><<<dim3((n_embd + 31) / 32), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, conv_w, hist, snap, add_src, block_dst, out, n_embd, q_dim);
+        return 0;
+    }
     return 1;
 }
 
@@ -1079,6 +1087,10 @@ extern "C" int ink_qkvrg_gemm_sudot4(hipStream_t s, const uint8_t* wq, const uin
         return ink_qkvrg_q4_b1(s, wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, Xq0, Xq1, Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
     }
     int total_rows = q_dim + kv_dim + kv_dim + r_dim + q_dim + n_head + 2 * dyn_dim;
+    if (is_q4 && B == 16) {
+        qkvrg_q4_nt_k<16><<<dim3((total_rows + 31) / 32), dim3(256), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
+        return 0;
+    }
     if (is_q4 && B == 8) {
         qkvrg_q4_nt_k<8><<<dim3((total_rows + 31) / 32), dim3(256), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
         return 0;
@@ -1089,6 +1101,14 @@ extern "C" int ink_qkvrg_gemm_sudot4(hipStream_t s, const uint8_t* wq, const uin
     }
     if (is_q4 && B == 4) {
         qkvrg_q4_nt_k<4><<<dim3((total_rows + 31) / 32), dim3(256), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
+        return 0;
+    }
+    if (is_q4 && B == 3) {
+        qkvrg_q4_nt_k<3><<<dim3((total_rows + 31) / 32), dim3(256), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
+        return 0;
+    }
+    if (is_q4 && B == 2) {
+        qkvrg_q4_nt_k<2><<<dim3((total_rows + 31) / 32), dim3(256), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim);
         return 0;
     }
     qkvrg_gemm_sudot4_k<<<dim3((total_rows + 3) / 4, (B + 7) / 8), dim3(128), 0, s>>>(wq, wk, wv, wr, wg, wsink, wkdyn, wvdyn, (const q8_1_blk*)Xq0, (const q8_1_blk*)Xq1, (const q8_1_blk*)Xq2, X0, X1, X2, Q, K, V, R, G, S, Kdyn, Vdyn, k, q_dim, kv_dim, r_dim, n_head, dyn_dim, B, is_q4);

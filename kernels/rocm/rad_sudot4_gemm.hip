@@ -1057,6 +1057,115 @@ __global__ void gemm_q8_0_sudot4_nt8_k(const uint8_t* __restrict__ W,
 }
 
 
+template <int NT>
+__global__ void gemm_q8_soa_sudot4_nt8_k(const uint8_t* __restrict__ W,
+                                         const q8_1_blk* __restrict__ Xq,
+                                         float* __restrict__ Y,
+                                         int n, int k) {
+    int grp = threadIdx.x >> 3;
+    int lane8 = threadIdx.x & 7;
+    int row = blockIdx.x * 32 + grp;
+    if (row >= n) return;
+    int nblk = k >> 5;
+    size_t rbytes = q8_soa_row_bytes(nblk);
+    const uint8_t* wrow = W + (size_t)row * rbytes;
+    const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
+    const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 32);
+    float acc[NT];
+#pragma unroll
+    for (int m = 0; m < NT; ++m) acc[m] = 0.0f;
+    for (int b = lane8; b < nblk; b += 8) {
+        uint4 qa = qrow[b * 2];
+        uint4 qb = qrow[b * 2 + 1];
+        float dw = __half2float(drow[b]);
+        int32_t w0 = (int32_t)qa.x, w1 = (int32_t)qa.y, w2 = (int32_t)qa.z, w3 = (int32_t)qa.w;
+        int32_t w4 = (int32_t)qb.x, w5 = (int32_t)qb.y, w6 = (int32_t)qb.z, w7 = (int32_t)qb.w;
+#pragma unroll
+        for (int m = 0; m < NT; ++m) {
+            const q8_1_blk& xb = Xq[(size_t)m * nblk + b];
+            int32_t sumi = 0;
+            sumi = __builtin_amdgcn_sudot4(true, w0, true, xb.q[0], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w1, true, xb.q[1], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w2, true, xb.q[2], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w3, true, xb.q[3], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w4, true, xb.q[4], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w5, true, xb.q[5], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w6, true, xb.q[6], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w7, true, xb.q[7], sumi, false);
+            acc[m] = fmaf(dw * xb.d, (float)sumi, acc[m]);
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < NT; ++m) {
+        float v = s_warp_sum8(acc[m]);
+        if (lane8 == 0) Y[(size_t)m * n + row] = v;
+    }
+}
+
+
+extern "C" __global__ void gemm_q8_soa_sudot4_k(const uint8_t* __restrict__ W,
+                                                const q8_1_blk* __restrict__ Xq,
+                                                float* __restrict__ Y,
+                                                int n, int k, int B) {
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * 8 + warp;
+    if (row >= n) return;
+    int t0 = blockIdx.y * 8;
+    int n_t = min(8, B - t0);
+    if (n_t <= 0) return;
+    int nblk = k >> 5;
+    size_t rbytes = q8_soa_row_bytes(nblk);
+    const uint8_t* wrow = W + (size_t)row * rbytes;
+    const uint4* qrow = reinterpret_cast<const uint4*>(wrow);
+    const __half* drow = reinterpret_cast<const __half*>(wrow + (size_t)nblk * 32);
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int b = lane; b < nblk; b += 32) {
+        uint4 qa = qrow[b * 2];
+        uint4 qb = qrow[b * 2 + 1];
+        float dw = __half2float(drow[b]);
+        int32_t w0 = (int32_t)qa.x, w1 = (int32_t)qa.y, w2 = (int32_t)qa.z, w3 = (int32_t)qa.w;
+        int32_t w4 = (int32_t)qb.x, w5 = (int32_t)qb.y, w6 = (int32_t)qb.z, w7 = (int32_t)qb.w;
+        for (int m = 0; m < n_t; ++m) {
+            const q8_1_blk& xb = Xq[(size_t)(t0 + m) * nblk + b];
+            int32_t sumi = 0;
+            sumi = __builtin_amdgcn_sudot4(true, w0, true, xb.q[0], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w1, true, xb.q[1], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w2, true, xb.q[2], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w3, true, xb.q[3], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w4, true, xb.q[4], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w5, true, xb.q[5], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w6, true, xb.q[6], sumi, false);
+            sumi = __builtin_amdgcn_sudot4(true, w7, true, xb.q[7], sumi, false);
+            acc[m] = fmaf(dw * xb.d, (float)sumi, acc[m]);
+        }
+    }
+    for (int m = 0; m < n_t; ++m) {
+        float v = s_warp_sum32(acc[m]);
+        if (lane == 0) Y[(size_t)(t0 + m) * n + row] = v;
+    }
+}
+
+
+extern "C" int ink_gemm_q8_soa_sudot4(hipStream_t s, const uint8_t* W, const void* Xq, float* Y, int n, int k, int B) {
+    bool use8 = (((k >> 5) & 31) != 0) && (((k >> 5) & 7) == 0);
+    if (use8) {
+        if (B == 16) { gemm_q8_soa_sudot4_nt8_k<16><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k); return 0; }
+        if (B == 15) { gemm_q8_soa_sudot4_nt8_k<15><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k); return 0; }
+        if (B == 8) { gemm_q8_soa_sudot4_nt8_k<8><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k); return 0; }
+        if (B == 7) { gemm_q8_soa_sudot4_nt8_k<7><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k); return 0; }
+        if (B == 6) { gemm_q8_soa_sudot4_nt8_k<6><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k); return 0; }
+        if (B == 5) { gemm_q8_soa_sudot4_nt8_k<5><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k); return 0; }
+        if (B == 4) { gemm_q8_soa_sudot4_nt8_k<4><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k); return 0; }
+        if (B == 3) { gemm_q8_soa_sudot4_nt8_k<3><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k); return 0; }
+        if (B == 2) { gemm_q8_soa_sudot4_nt8_k<2><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k); return 0; }
+        if (B == 1) { gemm_q8_soa_sudot4_nt8_k<1><<<dim3((n + 31) / 32, 1), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k); return 0; }
+    }
+    gemm_q8_soa_sudot4_k<<<dim3((n + 7) / 8, (B + 7) / 8), dim3(256), 0, s>>>(W, (const q8_1_blk*)Xq, Y, n, k, B);
+    return 0;
+}
+
+
 extern "C" int ink_gemm_q8_0_sudot4(hipStream_t s, const uint8_t* W, const void* Xq, float* Y, int n, int k, int B) {
     bool use8 = (((k >> 5) & 31) != 0) && (((k >> 5) & 7) == 0);
     if (use8) {

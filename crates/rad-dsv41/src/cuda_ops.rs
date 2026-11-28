@@ -291,6 +291,7 @@ extern "C" {
         stream: CudaStream,
     );
 
+    #[allow(dead_code)]
     pub fn rad_cuda_markov_argmax_f16(
         logits_row: *const c_void,
         markov_head: *const c_void,
@@ -469,6 +470,20 @@ extern "C" {
         out_id: *mut c_void,
         m: i32,
         n: i32,
+        stream: CudaStream,
+    );
+
+    pub fn rad_cuda_markov_argmax_conf_f16(
+        logits_row: *const c_void,
+        markov_head: *const c_void,
+        markov_embed: *const c_void,
+        prev_tok: i32,
+        blk_vals: *mut c_void,
+        blk_ids: *mut c_void,
+        out_val: *mut c_void,
+        out_id: *mut c_void,
+        vocab_local: i32,
+        rank: i32,
         stream: CudaStream,
     );
 }

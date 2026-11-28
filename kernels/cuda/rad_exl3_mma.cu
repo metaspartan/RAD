@@ -1734,6 +1734,16 @@ void rad_cuda_exl3_moe_mma_f16(
         if (split_k > 1) {
             cudaMemsetAsync(z_scratch_f32, 0, (size_t)pairs * N * sizeof(float), stream);
         }
+#define EXL3_DISPATCH_BITS(FN, GRID, ...) \
+    switch (bits) { \
+        case 2: FN<2><<<GRID, 256, 0, stream>>>(__VA_ARGS__); break; \
+        case 3: FN<3><<<GRID, 256, 0, stream>>>(__VA_ARGS__); break; \
+        case 4: FN<4><<<GRID, 256, 0, stream>>>(__VA_ARGS__); break; \
+        case 5: FN<5><<<GRID, 256, 0, stream>>>(__VA_ARGS__); break; \
+        case 6: FN<6><<<GRID, 256, 0, stream>>>(__VA_ARGS__); break; \
+        case 8: FN<8><<<GRID, 256, 0, stream>>>(__VA_ARGS__); break; \
+    }
+
         dim3 grid(n_blocks, max_groups, split_k);
         if (use_m64) {
             int x_is_sorted = 0;
@@ -1748,26 +1758,10 @@ void rad_cuda_exl3_moe_mma_f16(
             }
             int y_is_sorted = (split_k == 1 && !x_per_expert) ? 1 : 0;
             half* fused_y = (split_k == 1) ? y_out : nullptr;
-            switch (bits) {
-                case 2: exl3_moe_mma_grouped_m64_prerot_k<2><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit, x_is_sorted, y_is_sorted); break;
-                case 3: exl3_moe_mma_grouped_m64_prerot_k<3><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit, x_is_sorted, y_is_sorted); break;
-                case 4: exl3_moe_mma_grouped_m64_prerot_k<4><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit, x_is_sorted, y_is_sorted); break;
-                case 5: exl3_moe_mma_grouped_m64_prerot_k<5><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit, x_is_sorted, y_is_sorted); break;
-                case 6: exl3_moe_mma_grouped_m64_prerot_k<6><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit, x_is_sorted, y_is_sorted); break;
-                case 8: exl3_moe_mma_grouped_m64_prerot_k<8><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit, x_is_sorted, y_is_sorted); break;
-            }
-            if (split_k == 1) {
-                return;
-            }
+            EXL3_DISPATCH_BITS(exl3_moe_mma_grouped_m64_prerot_k, grid, x_rot_scratch, trellis_ptrs, svh_ptrs, next_suh_ptrs, gate_in, fused_y, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, K, N, split_k, wht_scale, swiglu_limit, x_is_sorted, y_is_sorted);
+            if (split_k == 1) return;
         } else {
-            switch (bits) {
-                case 2: exl3_moe_mma_grouped_m16_mul1_k<2><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
-                case 3: exl3_moe_mma_grouped_m16_mul1_k<3><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
-                case 4: exl3_moe_mma_grouped_m16_mul1_k<4><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
-                case 5: exl3_moe_mma_grouped_m16_mul1_k<5><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
-                case 6: exl3_moe_mma_grouped_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
-                case 8: exl3_moe_mma_grouped_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert); break;
-            }
+            EXL3_DISPATCH_BITS(exl3_moe_mma_grouped_m16_mul1_k, grid, x_in, trellis_ptrs, suh_ptrs, d_sorted, d_eids, d_offs, d_lens, d_ng, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert);
         }
         dim3 post_grid((n_blocks + 3) / 4, pairs);
         moe_wht128_post_f32_to_f16_k<<<post_grid, 128, 0, stream>>>(z_scratch_f32, svh_ptrs, use_m64 ? next_suh_ptrs : nullptr, expert_ids, gate_in, y_out, N, wht_scale, swiglu_limit, expert_start, n_local_experts);
@@ -1780,14 +1774,7 @@ void rad_cuda_exl3_moe_mma_f16(
         cudaMemsetAsync(z_scratch_f32, 0, (size_t)pairs * N * sizeof(float), stream);
     }
     dim3 grid(n_blocks, pairs, split_k);
-    switch (bits) {
-        case 2: exl3_moe_mma_m16_mul1_k<2><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, expert_ids, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert, expert_start, n_local_experts); break;
-        case 3: exl3_moe_mma_m16_mul1_k<3><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, expert_ids, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert, expert_start, n_local_experts); break;
-        case 4: exl3_moe_mma_m16_mul1_k<4><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, expert_ids, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert, expert_start, n_local_experts); break;
-        case 5: exl3_moe_mma_m16_mul1_k<5><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, expert_ids, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert, expert_start, n_local_experts); break;
-        case 6: exl3_moe_mma_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, expert_ids, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert, expert_start, n_local_experts); break;
-        case 8: exl3_moe_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, expert_ids, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert, expert_start, n_local_experts); break;
-    }
+    EXL3_DISPATCH_BITS(exl3_moe_mma_m16_mul1_k, grid, x_in, trellis_ptrs, suh_ptrs, expert_ids, z_scratch_f32, top_k, K, N, split_k, wht_scale, x_per_expert, expert_start, n_local_experts);
     dim3 post_grid((n_blocks + 3) / 4, pairs);
     moe_wht128_post_f32_to_f16_k<<<post_grid, 128, 0, stream>>>(z_scratch_f32, svh_ptrs, nullptr, expert_ids, gate_in, y_out, N, wht_scale, swiglu_limit, expert_start, n_local_experts);
 }
@@ -1826,33 +1813,12 @@ void rad_cuda_exl3_batched_group_mma_f16(
             x_in, suh_ptrs, x_rot_scratch, G, K, wht_scale
         );
         half* fused_y = (split_k == 1) ? y_out : nullptr;
-        switch (bits) {
-            case 2: exl3_batched_group_mma_m64_prerot_k<2><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 3: exl3_batched_group_mma_m64_prerot_k<3><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 4: exl3_batched_group_mma_m64_prerot_k<4><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 5: exl3_batched_group_mma_m64_prerot_k<5><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 6: exl3_batched_group_mma_m64_prerot_k<6><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 8: exl3_batched_group_mma_m64_prerot_k<8><<<grid, 256, 0, stream>>>(x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-        }
+        EXL3_DISPATCH_BITS(exl3_batched_group_mma_m64_prerot_k, grid, x_rot_scratch, trellis_ptrs, svh_ptrs, fused_y, z_scratch_f32, M, G, K, N, split_k, wht_scale);
         if (split_k == 1) return;
     } else if (use_m64) {
-        switch (bits) {
-            case 2: exl3_batched_group_mma_m64_mul1_k<2><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 3: exl3_batched_group_mma_m64_mul1_k<3><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 4: exl3_batched_group_mma_m64_mul1_k<4><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 5: exl3_batched_group_mma_m64_mul1_k<5><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 6: exl3_batched_group_mma_m64_mul1_k<6><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 8: exl3_batched_group_mma_m64_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-        }
+        EXL3_DISPATCH_BITS(exl3_batched_group_mma_m64_mul1_k, grid, x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale);
     } else {
-        switch (bits) {
-            case 2: exl3_batched_group_mma_m16_mul1_k<2><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 3: exl3_batched_group_mma_m16_mul1_k<3><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 4: exl3_batched_group_mma_m16_mul1_k<4><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 5: exl3_batched_group_mma_m16_mul1_k<5><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 6: exl3_batched_group_mma_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-            case 8: exl3_batched_group_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale); break;
-        }
+        EXL3_DISPATCH_BITS(exl3_batched_group_mma_m16_mul1_k, grid, x_in, trellis_ptrs, suh_ptrs, z_scratch_f32, M, G, K, N, split_k, wht_scale);
     }
     dim3 post_grid((n_blocks + 3) / 4, M * G);
     batched_group_wht128_post_f32_to_f16_k<<<post_grid, 128, 0, stream>>>(z_scratch_f32, svh_ptrs, y_out, G, N, wht_scale);
@@ -1888,24 +1854,10 @@ void rad_cuda_exl3_mma_f16(
     dim3 grid(n_blocks, m_blocks, split_k);
     if (use_m64) {
         half* fused_y = (split_k == 1) ? y : nullptr;
-        switch (bits) {
-            case 2: exl3_mma_m64_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
-            case 3: exl3_mma_m64_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
-            case 4: exl3_mma_m64_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
-            case 5: exl3_mma_m64_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
-            case 6: exl3_mma_m64_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
-            case 8: exl3_mma_m64_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, nullptr, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y); break;
-        }
+        EXL3_DISPATCH_BITS(exl3_mma_m64_mul1_k, grid, x_rot, trellis, svh, nullptr, nullptr, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, 0.0f, add_to_y);
         if (split_k == 1) return;
     } else {
-        switch (bits) {
-            case 2: exl3_mma_m16_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 3: exl3_mma_m16_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 4: exl3_mma_m16_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 5: exl3_mma_m16_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 6: exl3_mma_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 8: exl3_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-        }
+        EXL3_DISPATCH_BITS(exl3_mma_m16_mul1_k, grid, x_rot, trellis, z_scratch_f32, M, K, N, split_k);
     }
     dim3 post_grid((n_blocks + 3) / 4, M);
     mma_wht128_post_f32_to_f16_k<<<post_grid, 128, 0, stream>>>(z_scratch_f32, svh, nullptr, nullptr, y, N, wht_scale, 0.0f, add_to_y);
@@ -1943,24 +1895,10 @@ void rad_cuda_exl3_mma_swiglu_f16(
     dim3 grid(n_blocks, m_blocks, split_k);
     if (use_m64) {
         half* fused_y = (split_k == 1) ? y : nullptr;
-        switch (bits) {
-            case 2: exl3_mma_m64_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, next_suh, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
-            case 3: exl3_mma_m64_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, next_suh, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
-            case 4: exl3_mma_m64_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, next_suh, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
-            case 5: exl3_mma_m64_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, next_suh, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
-            case 6: exl3_mma_m64_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, next_suh, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
-            case 8: exl3_mma_m64_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, svh, gate_in, next_suh, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0); break;
-        }
+        EXL3_DISPATCH_BITS(exl3_mma_m64_mul1_k, grid, x_rot, trellis, svh, gate_in, next_suh, fused_y, z_scratch_f32, M, K, N, split_k, wht_scale, swiglu_limit, 0);
         if (split_k == 1) return;
     } else {
-        switch (bits) {
-            case 2: exl3_mma_m16_mul1_k<2><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 3: exl3_mma_m16_mul1_k<3><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 4: exl3_mma_m16_mul1_k<4><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 5: exl3_mma_m16_mul1_k<5><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 6: exl3_mma_m16_mul1_k<6><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-            case 8: exl3_mma_m16_mul1_k<8><<<grid, 256, 0, stream>>>(x_rot, trellis, z_scratch_f32, M, K, N, split_k); break;
-        }
+        EXL3_DISPATCH_BITS(exl3_mma_m16_mul1_k, grid, x_rot, trellis, z_scratch_f32, M, K, N, split_k);
     }
     dim3 post_grid((n_blocks + 3) / 4, M);
     mma_wht128_post_f32_to_f16_k<<<post_grid, 128, 0, stream>>>(z_scratch_f32, svh, gate_in, next_suh, y, N, wht_scale, swiglu_limit, 0);

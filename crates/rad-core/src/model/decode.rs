@@ -823,7 +823,7 @@ impl InklingEngine {
             std::ptr::null_mut()
         };
         let ap_snap = if b <= self.multi_verify_cap.min(512) { sl.attn_post_snap.ptr as *mut f32 } else { std::ptr::null_mut() };
-        if l.wo.ty == WeightType::Q4_0 && (b == 4 || b == 6 || b == 8) {
+        if l.wo.ty == WeightType::Q4_0 && (b == 2 || b == 3 || b == 4 || b == 6 || b == 8) {
             ops::ink_wo_conv_res_q4_batch_snap(s, l.wo.buf.ptr as *const u8, self.bsc.xq.ptr, l.attn_post_conv.ptr as *const f32, sl.attn_post_hist.ptr as *mut f32, ap_snap, cur, block_dst, ffn_inp, e, q_dim, bi);
         } else {
             match l.wo.ty {

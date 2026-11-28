@@ -63,6 +63,7 @@ extern "C" {
     pub fn ink_dspark_add_bias(s: HipStream, hidden_i: *const f32, delta: *const f32, bias: *const f32, out: *mut f32, n_embd: i32) -> i32;
     pub fn ink_quantize_q8_1(s: HipStream, x: *const f32, y: *mut core::ffi::c_void, k: i32, b: i32) -> i32;
     pub fn ink_gemm_q8_0_sudot4(s: HipStream, w: *const u8, xq: *const core::ffi::c_void, y: *mut f32, n: i32, k: i32, b: i32) -> i32;
+    pub fn ink_gemm_q8_soa_sudot4(s: HipStream, w: *const u8, xq: *const core::ffi::c_void, y: *mut f32, n: i32, k: i32, b: i32) -> i32;
     pub fn ink_gemm_q4_0_sudot4(s: HipStream, w: *const u8, xq: *const core::ffi::c_void, y: *mut f32, n: i32, k: i32, b: i32) -> i32;
     pub fn ink_moe_build_groups(s: HipStream, itop: *const i32, wtop: *const f32, scales: *const f32, exp_counts: *mut i32, exp_offsets: *mut i32, tok_sorted: *mut i32, slot_sorted: *mut i32, wt_sorted: *mut f32, n_used: i32, b: i32) -> i32;
     pub fn ink_moe_gu_nvfp4_sudot4(s: HipStream, w: *const u8, scales: *const f32, xq: *const core::ffi::c_void, exp_counts: *const i32, exp_offsets: *const i32, tok_sorted: *const i32, slot_sorted: *const i32, act_out: *mut f32, n_ff: i32, k: i32, n_used: i32, beta: f32, lb: f32) -> i32;
@@ -113,6 +114,7 @@ extern "C" {
     pub fn ink_attn_batch_gated_q8(s: HipStream, q: *const f32, r: *const f32, sinks: *const f32, rel_bias: *const f32, kc: *const u16, vc: *const u16, gate: *const f32, d_pos0: *const i32, out_q8: *mut core::ffi::c_void, n_head: i32, n_head_kv: i32, dh: i32, d_rel: i32, rel_extent: i32, swa_window: i32, is_swa: i32, max_ctx: i32, b: i32) -> i32;
     pub fn ink_bf16_to_q4_0(s: HipStream, src: *const u16, dst: *mut u8, n_rows: usize, nblk: i32) -> i32;
     pub fn ink_bf16_to_q8_0(s: HipStream, src: *const u16, dst: *mut u8, n_rows: usize, nblk: i32) -> i32;
+    pub fn ink_bf16_to_q8_soa(s: HipStream, src: *const u16, dst: *mut u8, n_rows: usize, nblk: i32) -> i32;
     pub fn ink_bf16_to_f32(s: HipStream, src: *const u16, dst: *mut f32, n: usize) -> i32;
     pub fn ink_dflash2_conv(s: HipStream, hidden: *const f32, dynamic: *const f32, base_kernel: *const f32, out: *mut f32, n_embd: i32, block_size: i32, group_size: i32, side: i32, n_tokens: i32) -> i32;
     pub fn ink_dflash2_conv_q8(s: HipStream, hidden: *const f32, dynamic: *const f32, base_kernel: *const f32, out_q8: *mut core::ffi::c_void, n_embd: i32, block_size: i32, group_size: i32, side: i32, n_tokens: i32) -> i32;
@@ -129,7 +131,7 @@ extern "C" {
     pub fn ink_dflash2_gu_swiglu_q8(s: HipStream, wg: *const u8, wu: *const u8, xq: *const core::ffi::c_void, out_q8: *mut core::ffi::c_void, n_ff: i32, k_dim: i32, b: i32) -> i32;
     pub fn ink_dflash2_proj_conv_add_q4(s: HipStream, w: *const u8, xq: *const core::ffi::c_void, dynamic: *const f32, base_kernel: *const f32, x_inout: *mut f32, n_embd: i32, k_dim: i32, group_size: i32, side: i32, b: i32) -> i32;
     pub fn ink_dflash2_topk16(s: HipStream, logits: *const f32, cand_ids: *mut i32, cand_vals: *mut f32, vocab_padded: i32, vocab_unpadded: i32, n_rows: i32) -> i32;
-    pub fn ink_dflash2_select_path(s: HipStream, cand_ids: *const i32, cand_vals: *const f32, h_proj: *const f32, pred_cb: *const u16, succ_cb: *const u16, d_draft_toks: *mut i32, n_users: i32, k_len: i32, rank: i32, softcap: f32) -> i32;
+    pub fn ink_dflash2_select_path(s: HipStream, cand_ids: *const i32, cand_vals: *const f32, h_proj: *const f32, pred_cb: *const u16, succ_cb: *const u16, d_draft_toks: *mut i32, d_best_b: *mut i32, n_users: i32, k_len: i32, rank: i32, softcap: f32, evict_alpha: f32) -> i32;
     pub fn ink_gather_dspark_feats_batch(s: HipStream, bsc_feats: *const f32, dst: *mut f32, start_tok: i32, max_batch: i32, n_embd: i32, n_tok: i32) -> i32;
     pub fn ink_dflash2_rope_norm_ctx_batch(s: HipStream, k_in: *const f32, v_in: *const f32, k_norm_w: *const f32, kc: *mut u16, vc: *mut u16, pos0: i32, max_ctx: i32, n_head_kv: i32, dh: i32, freq_base: f32, is_swa: i32, n_tok: i32) -> i32;
     pub fn ink_dflash2_rope_norm_ctx_batch_dpos(s: HipStream, k_in: *const f32, v_in: *const f32, k_norm_w: *const f32, kc: *mut u16, vc: *mut u16, d_pos0: *const i32, max_ctx: i32, n_head_kv: i32, dh: i32, freq_base: f32, is_swa: i32, n_tok: i32) -> i32;

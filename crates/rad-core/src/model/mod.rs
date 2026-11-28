@@ -18,6 +18,7 @@ pub enum WeightType {
     F32,
     Bf16,
     Q8_0,
+    Q8_0Soa,
     Q4_0,
     Nvfp4,
 }
@@ -114,7 +115,7 @@ impl DevWeight {
             WeightType::Bf16 => {
                 ops::ink_gemv_bf16(s, self.buf.ptr as *const u16, x, y, self.n, self.k);
             }
-            WeightType::Q8_0 => {
+            WeightType::Q8_0 | WeightType::Q8_0Soa => {
                 ops::ink_gemv_q8_0(s, self.buf.ptr as *const u8, x, y, self.n, self.k);
             }
             WeightType::Q4_0 => {

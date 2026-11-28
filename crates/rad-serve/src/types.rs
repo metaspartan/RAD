@@ -140,9 +140,9 @@ impl Drafter {
             Drafter::DFlash2(d) => {
                 let k = k_len.min(d.block_size);
                 let s = d.stream();
-                let mut draft = vec![0i32; k];
-                let d_ptr = d.draft_enqueue_on(seq, anchor_tok, engine, k, s)?;
-                let verified = engine.verify_batch_seq_from_dev(seq, d_ptr, k, s, &mut draft)?;
+                let (d_ptr, verify_b) = d.draft_enqueue_evict_on(seq, anchor_tok, engine, k, s)?;
+                let mut draft = vec![0i32; verify_b];
+                let verified = engine.verify_batch_seq_from_dev(seq, d_ptr, verify_b, s, &mut draft)?;
                 Ok((draft, verified))
             }
             Drafter::Dspark(d) => {

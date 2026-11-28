@@ -39,15 +39,16 @@ fn load_st_linear_q8(st: &SafetensorsFile, name: &str) -> Result<DevWeight> {
     let n = t.shape[0];
     let k = t.shape[1];
     let nblk = k / 32;
+    let rbytes = nblk * 32 + ((nblk * 2 + 15) & !15);
     let mut src = DevBuf::new(bytes.len()).map_err(he)?;
     src.copy_from(bytes, None).map_err(he)?;
-    let dst = DevBuf::new(n * nblk * 34).map_err(he)?;
+    let dst = DevBuf::new(n * rbytes).map_err(he)?;
     unsafe {
-        ops::ink_bf16_to_q8_0(std::ptr::null_mut(), src.ptr as *const u16, dst.ptr as *mut u8, n, nblk as i32);
+        ops::ink_bf16_to_q8_soa(std::ptr::null_mut(), src.ptr as *const u16, dst.ptr as *mut u8, n, nblk as i32);
         rad_hip::hipStreamSynchronize(std::ptr::null_mut());
     }
     drop(src);
-    Ok(DevWeight { buf: dst, ty: WeightType::Q8_0, n: n as i32, k: k as i32 })
+    Ok(DevWeight { buf: dst, ty: WeightType::Q8_0Soa, n: n as i32, k: k as i32 })
 }
 
 fn load_st_linear(st: &SafetensorsFile, name: &str, to_q4: bool) -> Result<DevWeight> {
@@ -151,6 +152,9 @@ pub struct DFlash2Drafter {
     cand_ids: DevBuf,
     cand_vals: DevBuf,
     d_draft_toks: DevBuf,
+    d_best_b: DevBuf,
+    h_best_b_pinned: rad_hip::PinnedBuf,
+    evict_alpha: f32,
     d_pos: DevBuf,
     d_inj_pos0: DevBuf,
     d_ctx_len: DevBuf,
@@ -305,6 +309,9 @@ impl DFlash2Drafter {
             cand_ids: DevBuf::new(max_seqs * (kmax - 1) * 16 * 4).map_err(he)?,
             cand_vals: DevBuf::new(max_seqs * (kmax - 1) * 16 * 4).map_err(he)?,
             d_draft_toks: DevBuf::new(max_seqs * kmax * 4).map_err(he)?,
+            d_best_b: DevBuf::new(16).map_err(he)?,
+            h_best_b_pinned: rad_hip::PinnedBuf::new(64).map_err(he)?,
+            evict_alpha: std::env::var("RAD_EVICT_ALPHA").ok().and_then(|s| s.parse().ok()).unwrap_or(0.88f32),
             d_pos: DevBuf::new(max_seqs * 4).map_err(he)?,
             d_inj_pos0: DevBuf::new(4).map_err(he)?,
             d_ctx_len: DevBuf::new(max_seqs * 4).map_err(he)?,
@@ -341,6 +348,9 @@ impl DFlash2Drafter {
             }
             WeightType::Bf16 => {
                 ops::ink_gemm_bf16(s, w.buf.ptr as *const u16, x_f32, y, n, k, b);
+            }
+            WeightType::Q8_0Soa => {
+                ops::ink_gemm_q8_soa_sudot4(s, w.buf.ptr as *const u8, xq, y, n, k, b);
             }
             _ => {
                 ops::ink_gemm_q8_0_sudot4(s, w.buf.ptr as *const u8, xq, y, n, k, b);
@@ -789,10 +799,12 @@ impl DFlash2Drafter {
             self.sel_pred_cb.ptr as *const u16,
             self.sel_succ_cb.ptr as *const u16,
             self.d_draft_toks.ptr as *mut i32,
+            if n_users == 1 { self.d_best_b.ptr as *mut i32 } else { std::ptr::null_mut() },
             n_users as i32,
             k_len as i32,
             self.selector_rank as i32,
             self.final_softcap,
+            if n_users == 1 { self.evict_alpha } else { 0.0f32 },
         );
     }
 
@@ -904,6 +916,39 @@ impl DFlash2Drafter {
             g.launch_on(stream).map_err(he)?;
         }
         Ok(self.d_draft_toks.ptr as *const core::ffi::c_void)
+    }
+
+    pub fn draft_enqueue_evict_on(
+        &mut self,
+        seq: usize,
+        anchor_tok: i32,
+        target: &InklingEngine,
+        k_len: usize,
+        stream: HipStream,
+    ) -> Result<(*const core::ffi::c_void, usize)> {
+        let k = k_len.min(self.block_size);
+        let d_ptr = self.draft_enqueue_on(seq, anchor_tok, target, k, stream)?;
+        if self.evict_alpha > 0.0f32 && k == 8 {
+            let pin = self.h_best_b_pinned.ptr as *mut i32;
+            let rc = unsafe {
+                let r = rad_hip::hipMemcpyAsync(
+                    pin as *mut core::ffi::c_void,
+                    self.d_best_b.ptr,
+                    4,
+                    rad_hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                    stream,
+                );
+                let s = rad_hip::hipStreamSynchronize(stream);
+                if r != rad_hip::HIP_SUCCESS { r } else { s }
+            };
+            if rc != rad_hip::HIP_SUCCESS {
+                return Err(he(rc));
+            }
+            let b = unsafe { *pin } as usize;
+            let verify_b = if b == 2 || b == 3 || b == 4 || b == 6 || b == 8 { b } else { k };
+            return Ok((d_ptr, verify_b));
+        }
+        Ok((d_ptr, k))
     }
 
     pub fn draft(&mut self, anchor_tok: i32, target: &InklingEngine, k_len: usize) -> Result<Vec<i32>> {

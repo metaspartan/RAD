@@ -888,7 +888,7 @@ impl Dsv41Engine {
         }
         let rdma_ptrs = comm.rdma_ptrs();
         let branch_dst = rdma_ptrs.map(|(s, _)| s).unwrap_or(self.d_branch_out.ptr);
-        let use_graph = (m == 1 || m == 6 || m == 16 || m == 32 || m == 64 || m == 128 || m == 512 || m == 1024 || m == 2048) && rdma_ptrs.is_some();
+        let use_graph = (m == 1 || m == 2 || m == 6 || m == 16 || m == 32 || m == 64 || m == 128 || m == 512 || m == 1024 || m == 2048) && rdma_ptrs.is_some();
         let d_sp_ptr = self.d_start_pos.ptr as *const i32;
 
         for l in 0..self.layers.len() {
@@ -1078,7 +1078,7 @@ impl Dsv41Engine {
         let d = tc.hidden_size;
         let stream: CudaStream = std::ptr::null_mut();
         let has_mtp = self.mtp.is_some();
-        let use_head_graph = (m == 1 || m == 6 || m == 16 || m == 32 || m == 64 || m == 128 || m == 512)
+        let use_head_graph = (m == 1 || m == 2 || m == 6 || m == 16 || m == 32 || m == 64 || m == 128 || m == 512)
             && self.engram_layers.is_empty()
             && comm.rdma_ptrs().is_some();
         if use_head_graph {
@@ -1364,9 +1364,18 @@ impl Dsv41Engine {
         let m_rank = tc.dspark_markov_rank.max(1) as i32;
         let offset = (self.rank * v_local) as i32;
         let mut out = Vec::with_capacity(n_blk * blk + 1);
+        let mut probs = Vec::with_capacity(n_blk * blk);
         out.push(anchor);
+        let evict_alpha = std::env::var("RAD_SPARK_EVICT_ALPHA")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1.0f32);
+        let mut p_cum = 1.0f32;
 
         for b_idx in 0..n_blk {
+            if b_idx > 0 && (evict_alpha <= 0.0f32 || p_cum < 0.45f32) {
+                break;
+            }
             let start_pos = (self.pos + b_idx * blk) as i32;
             unsafe {
                 *(self.d_start_pos.ptr as *mut i32) = start_pos;
@@ -1554,7 +1563,7 @@ impl Dsv41Engine {
                 let prev_tok = *out.last().unwrap();
                 unsafe {
                     let row_ptr = (self.d_logits.ptr as *const u8).add(i * v_local * 2) as *const c_void;
-                    cuda_ops::rad_cuda_markov_argmax_f16(
+                    cuda_ops::rad_cuda_markov_argmax_conf_f16(
                         row_ptr,
                         mtp.markov_head.ptr,
                         mtp.markov_embed.ptr,
@@ -1569,12 +1578,42 @@ impl Dsv41Engine {
                     );
                 }
                 rad_cuda::sync_device().map_err(CudaFail)?;
-                let mut bval = [self.d_best_val.as_f32_slice()[0]];
-                let mut bid = [unsafe { *(self.d_best_id.ptr as *const i32) }];
-                bid[0] += offset;
-                comm.all_reduce_argmax(&mut bval, &mut bid)?;
-                out.push(bid[0]);
+                let bvs = self.d_best_val.as_f32_slice();
+                let mut bval = bvs[0];
+                let sum_exp = bvs[1];
+                let mut bid = unsafe { *(self.d_best_id.ptr as *const i32) } + offset;
+                let p_raw = comm.all_reduce_argmax_conf(&mut bval, &mut bid, sum_exp)?;
+                let p_eff = (p_raw * evict_alpha.max(0.0f32)).min(1.0f32);
+                p_cum *= p_eff;
+                probs.push(p_eff);
+                out.push(bid);
             }
+        }
+        if evict_alpha > 0.0f32 && out.len() >= 6 {
+            let mut e_at = [1.0f32; 12];
+            let mut pc = 1.0f32;
+            let mut ee = 1.0f32;
+            for (idx, &p) in probs.iter().enumerate() {
+                pc *= p;
+                ee += pc;
+                let m_len = idx + 2;
+                if m_len < e_at.len() {
+                    e_at[m_len] = ee;
+                }
+            }
+            let cands: &[(usize, f32)] = &[(2, 43.0f32), (6, 58.0f32)];
+            let mut best_m = out.len();
+            let mut best_r = -1.0f32;
+            for &(cm, t_ms) in cands {
+                if cm <= out.len() {
+                    let r = e_at[cm] / t_ms;
+                    if r > best_r {
+                        best_r = r;
+                        best_m = cm;
+                    }
+                }
+            }
+            out.truncate(best_m);
         }
         self.mtp = Some(mtp);
         Ok(out)

@@ -1550,6 +1550,226 @@ void rad_cuda_rms_norm_bf16w_wht128_f16(
     rms_norm_bf16w_wht128_f16_k<<<M, threads, 0, stream>>>(x, norm_w, suh, y_rot, D, eps, wht_scale);
 }
 
+__global__ __launch_bounds__(256)
+void markov_argmax_conf_stage1_f16_k(
+    const half* __restrict__ logits_row,
+    const half* __restrict__ markov_head,
+    const __nv_bfloat16* __restrict__ markov_embed,
+    int prev_tok,
+    float* __restrict__ blk_vals,
+    int* __restrict__ blk_ids,
+    float* __restrict__ blk_sums,
+    int vocab_local,
+    int rank
+) {
+    __shared__ alignas(16) float s_emb[256];
+    int tid = threadIdx.x;
+    for (int i = tid; i < rank; i += 256) {
+        s_emb[i] = __bfloat162float(markov_embed[(size_t)prev_tok * rank + i]);
+    }
+    __syncthreads();
+    float best_v = -1e30f;
+    int best_i = 0;
+    float sum_e = 0.0f;
+    if ((rank & 7) == 0) {
+        int sub_id = tid >> 3;
+        int lane8 = tid & 7;
+        int r8 = rank >> 3;
+        const float4* s_emb4 = reinterpret_cast<const float4*>(s_emb);
+        for (int v = blockIdx.x * 32 + sub_id; v < vocab_local; v += gridDim.x * 32) {
+            const uint4* mh8 = reinterpret_cast<const uint4*>(markov_head + (size_t)v * rank);
+            float dot = 0.0f;
+            for (int i8 = lane8; i8 < r8; i8 += 8) {
+                uint4 wq = __ldg(mh8 + i8);
+                float2 w01 = __half22float2(*reinterpret_cast<const half2*>(&wq.x));
+                float2 w23 = __half22float2(*reinterpret_cast<const half2*>(&wq.y));
+                float2 w45 = __half22float2(*reinterpret_cast<const half2*>(&wq.z));
+                float2 w67 = __half22float2(*reinterpret_cast<const half2*>(&wq.w));
+                float4 e0 = s_emb4[i8 * 2];
+                float4 e1 = s_emb4[i8 * 2 + 1];
+                dot = fmaf(w01.x, e0.x, fmaf(w01.y, e0.y, fmaf(w23.x, e0.z, fmaf(w23.y, e0.w, dot))));
+                dot = fmaf(w45.x, e1.x, fmaf(w45.y, e1.y, fmaf(w67.x, e1.z, fmaf(w67.y, e1.w, dot))));
+            }
+            dot += __shfl_xor_sync(0xFFFFFFFFu, dot, 4);
+            dot += __shfl_xor_sync(0xFFFFFFFFu, dot, 2);
+            dot += __shfl_xor_sync(0xFFFFFFFFu, dot, 1);
+            if (lane8 == 0) {
+                float val = __half2float(__ldg(logits_row + v)) + dot;
+                if (val > best_v || (val == best_v && v < best_i)) {
+                    float d = best_v - val;
+                    sum_e = (d > -16.0f ? sum_e * exp2f(d * 1.4426950408889634f) : 0.0f) + 1.0f;
+                    best_v = val;
+                    best_i = v;
+                } else {
+                    float d = val - best_v;
+                    if (d > -16.0f) sum_e += exp2f(d * 1.4426950408889634f);
+                }
+            }
+        }
+    } else {
+        int r2 = rank >> 1;
+        for (int v = blockIdx.x * 256 + tid; v < vocab_local; v += gridDim.x * 256) {
+            const half2* mh2 = reinterpret_cast<const half2*>(markov_head + (size_t)v * rank);
+            float dot = 0.0f;
+            for (int i = 0; i < r2; ++i) {
+                float2 wv = __half22float2(__ldg(mh2 + i));
+                dot = fmaf(wv.x, s_emb[2 * i], fmaf(wv.y, s_emb[2 * i + 1], dot));
+            }
+            float val = __half2float(__ldg(logits_row + v)) + dot;
+            if (val > best_v || (val == best_v && v < best_i)) {
+                float d = best_v - val;
+                sum_e = (d > -16.0f ? sum_e * exp2f(d * 1.4426950408889634f) : 0.0f) + 1.0f;
+                best_v = val;
+                best_i = v;
+            } else {
+                float d = val - best_v;
+                if (d > -16.0f) sum_e += exp2f(d * 1.4426950408889634f);
+            }
+        }
+    }
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    float wmax = best_v;
+    int wid_i = best_i;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        float ov = __shfl_xor_sync(0xFFFFFFFFu, wmax, m);
+        int oi = __shfl_xor_sync(0xFFFFFFFFu, wid_i, m);
+        if (ov > wmax || (ov == wmax && oi < wid_i)) {
+            wmax = ov; wid_i = oi;
+        }
+    }
+    float d_w = best_v - wmax;
+    float ws = (sum_e > 0.0f && d_w > -16.0f) ? (sum_e * exp2f(d_w * 1.4426950408889634f)) : 0.0f;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) ws += __shfl_xor_sync(0xFFFFFFFFu, ws, m);
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    __shared__ float ss[8];
+    if (lane == 0) {
+        sv[warp] = wmax;
+        si[warp] = wid_i;
+        ss[warp] = ws;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float bv = (lane < 8) ? sv[lane] : -1e30f;
+        int bi = (lane < 8) ? si[lane] : 0;
+        float bs = (lane < 8) ? ss[lane] : 0.0f;
+        float gm = bv;
+        int gi = bi;
+        #pragma unroll
+        for (int m = 4; m > 0; m >>= 1) {
+            float ov = __shfl_xor_sync(0xFFFFFFFFu, gm, m);
+            int oi = __shfl_xor_sync(0xFFFFFFFFu, gi, m);
+            if (ov > gm || (ov == gm && oi < gi)) {
+                gm = ov; gi = oi;
+            }
+        }
+        float d_b = bv - gm;
+        float gs = (bs > 0.0f && d_b > -16.0f) ? (bs * exp2f(d_b * 1.4426950408889634f)) : 0.0f;
+        #pragma unroll
+        for (int m = 4; m > 0; m >>= 1) gs += __shfl_xor_sync(0xFFFFFFFFu, gs, m);
+        if (lane == 0) {
+            blk_vals[blockIdx.x] = gm;
+            blk_ids[blockIdx.x] = gi;
+            blk_sums[blockIdx.x] = gs;
+        }
+    }
+}
+
+__global__ __launch_bounds__(256)
+void markov_argmax_conf_stage2_k(
+    const float* __restrict__ blk_vals,
+    const int* __restrict__ blk_ids,
+    const float* __restrict__ blk_sums,
+    float* __restrict__ out_val,
+    int* __restrict__ out_id,
+    int n_blks
+) {
+    int tid = threadIdx.x;
+    float my_v = (tid < n_blks) ? blk_vals[tid] : -1e30f;
+    int my_i = (tid < n_blks) ? blk_ids[tid] : 0;
+    float my_s = (tid < n_blks) ? blk_sums[tid] : 0.0f;
+    float bv = my_v;
+    int bi = my_i;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, m);
+        int oi = __shfl_xor_sync(0xFFFFFFFFu, bi, m);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov; bi = oi;
+        }
+    }
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    __shared__ float s_gmax;
+    __shared__ int s_gid;
+    if (lane == 0) {
+        sv[warp] = bv;
+        si[warp] = bi;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float gm = (lane < 8) ? sv[lane] : -1e30f;
+        int gi = (lane < 8) ? si[lane] : 0;
+        #pragma unroll
+        for (int m = 4; m > 0; m >>= 1) {
+            float ov = __shfl_xor_sync(0xFFFFFFFFu, gm, m);
+            int oi = __shfl_xor_sync(0xFFFFFFFFu, gi, m);
+            if (ov > gm || (ov == gm && oi < gi)) {
+                gm = ov; gi = oi;
+            }
+        }
+        if (lane == 0) {
+            s_gmax = gm;
+            s_gid = gi;
+        }
+    }
+    __syncthreads();
+    float d = my_v - s_gmax;
+    float sc = (my_s > 0.0f && d > -16.0f) ? (my_s * exp2f(d * 1.4426950408889634f)) : 0.0f;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) sc += __shfl_xor_sync(0xFFFFFFFFu, sc, m);
+    if (lane == 0) sv[warp] = sc;
+    __syncthreads();
+    if (warp == 0) {
+        float gs = (lane < 8) ? sv[lane] : 0.0f;
+        #pragma unroll
+        for (int m = 4; m > 0; m >>= 1) gs += __shfl_xor_sync(0xFFFFFFFFu, gs, m);
+        if (lane == 0) {
+            out_val[0] = s_gmax;
+            out_val[1] = gs;
+            out_id[0] = s_gid;
+        }
+    }
+}
+
+void rad_cuda_markov_argmax_conf_f16(
+    const half* logits_row,
+    const half* markov_head,
+    const __nv_bfloat16* markov_embed,
+    int prev_tok,
+    float* blk_vals,
+    int* blk_ids,
+    float* out_val,
+    int* out_id,
+    int vocab_local,
+    int rank,
+    cudaStream_t stream
+) {
+    int n_blks = (vocab_local + 255) / 256;
+    if (n_blks > 256) n_blks = 256;
+    if (n_blks < 1) n_blks = 1;
+    float* blk_sums = blk_vals + 256;
+    markov_argmax_conf_stage1_f16_k<<<n_blks, 256, 0, stream>>>(
+        logits_row, markov_head, markov_embed, prev_tok, blk_vals, blk_ids, blk_sums, vocab_local, rank
+    );
+    markov_argmax_conf_stage2_k<<<1, 256, 0, stream>>>(blk_vals, blk_ids, blk_sums, out_val, out_id, n_blks);
+}
+
 void rad_cuda_add_f16(half* dst, const half* src, int N, cudaStream_t stream) {
     add_f16_k<<<(N + 255) / 256, 256, 0, stream>>>(dst, src, N);
 }

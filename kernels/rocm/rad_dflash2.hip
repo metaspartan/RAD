@@ -233,7 +233,8 @@ extern "C" __global__ void dflash2_select_path_k(const int* __restrict__ cand_id
                                                  const uint16_t* __restrict__ pred_cb,
                                                  const uint16_t* __restrict__ succ_cb,
                                                  int* __restrict__ d_draft_toks,
-                                                 int K_len, int rank, float softcap) {
+                                                 int* __restrict__ d_best_b,
+                                                 int K_len, int rank, float softcap, float evict_alpha) {
     int tid = threadIdx.x;
     int u = blockIdx.x;
     int* out_toks = d_draft_toks + u * K_len;
@@ -244,8 +245,22 @@ extern "C" __global__ void dflash2_select_path_k(const int* __restrict__ cand_id
     __shared__ float cond_s[256];
     __shared__ float scores_s[16];
     __shared__ int prev_tok;
+    __shared__ float p_cum;
+    __shared__ float e_emit;
+    __shared__ float e2;
+    __shared__ float e3;
+    __shared__ float e4;
+    __shared__ float e6;
 
-    if (tid == 0) prev_tok = out_toks[0];
+    if (tid == 0) {
+        prev_tok = out_toks[0];
+        p_cum = 1.0f;
+        e_emit = 1.0f;
+        e2 = 1.0f;
+        e3 = 1.0f;
+        e4 = 1.0f;
+        e6 = 1.0f;
+    }
     __syncthreads();
 
     for (int slot = 1; slot < K_len; ++slot) {
@@ -291,7 +306,8 @@ extern "C" __global__ void dflash2_select_path_k(const int* __restrict__ cand_id
         __syncthreads();
 
         if (tid < 16) {
-            float bv = scores_s[tid];
+            float my_s = scores_s[tid];
+            float bv = my_s;
             int bi = tid;
 #pragma unroll
             for (int off = 8; off > 0; off >>= 1) {
@@ -302,13 +318,46 @@ extern "C" __global__ void dflash2_select_path_k(const int* __restrict__ cand_id
                     bi = oi;
                 }
             }
+            float max_s = __shfl(bv, 0, 16);
+            float se = exp2f((my_s - max_s) * 1.4426950408889634f);
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1) {
+                se += __shfl_down(se, off, 16);
+            }
             if (tid == 0) {
                 int chosen = cids[(slot - 1) * 16 + bi];
                 out_toks[slot] = chosen;
                 prev_tok = chosen;
+                if (d_best_b && u == 0 && evict_alpha > 0.0f) {
+                    float p_slot = fminf(1.0f, (1.0f / fmaxf(se, 1.0f)) * evict_alpha);
+                    p_cum *= p_slot;
+                    e_emit += p_cum;
+                    if (slot == 1) e2 = e_emit;
+                    if (slot == 2) e3 = e_emit;
+                    if (slot == 3) e4 = e_emit;
+                    if (slot == 5) e6 = e_emit;
+                }
             }
         }
         __syncthreads();
+    }
+
+    if (tid == 0 && d_best_b && u == 0) {
+        int best_b = K_len;
+        if (evict_alpha > 0.0f && K_len == 8) {
+            float r2 = e2 / 12.6f;
+            float r3 = e3 / 14.0f;
+            float r4 = e4 / 15.2f;
+            float r6 = e6 / 18.0f;
+            float r8 = e_emit / 20.4f;
+            float br = r2;
+            best_b = 2;
+            if (r3 > br) { br = r3; best_b = 3; }
+            if (r4 > br) { br = r4; best_b = 4; }
+            if (r6 > br) { br = r6; best_b = 6; }
+            if (r8 > br) { best_b = 8; }
+        }
+        d_best_b[0] = best_b;
     }
 }
 
@@ -337,6 +386,42 @@ extern "C" __global__ void bf16_to_q8_0_k(const uint16_t* __restrict__ src,
         int q = max(-127, min(127, __float2int_rn(vals[j] * inv)));
         dp[2 + j] = (uint8_t)(int8_t)q;
     }
+}
+
+extern "C" __global__ void bf16_to_q8_soa_k(const uint16_t* __restrict__ src,
+                                            uint8_t* __restrict__ dst,
+                                            size_t n_rows, int nblk) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = n_rows * (size_t)nblk;
+    if (idx >= total) return;
+    size_t row = idx / (size_t)nblk;
+    int b = (int)(idx % (size_t)nblk);
+    const uint16_t* sp = src + idx * 32;
+    size_t rbytes = (size_t)nblk * 32 + (((size_t)nblk * 2 + 15) & ~(size_t)15);
+    uint8_t* drow = dst + row * rbytes;
+    float vals[32];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        float v = df2_bf16_f32(sp[j]);
+        vals[j] = v;
+        amax = fmaxf(amax, fabsf(v));
+    }
+    float d = amax / 127.0f;
+    float inv = (d > 0.0f) ? (1.0f / d) : 0.0f;
+    reinterpret_cast<__half*>(drow + (size_t)nblk * 32)[b] = __float2half(d);
+    uint8_t* qo = drow + (size_t)b * 32;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        int q = max(-127, min(127, __float2int_rn(vals[j] * inv)));
+        qo[j] = (uint8_t)(int8_t)q;
+    }
+}
+
+extern "C" int ink_bf16_to_q8_soa(hipStream_t s, const uint16_t* src, uint8_t* dst, size_t n_rows, int nblk) {
+    size_t total = n_rows * (size_t)nblk;
+    bf16_to_q8_soa_k<<<dim3((unsigned int)((total + 255) / 256)), dim3(256), 0, s>>>(src, dst, n_rows, nblk);
+    return 0;
 }
 
 extern "C" int ink_bf16_to_q8_0(hipStream_t s, const uint16_t* src, uint8_t* dst, size_t n_rows, int nblk) {
@@ -766,8 +851,8 @@ extern "C" int ink_dflash2_rope_norm_ctx_batch_dpos(hipStream_t s, const float* 
     return 0;
 }
 
-extern "C" int ink_dflash2_select_path(hipStream_t s, const int* cand_ids, const float* cand_vals, const float* h_proj, const uint16_t* pred_cb, const uint16_t* succ_cb, int* d_draft_toks, int n_users, int K_len, int rank, float softcap) {
-    dflash2_select_path_k<<<dim3(n_users), dim3(256), 0, s>>>(cand_ids, cand_vals, h_proj, pred_cb, succ_cb, d_draft_toks, K_len, rank, softcap);
+extern "C" int ink_dflash2_select_path(hipStream_t s, const int* cand_ids, const float* cand_vals, const float* h_proj, const uint16_t* pred_cb, const uint16_t* succ_cb, int* d_draft_toks, int* d_best_b, int n_users, int K_len, int rank, float softcap, float evict_alpha) {
+    dflash2_select_path_k<<<dim3(n_users), dim3(256), 0, s>>>(cand_ids, cand_vals, h_proj, pred_cb, succ_cb, d_draft_toks, d_best_b, K_len, rank, softcap, evict_alpha);
     return 0;
 }
 
